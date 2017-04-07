@@ -26,13 +26,15 @@ from swift.obj.diskfile import get_data_dir
 from test.probe.common import ReplProbeTest
 from swift.common.utils import readconf
 
+EXCLUDE_FILES = ['hashes.pkl', 'hashes.invalid', '.lock']
+
 
 def collect_info(path_list):
     """
     Recursive collect dirs and files in path_list directory.
 
     :param path_list: start directory for collecting
-    :return files_list, dir_list: tuple of included
+    :return: files_list, dir_list tuple of included
     directories and files
     """
     files_list = []
@@ -41,6 +43,7 @@ def collect_info(path_list):
         temp_files_list = []
         temp_dir_list = []
         for root, dirs, files in os.walk(path):
+            files = [f for f in files if f not in EXCLUDE_FILES]
             temp_files_list += files
             temp_dir_list += dirs
         files_list.append(temp_files_list)
@@ -53,7 +56,7 @@ def find_max_occupancy_node(dir_list):
     Find node with maximum occupancy.
 
     :param list_dir: list of directories for each node.
-    :return number: number node in list_dir
+    :return: number number node in list_dir
     """
     count = 0
     number = 0
@@ -146,7 +149,9 @@ class TestReplicatorFunctions(ReplProbeTest):
                         raise
                     time.sleep(1)
 
-            # Check behavior by deleting hashes.pkl file
+            # Delete directories and files in objects storage without
+            # deleting file "hashes.pkl".
+            # Check, that files not replicated.
             for directory in os.listdir(os.path.join(test_node, data_dir)):
                 for input_dir in os.listdir(os.path.join(
                         test_node, data_dir, directory)):
@@ -165,13 +170,15 @@ class TestReplicatorFunctions(ReplProbeTest):
                                 test_node, data_dir, directory)):
                             self.assertFalse(os.path.isdir(
                                 os.path.join(test_node, data_dir,
-                                             directory, '/', input_dir)))
+                                             directory, input_dir)))
                     break
                 except Exception:
                     if time.time() - begin > 60:
                         raise
                     time.sleep(1)
 
+            # Now, delete file "hashes.pkl".
+            # Check, that all files were replicated.
             for directory in os.listdir(os.path.join(test_node, data_dir)):
                 os.remove(os.path.join(
                     test_node, data_dir, directory, 'hashes.pkl'))

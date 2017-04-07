@@ -407,7 +407,10 @@ class ObjectController(BaseStorageServer):
     def _make_timeout_reader(self, file_like):
         def timeout_reader():
             with ChunkReadTimeout(self.client_timeout):
-                return file_like.read(self.network_chunk_size)
+                try:
+                    return file_like.read(self.network_chunk_size)
+                except (IOError, ValueError):
+                    raise ChunkReadError
         return timeout_reader
 
     def _read_put_commit_message(self, mime_documents_iter):
@@ -1110,6 +1113,7 @@ class ObjectController(BaseStorageServer):
                     ' %(path)s '), {'method': req.method, 'path': req.path})
                 res = HTTPInternalServerError(body=traceback.format_exc())
         trans_time = time.time() - start_time
+        res.fix_conditional_response()
         if self.log_requests:
             log_line = get_log_line(req, res, trans_time, '')
             if req.method in ('REPLICATE', 'SSYNC') or \

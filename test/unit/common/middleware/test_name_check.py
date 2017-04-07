@@ -21,10 +21,12 @@ Created on February 29, 2012
 @author: eamonn-otoole
 '''
 
+import numbers
 import unittest
 
 from swift.common.swob import Request, Response
 from swift.common.middleware import name_check
+from swift.common import utils
 
 MAX_LENGTH = 255
 FORBIDDEN_CHARS = '\'\"<>`'
@@ -115,6 +117,38 @@ class TestNameCheckMiddleware(unittest.TestCase):
                     self.test_check)
             self.assertEqual(resp.body, 'OK')
 
+
+class TestSwiftInfo(unittest.TestCase):
+    def setUp(self):
+        utils._swift_info = {}
+        utils._swift_admin_info = {}
+
+    def test_registered_defaults(self):
+        name_check.filter_factory({})(FakeApp())
+        swift_info = utils.get_swift_info()
+        self.assertTrue('name_check' in swift_info)
+        self.assertTrue(isinstance(
+            swift_info['name_check'].get('maximum_length'),
+            numbers.Integral))
+        self.assertTrue(isinstance(
+            swift_info['name_check'].get('forbidden_chars'),
+            str))
+        self.assertTrue(isinstance(
+            swift_info['name_check'].get('forbidden_regexp'),
+            str))
+
+    def test_registered_configured_options(self):
+        conf = {'maximum_length': 512,
+                'forbidden_chars': '\'\"`',
+                'forbidden_regexp': "/\./|/\.\./|/\.$"}
+        name_check.filter_factory(conf)(FakeApp())
+        swift_info = utils.get_swift_info()
+        self.assertTrue('name_check' in swift_info)
+        self.assertEqual(swift_info['name_check'].get('maximum_length'), 512)
+        self.assertEqual(set(swift_info['name_check'].get('forbidden_chars')),
+                         set('\'\"`'))
+        self.assertEqual(swift_info['name_check'].get('forbidden_regexp'),
+                         "/\./|/\.\./|/\.$")
 
 if __name__ == '__main__':
     unittest.main()

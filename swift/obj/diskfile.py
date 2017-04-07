@@ -31,6 +31,7 @@ are also not considered part of the backend API.
 """
 
 import six.moves.cPickle as pickle
+import copy
 import errno
 import fcntl
 import json
@@ -42,11 +43,12 @@ import hashlib
 import logging
 import traceback
 import xattr
-from os.path import basename, dirname, exists, getmtime, join, splitext
+from os.path import basename, dirname, exists, join, splitext
 from random import shuffle
 from tempfile import mkstemp
 from contextlib import contextmanager
 from collections import defaultdict
+from datetime import timedelta
 
 from eventlet import Timeout
 from eventlet.hubs import trampoline
@@ -77,7 +79,7 @@ from functools import partial
 
 
 PICKLE_PROTOCOL = 2
-ONE_WEEK = 604800
+DEFAULT_RECLAIM_AGE = timedelta(weeks=1).total_seconds()
 HASH_FILE = 'hashes.pkl'
 HASH_INVALIDATIONS_FILE = 'hashes.invalid'
 METADATA_KEY = 'user.swift.metadata'
@@ -231,6 +233,48 @@ def quarantine_renamer(device_path, corrupted_file_path):
     return to_dir
 
 
+def read_hashes(partition_dir):
+    """
+    Read the existing hashes.pkl
+
+    :returns: a dict, the suffix hashes (if any), the key 'valid' will be False
+              if hashes.pkl is corrupt, cannot be read or does not exist
+    """
+    hashes_file = join(partition_dir, HASH_FILE)
+    hashes = {'valid': False}
+    try:
+        with open(hashes_file, 'rb') as hashes_fp:
+            pickled_hashes = hashes_fp.read()
+    except (IOError, OSError):
+        pass
+    else:
+        try:
+            hashes = pickle.loads(pickled_hashes)
+        except Exception:
+            # pickle.loads() can raise a wide variety of exceptions when
+            # given invalid input depending on the way in which the
+            # input is invalid.
+            pass
+    # hashes.pkl w/o valid updated key is "valid" but "forever old"
+    hashes.setdefault('valid', True)
+    hashes.setdefault('updated', -1)
+    return hashes
+
+
+def write_hashes(partition_dir, hashes):
+    """
+    Write hashes to hashes.pkl
+
+    The updated key is added to hashes before it is written.
+    """
+    hashes_file = join(partition_dir, HASH_FILE)
+    # 'valid' key should always be set by the caller; however, if there's a bug
+    # setting invalid is most safe
+    hashes.setdefault('valid', False)
+    hashes['updated'] = time.time()
+    write_pickle(hashes, hashes_file, partition_dir, PICKLE_PROTOCOL)
+
+
 def consolidate_hashes(partition_dir):
     """
     Take what's in hashes.pkl and hashes.invalid, combine them, write the
@@ -257,44 +301,25 @@ def consolidate_hashes(partition_dir):
         return None
 
     with lock_path(partition_dir):
-        try:
-            with open(hashes_file, 'rb') as hashes_fp:
-                pickled_hashes = hashes_fp.read()
-        except (IOError, OSError):
-            hashes = {}
-        else:
-            try:
-                hashes = pickle.loads(pickled_hashes)
-            except Exception:
-                # pickle.loads() can raise a wide variety of exceptions when
-                # given invalid input depending on the way in which the
-                # input is invalid.
-                hashes = None
+        hashes = read_hashes(partition_dir)
 
-        modified = False
+        found_invalidation_entry = False
         try:
             with open(invalidations_file, 'rb') as inv_fh:
                 for line in inv_fh:
+                    found_invalidation_entry = True
                     suffix = line.strip()
-                    if hashes is not None and \
-                            hashes.get(suffix, '') is not None:
-                        hashes[suffix] = None
-                        modified = True
+                    hashes[suffix] = None
         except (IOError, OSError) as e:
             if e.errno != errno.ENOENT:
                 raise
 
-        if modified:
-            write_pickle(hashes, hashes_file, partition_dir, PICKLE_PROTOCOL)
-
-        # Now that all the invalidations are reflected in hashes.pkl, it's
-        # safe to clear out the invalidations file.
-        try:
+        if found_invalidation_entry:
+            write_hashes(partition_dir, hashes)
+            # Now that all the invalidations are reflected in hashes.pkl, it's
+            # safe to clear out the invalidations file.
             with open(invalidations_file, 'wb') as inv_fh:
                 pass
-        except OSError as e:
-            if e.errno != errno.ENOENT:
-                raise
 
         return hashes
 
@@ -309,10 +334,6 @@ def invalidate_hash(suffix_dir):
 
     suffix = basename(suffix_dir)
     partition_dir = dirname(suffix_dir)
-    hashes_file = join(partition_dir, HASH_FILE)
-    if not os.path.exists(hashes_file):
-        return
-
     invalidations_file = join(partition_dir, HASH_INVALIDATIONS_FILE)
     with lock_path(partition_dir):
         with open(invalidations_file, 'ab') as inv_fh:
@@ -557,7 +578,7 @@ class BaseDiskFileManager(object):
         self.keep_cache_size = int(conf.get('keep_cache_size', 5242880))
         self.bytes_per_sync = int(conf.get('mb_per_sync', 512)) * 1024 * 1024
         self.mount_check = config_true_value(conf.get('mount_check', 'true'))
-        self.reclaim_age = int(conf.get('reclaim_age', ONE_WEEK))
+        self.reclaim_age = int(conf.get('reclaim_age', DEFAULT_RECLAIM_AGE))
         self.replication_one_per_device = config_true_value(
             conf.get('replication_one_per_device', 'true'))
         self.replication_lock_timeout = int(conf.get(
@@ -772,11 +793,11 @@ class BaseDiskFileManager(object):
                     data_info -> a file info dict for a .data file
                     meta_info -> a file info dict for a .meta file
                     ctype_info -> a file info dict for a .meta file which
-                                  contains the content-type value
+                    contains the content-type value
                     unexpected -> a list of file paths for unexpected
-                                  files
+                    files
                     possible_reclaim -> a list of file info dicts for possible
-                                        reclaimable files
+                    reclaimable files
                     obsolete  -> a list of file info dicts for obsolete files
         """
         # Build the exts data structure:
@@ -886,13 +907,12 @@ class BaseDiskFileManager(object):
 
         return results
 
-    def cleanup_ondisk_files(self, hsh_path, reclaim_age=ONE_WEEK, **kwargs):
+    def cleanup_ondisk_files(self, hsh_path, **kwargs):
         """
         Clean up on-disk files that are obsolete and gather the set of valid
         on-disk files for an object.
 
         :param hsh_path: object hash path
-        :param reclaim_age: age in seconds at which to remove tombstones
         :param frag_index: if set, search for a specific fragment index .data
                            file, otherwise accept the first valid .data file
         :returns: a dict that may contain: valid on disk files keyed by their
@@ -901,7 +921,7 @@ class BaseDiskFileManager(object):
                   reverse sorted, stored under the key 'files'.
         """
         def is_reclaimable(timestamp):
-            return (time.time() - float(timestamp)) > reclaim_age
+            return (time.time() - float(timestamp)) > self.reclaim_age
 
         files = listdir(hsh_path)
         files.sort(reverse=True)
@@ -932,11 +952,10 @@ class BaseDiskFileManager(object):
         """
         raise NotImplementedError
 
-    def _hash_suffix_dir(self, path, reclaim_age):
+    def _hash_suffix_dir(self, path):
         """
 
         :param path: full path to directory
-        :param reclaim_age: age in seconds at which to remove tombstones
         """
         hashes = defaultdict(hashlib.md5)
         try:
@@ -948,7 +967,7 @@ class BaseDiskFileManager(object):
         for hsh in path_contents:
             hsh_path = join(path, hsh)
             try:
-                ondisk_info = self.cleanup_ondisk_files(hsh_path, reclaim_age)
+                ondisk_info = self.cleanup_ondisk_files(hsh_path)
             except OSError as err:
                 if err.errno == errno.ENOTDIR:
                     partition_path = dirname(path)
@@ -1006,60 +1025,72 @@ class BaseDiskFileManager(object):
             raise PathNotDir()
         return hashes
 
-    def _hash_suffix(self, path, reclaim_age):
+    def _hash_suffix(self, path):
         """
         Performs reclamation and returns an md5 of all (remaining) files.
 
         :param path: full path to directory
-        :param reclaim_age: age in seconds at which to remove tombstones
         :raises PathNotDir: if given path is not a valid directory
         :raises OSError: for non-ENOTDIR errors
         """
         raise NotImplementedError
 
-    def _get_hashes(self, partition_path, recalculate=None, do_listdir=False,
-                    reclaim_age=None):
+    def _get_hashes(self, *args, **kwargs):
+        hashed, hashes = self.__get_hashes(*args, **kwargs)
+        hashes.pop('updated', None)
+        hashes.pop('valid', None)
+        return hashed, hashes
+
+    def __get_hashes(self, partition_path, recalculate=None, do_listdir=False):
         """
         Get hashes for each suffix dir in a partition.  do_listdir causes it to
         mistrust the hash cache for suffix existence at the (unexpectedly high)
-        cost of a listdir.  reclaim_age is just passed on to hash_suffix.
+        cost of a listdir.
 
         :param partition_path: absolute path of partition to get hashes for
         :param recalculate: list of suffixes which should be recalculated when
                             got
         :param do_listdir: force existence check for all hashes in the
                            partition
-        :param reclaim_age: age at which to remove tombstones
 
         :returns: tuple of (number of suffix dirs hashed, dictionary of hashes)
         """
-        reclaim_age = reclaim_age or self.reclaim_age
         hashed = 0
         hashes_file = join(partition_path, HASH_FILE)
         modified = False
-        force_rewrite = False
-        hashes = {}
-        mtime = -1
+        orig_hashes = {'valid': False}
 
         if recalculate is None:
             recalculate = []
 
         try:
-            mtime = getmtime(hashes_file)
-        except OSError as e:
-            if e.errno != errno.ENOENT:
-                raise
-
-        try:
-            hashes = self.consolidate_hashes(partition_path)
+            orig_hashes = self.consolidate_hashes(partition_path)
         except Exception:
+            self.logger.warning('Unable to read %r', hashes_file,
+                                exc_info=True)
+
+        if orig_hashes is None:
+            # consolidate_hashes returns None if hashes.pkl does not exist
+            orig_hashes = {'valid': False}
+        if not orig_hashes['valid']:
+            # This is the only path to a valid hashes from invalid read (e.g.
+            # does not exist, corrupt, etc.).  Moreover, in order to write this
+            # valid hashes we must read *the exact same* invalid state or we'll
+            # trigger race detection.
             do_listdir = True
-            force_rewrite = True
+            hashes = {'valid': True}
+            # If the exception handling around consolidate_hashes fired we're
+            # going to do a full rehash regardless; but we need to avoid
+            # needless recursion if the on-disk hashes.pkl is actually readable
+            # (worst case is consolidate_hashes keeps raising exceptions and we
+            # eventually run out of stack).
+            # N.B. orig_hashes invalid only effects new parts and error/edge
+            # conditions - so try not to get overly caught up trying to
+            # optimize it out unless you manage to convince yourself there's a
+            # bad behavior.
+            orig_hashes = read_hashes(partition_path)
         else:
-            if hashes is None:  # no hashes.pkl file; let's build it
-                do_listdir = True
-                force_rewrite = True
-                hashes = {}
+            hashes = copy.deepcopy(orig_hashes)
 
         if do_listdir:
             for suff in os.listdir(partition_path):
@@ -1072,7 +1103,7 @@ class BaseDiskFileManager(object):
             if not hash_:
                 suffix_dir = join(partition_path, suffix)
                 try:
-                    hashes[suffix] = self._hash_suffix(suffix_dir, reclaim_age)
+                    hashes[suffix] = self._hash_suffix(suffix_dir)
                     hashed += 1
                 except PathNotDir:
                     del hashes[suffix]
@@ -1081,13 +1112,10 @@ class BaseDiskFileManager(object):
                 modified = True
         if modified:
             with lock_path(partition_path):
-                if force_rewrite or not exists(hashes_file) or \
-                        getmtime(hashes_file) == mtime:
-                    write_pickle(
-                        hashes, hashes_file, partition_path, PICKLE_PROTOCOL)
+                if read_hashes(partition_path) == orig_hashes:
+                    write_hashes(partition_path, hashes)
                     return hashed, hashes
-            return self._get_hashes(partition_path, recalculate, do_listdir,
-                                    reclaim_age)
+            return self.__get_hashes(partition_path, recalculate, do_listdir)
         else:
             return hashed, hashes
 
@@ -1237,8 +1265,7 @@ class BaseDiskFileManager(object):
             dev_path, get_data_dir(policy), str(partition), object_hash[-3:],
             object_hash)
         try:
-            filenames = self.cleanup_ondisk_files(object_path,
-                                                  self.reclaim_age)['files']
+            filenames = self.cleanup_ondisk_files(object_path)['files']
         except OSError as err:
             if err.errno == errno.ENOTDIR:
                 quar_path = self.quarantine_renamer(dev_path, object_path)
@@ -1324,7 +1351,7 @@ class BaseDiskFileManager(object):
     def yield_hashes(self, device, partition, policy,
                      suffixes=None, **kwargs):
         """
-        Yields tuples of (full_path, hash_only, timestamps) for object
+        Yields tuples of (hash_only, timestamps) for object
         information stored for the given device, partition, and
         (optionally) suffixes. If suffixes is None, all stored
         suffixes will be searched for object hashes. Note that if
@@ -1369,7 +1396,7 @@ class BaseDiskFileManager(object):
                 object_path = os.path.join(suffix_path, object_hash)
                 try:
                     results = self.cleanup_ondisk_files(
-                        object_path, self.reclaim_age, **kwargs)
+                        object_path, **kwargs)
                     timestamps = {}
                     for ts_key, info_key, info_ts_key in key_preference:
                         if info_key not in results:
@@ -1380,7 +1407,7 @@ class BaseDiskFileManager(object):
                         # file cannot be opened and therefore cannot
                         # be ssync'd
                         continue
-                    yield (object_path, object_hash, timestamps)
+                    yield (object_hash, timestamps)
                 except AssertionError as err:
                     self.logger.debug('Invalid file set in %s (%s)' % (
                         object_path, err))
@@ -2581,17 +2608,16 @@ class DiskFileManager(BaseDiskFileManager):
             hashes[None].update(
                 file_info['timestamp'].internal + file_info['ext'])
 
-    def _hash_suffix(self, path, reclaim_age):
+    def _hash_suffix(self, path):
         """
         Performs reclamation and returns an md5 of all (remaining) files.
 
         :param path: full path to directory
-        :param reclaim_age: age in seconds at which to remove tombstones
         :raises PathNotDir: if given path is not a valid directory
         :raises OSError: for non-ENOTDIR errors
         :returns: md5 of files in suffix
         """
-        hashes = self._hash_suffix_dir(path, reclaim_age)
+        hashes = self._hash_suffix_dir(path)
         return hashes[None].hexdigest()
 
 
@@ -2785,13 +2811,13 @@ class ECDiskFile(BaseDiskFile):
                              for fi in pref['exclude']]}
                 for pref in frag_prefs]
         except ValueError as e:
-                raise DiskFileError(
-                    'Bad timestamp in frag_prefs: %r: %s'
-                    % (frag_prefs, e))
+            raise DiskFileError(
+                'Bad timestamp in frag_prefs: %r: %s'
+                % (frag_prefs, e))
         except DiskFileError as e:
-                raise DiskFileError(
-                    'Bad fragment index in frag_prefs: %r: %s'
-                    % (frag_prefs, e))
+            raise DiskFileError(
+                'Bad fragment index in frag_prefs: %r: %s'
+                % (frag_prefs, e))
         except (KeyError, TypeError) as e:
             raise DiskFileError(
                 'Bad frag_prefs: %r: %s' % (frag_prefs, e))
@@ -3197,12 +3223,11 @@ class ECDiskFileManager(BaseDiskFileManager):
             file_info = ondisk_info['durable_frag_set'][0]
             hashes[None].update(file_info['timestamp'].internal + '.durable')
 
-    def _hash_suffix(self, path, reclaim_age):
+    def _hash_suffix(self, path):
         """
         Performs reclamation and returns an md5 of all (remaining) files.
 
         :param path: full path to directory
-        :param reclaim_age: age in seconds at which to remove tombstones
         :raises PathNotDir: if given path is not a valid directory
         :raises OSError: for non-ENOTDIR errors
         :returns: dict of md5 hex digests
@@ -3211,5 +3236,5 @@ class ECDiskFileManager(BaseDiskFileManager):
         # here we flatten out the hashers hexdigest into a dictionary instead
         # of just returning the one hexdigest for the whole suffix
 
-        hash_per_fi = self._hash_suffix_dir(path, reclaim_age)
+        hash_per_fi = self._hash_suffix_dir(path)
         return dict((fi, md5.hexdigest()) for fi, md5 in hash_per_fi.items())

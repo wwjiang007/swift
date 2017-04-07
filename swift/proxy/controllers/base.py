@@ -232,6 +232,7 @@ def cors_validation(func):
             #  - simple response headers,
             #    http://www.w3.org/TR/cors/#simple-response-header
             #  - swift specific: etag, x-timestamp, x-trans-id
+            #  - headers provided by the operator in cors_expose_headers
             #  - user metadata headers
             #  - headers provided by the user in
             #    x-container-meta-access-control-expose-headers
@@ -240,6 +241,7 @@ def cors_validation(func):
                     'cache-control', 'content-language', 'content-type',
                     'expires', 'last-modified', 'pragma', 'etag',
                     'x-timestamp', 'x-trans-id', 'x-openstack-request-id'])
+                expose_headers.update(controller.app.cors_expose_headers)
                 for header in resp.headers:
                     if header.startswith('X-Container-Meta') or \
                             header.startswith('X-Object-Meta'):
@@ -1356,6 +1358,7 @@ class NodeIter(object):
         Install a callback function that will be used during a call to next()
         to get an alternate node instead of returning the next node from the
         iterator.
+
         :param callback: A no argument function that should return a node dict
                          or None.
         """
@@ -1885,28 +1888,37 @@ class Controller(object):
             resp.status = HTTP_UNAUTHORIZED
             return resp
 
-        # Allow all headers requested in the request. The CORS
-        # specification does leave the door open for this, as mentioned in
-        # http://www.w3.org/TR/cors/#resource-preflight-requests
-        # Note: Since the list of headers can be unbounded
-        # simply returning headers can be enough.
-        allow_headers = set()
-        if req.headers.get('Access-Control-Request-Headers'):
-            allow_headers.update(
-                list_from_csv(req.headers['Access-Control-Request-Headers']))
-
         # Populate the response with the CORS preflight headers
         if cors.get('allow_origin') and \
                 cors.get('allow_origin').strip() == '*':
             headers['access-control-allow-origin'] = '*'
         else:
             headers['access-control-allow-origin'] = req_origin_value
+            if 'vary' in headers:
+                headers['vary'] += ', Origin'
+            else:
+                headers['vary'] = 'Origin'
+
         if cors.get('max_age') is not None:
             headers['access-control-max-age'] = cors.get('max_age')
+
         headers['access-control-allow-methods'] = \
             ', '.join(self.allowed_methods)
+
+        # Allow all headers requested in the request. The CORS
+        # specification does leave the door open for this, as mentioned in
+        # http://www.w3.org/TR/cors/#resource-preflight-requests
+        # Note: Since the list of headers can be unbounded
+        # simply returning headers can be enough.
+        allow_headers = set(
+            list_from_csv(req.headers.get('Access-Control-Request-Headers')))
         if allow_headers:
             headers['access-control-allow-headers'] = ', '.join(allow_headers)
+            if 'vary' in headers:
+                headers['vary'] += ', Access-Control-Request-Headers'
+            else:
+                headers['vary'] = 'Access-Control-Request-Headers'
+
         resp.headers = headers
 
         return resp

@@ -143,6 +143,8 @@ This is very useful when one is managing more than one swift cluster.
 Use a comma separated list of full URL (http://foo.bar:1234,https://foo.bar)
 .IP \fBstrict_cors_mode\fR
 The default is true.
+.IP \fBcors_expose_headers\fR
+Comma separated list of headers to expose through Access-Control-Expose-Headers
 .IP \fBnice_priority\fR
 Modify scheduling priority of server processes. Niceness values range from -20
 (most favorable to the process) to 19 (least favorable to the process).
@@ -497,7 +499,7 @@ Logging address. The default is /dev/log.
 .IP "\fBset log_headers\fR "
 Enables the ability to log request headers. The default is False.
 .IP \fBstorage_domain\fR
-The domain to be used by the middleware.
+The domain to be used by the middleware. Multiple domains can be specified separated by a comma.
 .IP \fBpath_root\fR
 The path root value for the storage URL. The default is v1.
 .IP \fBreseller_prefixes\fR
@@ -991,9 +993,7 @@ Whether account PUTs and DELETEs are even callable. If set to 'true' any authori
 user may create and delete accounts; if 'false' no one, even authorized, can. The default
 is false.
 .IP \fBobject_post_as_copy\fR
-Set object_post_as_copy = false to turn on fast posts where only the metadata changes
-are stored as new and the original data file is kept in place. This makes for quicker
-posts. The default is True.
+Deprecated. The default is False.
 .IP \fBaccount_autocreate\fR
 If set to 'true' authorized accounts that do not yet exist within the Swift cluster
 will be automatically created. The default is set to false.
@@ -1079,9 +1079,9 @@ Ignored if IOPRIO_CLASS_IDLE is set.
 .LP
 More in depth documentation about the swift-proxy-server and
 also OpenStack Swift as a whole can be found at
-.BI http://swift.openstack.org/admin_guide.html
+.BI http://docs.openstack.org/developer/swift/admin_guide.html
 and
-.BI http://swift.openstack.org
+.BI http://docs.openstack.org/developer/swift
 
 .SH "SEE ALSO"
 .BR swift-proxy-server(1)

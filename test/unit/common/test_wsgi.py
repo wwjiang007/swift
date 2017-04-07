@@ -469,11 +469,14 @@ class TestWSGI(unittest.TestCase):
                     with mock.patch('swift.common.wsgi.eventlet') as _eventlet:
                         with mock.patch.dict('os.environ', {'TZ': ''}):
                             with mock.patch('swift.common.wsgi.inspect'):
-                                conf = wsgi.appconfig(conf_dir)
-                                logger = logging.getLogger('test')
-                                sock = listen(('localhost', 0))
-                                wsgi.run_server(conf, logger, sock)
-                                self.assertTrue(os.environ['TZ'] is not '')
+                                with mock.patch('time.tzset') as mock_tzset:
+                                    conf = wsgi.appconfig(conf_dir)
+                                    logger = logging.getLogger('test')
+                                    sock = listen(('localhost', 0))
+                                    wsgi.run_server(conf, logger, sock)
+                                    self.assertEqual(os.environ['TZ'], 'UTC+0')
+                                    self.assertEqual(mock_tzset.mock_calls,
+                                                     [mock.call()])
 
         self.assertEqual('HTTP/1.0',
                          _wsgi.HttpProtocol.default_request_version)
@@ -1269,6 +1272,21 @@ class TestWSGIContext(unittest.TestCase):
         self.assertEqual('bbbbb', next(iterator))
         iterable.close()
         self.assertRaises(StopIteration, iterator.next)
+
+    def test_update_content_length(self):
+        statuses = ['200 Ok']
+
+        def app(env, start_response):
+            start_response(statuses.pop(0), [('Content-Length', '30')])
+            yield 'Ok\n'
+
+        wc = wsgi.WSGIContext(app)
+        r = Request.blank('/')
+        it = wc._app_call(r.environ)
+        wc.update_content_length(35)
+        self.assertEqual(wc._response_status, '200 Ok')
+        self.assertEqual(''.join(it), 'Ok\n')
+        self.assertEqual(wc._response_headers, [('Content-Length', '35')])
 
 
 class TestPipelineWrapper(unittest.TestCase):

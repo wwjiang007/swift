@@ -354,6 +354,33 @@ class TestSlo(Base):
         self.assertEqual('b', file_contents[-2])
         self.assertEqual('c', file_contents[-1])
 
+    def test_slo_ranged_get_half_open_on_right(self):
+        file_item = self.env.container.file('manifest-abcde')
+        file_contents = file_item.read(
+            hdrs={"Range": "bytes=1048571-"})
+        grouped_file_contents = [
+            (char, sum(1 for _char in grp))
+            for char, grp in itertools.groupby(file_contents)]
+        self.assertEqual([
+            ('a', 5),
+            ('b', 1048576),
+            ('c', 1048576),
+            ('d', 1048576),
+            ('e', 1)
+        ], grouped_file_contents)
+
+    def test_slo_ranged_get_half_open_on_left(self):
+        file_item = self.env.container.file('manifest-abcde')
+        file_contents = file_item.read(
+            hdrs={"Range": "bytes=-123456"})
+        grouped_file_contents = [
+            (char, sum(1 for _char in grp))
+            for char, grp in itertools.groupby(file_contents)]
+        self.assertEqual([
+            ('d', 123455),
+            ('e', 1),
+        ], grouped_file_contents)
+
     def test_slo_multi_ranged_get(self):
         file_item = self.env.container.file('manifest-abcde')
         file_contents = file_item.read(
@@ -444,6 +471,35 @@ class TestSlo(Base):
             self.assertEqual(400, err.status)
         else:
             self.fail("Expected ResponseError but didn't get it")
+
+    def test_slo_client_etag_mismatch(self):
+        file_item = self.env.container.file("manifest-a-mismatch-etag")
+        try:
+            file_item.write(
+                json.dumps([{
+                    'size_bytes': 1024 * 1024,
+                    'etag': hashlib.md5('a' * 1024 * 1024).hexdigest(),
+                    'path': '/%s/%s' % (self.env.container.name, 'seg_a')}]),
+                parms={'multipart-manifest': 'put'},
+                hdrs={'Etag': 'NOTetagofthesegments'})
+        except ResponseError as err:
+            self.assertEqual(422, err.status)
+
+    def test_slo_client_etag(self):
+        file_item = self.env.container.file("manifest-a-b-etag")
+        etag_a = hashlib.md5('a' * 1024 * 1024).hexdigest()
+        etag_b = hashlib.md5('b' * 1024 * 1024).hexdigest()
+        file_item.write(
+            json.dumps([{
+                'size_bytes': 1024 * 1024,
+                'etag': etag_a,
+                'path': '/%s/%s' % (self.env.container.name, 'seg_a')}, {
+                'size_bytes': 1024 * 1024,
+                'etag': etag_b,
+                'path': '/%s/%s' % (self.env.container.name, 'seg_b')}]),
+            parms={'multipart-manifest': 'put'},
+            hdrs={'Etag': hashlib.md5(etag_a + etag_b).hexdigest()})
+        self.assert_status(201)
 
     def test_slo_unspecified_etag(self):
         file_item = self.env.container.file("manifest-a-unspecified-etag")

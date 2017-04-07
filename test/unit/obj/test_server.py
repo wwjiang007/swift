@@ -32,9 +32,9 @@ from shutil import rmtree
 from time import gmtime, strftime, time, struct_time
 from tempfile import mkdtemp
 from hashlib import md5
-import tempfile
 from collections import defaultdict
 from contextlib import contextmanager
+from textwrap import dedent
 
 from eventlet import sleep, spawn, wsgi, listen, Timeout, tpool, greenthread
 from eventlet.green import httplib
@@ -62,6 +62,7 @@ from swift.common.storage_policy import (StoragePolicy, ECStoragePolicy,
                                          POLICIES, EC_POLICY)
 from swift.common.exceptions import DiskFileDeviceUnavailable, \
     DiskFileNoSpace, DiskFileQuarantined
+from swift.common.wsgi import init_request_processor
 
 
 def mock_time(*args, **kwargs):
@@ -133,6 +134,11 @@ class TestObjectController(unittest.TestCase):
     def _stage_tmp_dir(self, policy):
         mkdirs(os.path.join(self.testdir, 'sda1',
                             diskfile.get_tmp_dir(policy)))
+
+    def iter_policies(self):
+        for policy in POLICIES:
+            self.policy = policy
+            yield policy
 
     def check_all_api_methods(self, obj_name='o', alt_res=None):
         path = '/sda1/p/a/c/%s' % obj_name
@@ -1919,6 +1925,25 @@ class TestObjectController(unittest.TestCase):
             resp = req.get_response(self.object_controller)
             self.assertEqual(resp.status_int, 408)
 
+    def test_PUT_client_closed_connection(self):
+        class fake_input(object):
+            def read(self, *a, **kw):
+                # On client disconnect during a chunked transfer, eventlet
+                # may raise a ValueError (or ChunkReadError, following
+                # https://github.com/eventlet/eventlet/commit/c3ce3ee -- but
+                # that inherits from ValueError)
+                raise ValueError
+
+        timestamp = normalize_timestamp(time())
+        req = Request.blank(
+            '/sda1/p/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
+            headers={'X-Timestamp': timestamp,
+                     'Content-Type': 'text/plain',
+                     'Content-Length': '6'})
+        req.environ['wsgi.input'] = fake_input()
+        resp = req.get_response(self.object_controller)
+        self.assertEqual(resp.status_int, 499)
+
     def test_PUT_system_metadata(self):
         # check that sysmeta is stored in diskfile
         timestamp = normalize_timestamp(time())
@@ -2832,10 +2857,22 @@ class TestObjectController(unittest.TestCase):
         self.assertEqual(resp.etag, etag)
 
         req = Request.blank(
+            '/sda1/p/a/c/o', environ={'REQUEST_METHOD': 'HEAD'},
+            headers={'If-Match': '"11111111111111111111111111111111"'})
+        resp = req.get_response(self.object_controller)
+        self.assertEqual(resp.status_int, 412)
+        self.assertIn(
+            '"HEAD /sda1/p/a/c/o" 412 - ',
+            self.object_controller.logger.get_lines_for_level('info')[-1])
+
+        req = Request.blank(
             '/sda1/p/a/c/o', environ={'REQUEST_METHOD': 'GET'},
             headers={'If-Match': '"11111111111111111111111111111111"'})
         resp = req.get_response(self.object_controller)
         self.assertEqual(resp.status_int, 412)
+        self.assertIn(
+            '"GET /sda1/p/a/c/o" 412 - ',
+            self.object_controller.logger.get_lines_for_level('info')[-1])
 
         req = Request.blank(
             '/sda1/p/a/c/o', environ={'REQUEST_METHOD': 'GET'},
@@ -6164,6 +6201,72 @@ class TestObjectController(unittest.TestCase):
             resp = req.get_response(self.object_controller)
         self.assertEqual(resp.status_int, 507)
 
+    def test_REPLICATE_reclaims_tombstones(self):
+        conf = {'devices': self.testdir, 'mount_check': False,
+                'reclaim_age': 100}
+        self.object_controller = object_server.ObjectController(
+            conf, logger=self.logger)
+        for policy in self.iter_policies():
+            # create a tombstone
+            ts = next(self.ts)
+            delete_request = Request.blank(
+                '/sda1/0/a/c/o', method='DELETE',
+                headers={
+                    'x-backend-storage-policy-index': int(policy),
+                    'x-timestamp': ts.internal,
+                })
+            resp = delete_request.get_response(self.object_controller)
+            self.assertEqual(resp.status_int, 404)
+            objfile = self.df_mgr.get_diskfile('sda1', '0', 'a', 'c', 'o',
+                                               policy=policy)
+            tombstone_file = os.path.join(objfile._datadir,
+                                          '%s.ts' % ts.internal)
+            self.assertTrue(os.path.exists(tombstone_file))
+
+            # REPLICATE will hash it
+            req = Request.blank(
+                '/sda1/0', method='REPLICATE',
+                headers={
+                    'x-backend-storage-policy-index': int(policy),
+                })
+            resp = req.get_response(self.object_controller)
+            self.assertEqual(resp.status_int, 200)
+            suffix = pickle.loads(resp.body).keys()[0]
+            self.assertEqual(suffix, os.path.basename(
+                os.path.dirname(objfile._datadir)))
+            # tombstone still exists
+            self.assertTrue(os.path.exists(tombstone_file))
+
+            # after reclaim REPLICATE will rehash
+            replicate_request = Request.blank(
+                '/sda1/0/%s' % suffix, method='REPLICATE',
+                headers={
+                    'x-backend-storage-policy-index': int(policy),
+                })
+            the_future = time() + 200
+            with mock.patch('swift.obj.diskfile.time.time') as mock_time:
+                mock_time.return_value = the_future
+                resp = replicate_request.get_response(self.object_controller)
+            self.assertEqual(resp.status_int, 200)
+            self.assertEqual({}, pickle.loads(resp.body))
+            # and tombstone is reaped!
+            self.assertFalse(os.path.exists(tombstone_file))
+
+            # N.B. with a small reclaim age like this - if proxy clocks get far
+            # enough out of whack ...
+            with mock.patch('swift.obj.diskfile.time.time') as mock_time:
+                mock_time.return_value = the_future
+                resp = delete_request.get_response(self.object_controller)
+                # we won't even create the tombstone
+                self.assertFalse(os.path.exists(tombstone_file))
+                # hashdir sticks around tho
+                self.assertTrue(os.path.exists(objfile._datadir))
+                # REPLICATE will clean it all up
+                resp = replicate_request.get_response(self.object_controller)
+                self.assertEqual(resp.status_int, 200)
+                self.assertEqual({}, pickle.loads(resp.body))
+                self.assertFalse(os.path.exists(objfile._datadir))
+
     def test_SSYNC_can_be_called(self):
         req = Request.blank('/sda1/0',
                             environ={'REQUEST_METHOD': 'SSYNC'},
@@ -6353,7 +6456,7 @@ class TestObjectController(unittest.TestCase):
                         self.assertEqual(
                             self.logger.get_lines_for_level('info'),
                             ['None - - [01/Jan/1970:02:46:41 +0000] "PUT'
-                             ' /sda1/p/a/c/o" 405 - "-" "-" "-" 1.0000 "-"'
+                             ' /sda1/p/a/c/o" 405 91 "-" "-" "-" 1.0000 "-"'
                              ' 1234 -'])
 
     def test_call_incorrect_replication_method(self):
@@ -6753,7 +6856,7 @@ class TestObjectServer(unittest.TestCase):
 
     def setUp(self):
         # dirs
-        self.tmpdir = tempfile.mkdtemp()
+        self.tmpdir = mkdtemp()
         self.tempdir = os.path.join(self.tmpdir, 'tmp_test_obj_server')
 
         self.devices = os.path.join(self.tempdir, 'srv/node')
@@ -6788,6 +6891,7 @@ class TestObjectServer(unittest.TestCase):
         headers = {
             'Expect': '100-continue',
             'Content-Length': len(test_body),
+            'Content-Type': 'application/test',
             'X-Timestamp': utils.Timestamp(time()).internal,
         }
         conn = bufferedhttp.http_connect('127.0.0.1', self.port, 'sda1', '0',
@@ -6805,6 +6909,7 @@ class TestObjectServer(unittest.TestCase):
         headers = {
             'Expect': '100-continue',
             'Content-Length': len(test_body),
+            'Content-Type': 'application/test',
             'X-Timestamp': utils.Timestamp(time()).internal,
             'X-Backend-Obj-Metadata-Footer': 'yes',
             'X-Backend-Obj-Multipart-Mime-Boundary': 'boundary123',
@@ -6823,6 +6928,7 @@ class TestObjectServer(unittest.TestCase):
         headers = {
             'Expect': '100-continue',
             'Content-Length': len(test_body),
+            'Content-Type': 'application/test',
             'X-Timestamp': put_timestamp.internal,
         }
         conn = bufferedhttp.http_connect('127.0.0.1', self.port, 'sda1', '0',
@@ -6892,9 +6998,12 @@ class TestObjectServer(unittest.TestCase):
             self.assertIn(' 499 ', line)
 
     def find_files(self):
+        ignore_files = {'.lock', 'hashes.invalid'}
         found_files = defaultdict(list)
         for root, dirs, files in os.walk(self.devices):
             for filename in files:
+                if filename in ignore_files:
+                    continue
                 _name, ext = os.path.splitext(filename)
                 file_path = os.path.join(root, filename)
                 found_files[ext].append(file_path)
@@ -7455,7 +7564,8 @@ class TestZeroCopy(unittest.TestCase):
         url_path = '/sda1/2100/a/c/o'
 
         self.http_conn.request('PUT', url_path, 'obj contents',
-                               {'X-Timestamp': '127082564.24709'})
+                               {'X-Timestamp': '127082564.24709',
+                                'Content-Type': 'application/test'})
         response = self.http_conn.getresponse()
         self.assertEqual(response.status, 201)
         response.read()
@@ -7473,7 +7583,8 @@ class TestZeroCopy(unittest.TestCase):
         url_path = '/sda1/2100/a/c/o'
 
         self.http_conn.request('PUT', url_path, obj_contents,
-                               {'X-Timestamp': '1402600322.52126'})
+                               {'X-Timestamp': '1402600322.52126',
+                                'Content-Type': 'application/test'})
         response = self.http_conn.getresponse()
         self.assertEqual(response.status, 201)
         response.read()
@@ -7490,7 +7601,8 @@ class TestZeroCopy(unittest.TestCase):
         ts = '1402601849.47475'
 
         self.http_conn.request('PUT', url_path, 'obj contents',
-                               {'X-Timestamp': ts})
+                               {'X-Timestamp': ts,
+                                'Content-Type': 'application/test'})
         response = self.http_conn.getresponse()
         self.assertEqual(response.status, 201)
         response.read()
@@ -7521,7 +7633,8 @@ class TestZeroCopy(unittest.TestCase):
 
         self.http_conn.request(
             'PUT', url_path, '',
-            {'X-Timestamp': ts, 'Content-Length': '0'})
+            {'X-Timestamp': ts, 'Content-Length': '0',
+             'Content-Type': 'application/test'})
         response = self.http_conn.getresponse()
         self.assertEqual(response.status, 201)
         response.read()
@@ -7537,6 +7650,103 @@ class TestZeroCopy(unittest.TestCase):
         self.assertEqual(response.status, 200)  # still there
         contents = response.read()
         self.assertEqual(contents, '')
+
+
+class TestConfigOptionHandling(unittest.TestCase):
+
+    def setUp(self):
+        self.tmpdir = mkdtemp()
+
+    def tearDown(self):
+        rmtree(self.tmpdir)
+
+    def _app_config(self, config):
+        contents = dedent(config)
+        conf_file = os.path.join(self.tmpdir, 'object-server.conf')
+        with open(conf_file, 'w') as f:
+            f.write(contents)
+        return init_request_processor(conf_file, 'object-server')[:2]
+
+    def test_default(self):
+        config = """
+        [DEFAULT]
+
+        [pipeline:main]
+        pipeline = object-server
+
+        [app:object-server]
+        use = egg:swift#object
+        """
+        app, config = self._app_config(config)
+        self.assertNotIn('reclaim_age', config)
+        for policy in POLICIES:
+            self.assertEqual(app._diskfile_router[policy].reclaim_age, 604800)
+
+    def test_option_in_app(self):
+        config = """
+        [DEFAULT]
+
+        [pipeline:main]
+        pipeline = object-server
+
+        [app:object-server]
+        use = egg:swift#object
+        reclaim_age = 100
+        """
+        app, config = self._app_config(config)
+        self.assertEqual(config['reclaim_age'], '100')
+        for policy in POLICIES:
+            self.assertEqual(app._diskfile_router[policy].reclaim_age, 100)
+
+    def test_option_in_default(self):
+        config = """
+        [DEFAULT]
+        reclaim_age = 200
+
+        [pipeline:main]
+        pipeline = object-server
+
+        [app:object-server]
+        use = egg:swift#object
+        """
+        app, config = self._app_config(config)
+        self.assertEqual(config['reclaim_age'], '200')
+        for policy in POLICIES:
+            self.assertEqual(app._diskfile_router[policy].reclaim_age, 200)
+
+    def test_option_in_both(self):
+        config = """
+        [DEFAULT]
+        reclaim_age = 300
+
+        [pipeline:main]
+        pipeline = object-server
+
+        [app:object-server]
+        use = egg:swift#object
+        reclaim_age = 400
+        """
+        app, config = self._app_config(config)
+        self.assertEqual(config['reclaim_age'], '300')
+        for policy in POLICIES:
+            self.assertEqual(app._diskfile_router[policy].reclaim_age, 300)
+
+        # use paste "set" syntax to override global config value
+        config = """
+        [DEFAULT]
+        reclaim_age = 500
+
+        [pipeline:main]
+        pipeline = object-server
+
+        [app:object-server]
+        use = egg:swift#object
+        set reclaim_age = 600
+        """
+        app, config = self._app_config(config)
+        self.assertEqual(config['reclaim_age'], '600')
+        for policy in POLICIES:
+            self.assertEqual(app._diskfile_router[policy].reclaim_age, 600)
 
 
 if __name__ == '__main__':

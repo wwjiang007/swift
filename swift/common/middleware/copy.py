@@ -117,18 +117,15 @@ Object Post as Copy
 -------------------
 Historically, this has been a feature (and a configurable option with default
 set to True) in proxy server configuration. This has been moved to server side
-copy middleware.
+copy middleware and the default changed to False.
 
-When ``object_post_as_copy`` is set to ``true`` (default value), an incoming
-POST request is morphed into a COPY request where source and destination
-objects are same.
+When ``object_post_as_copy`` is set to ``true``, an incoming POST request is
+morphed into a COPY request where source and destination objects are same.
 
 This feature was necessary because of a previous behavior where POSTS would
 update the metadata on the object but not on the container. As a result,
 features like container sync would not work correctly. This is no longer the
-case and the plan is to deprecate this option. It is being kept now for
-backwards compatibility. At first chance, set ``object_post_as_copy`` to
-``false``.
+case and this option is now deprecated. It will be removed in a future release.
 """
 
 import os
@@ -277,7 +274,13 @@ class ServerSideCopyMiddleware(object):
         # problems during upgrade.
         self._load_object_post_as_copy_conf(conf)
         self.object_post_as_copy = \
-            config_true_value(conf.get('object_post_as_copy', 'true'))
+            config_true_value(conf.get('object_post_as_copy', 'false'))
+        if self.object_post_as_copy:
+            msg = ('object_post_as_copy=true is deprecated; remove all '
+                   'references to it from %s to disable this warning. This '
+                   'option will be ignored in a future release' % conf.get(
+                       '__file__', 'proxy-server.conf'))
+            self.logger.warning(msg)
 
     def _load_object_post_as_copy_conf(self, conf):
         if ('object_post_as_copy' in conf or '__file__' not in conf):
@@ -318,17 +321,17 @@ class ServerSideCopyMiddleware(object):
         self.container_name = container
         self.object_name = obj
 
-        # Save off original request method (COPY/POST) in case it gets mutated
-        # into PUT during handling. This way logging can display the method
-        # the client actually sent.
-        req.environ['swift.orig_req_method'] = req.method
-
         try:
+            # In some cases, save off original request method since it gets
+            # mutated into PUT during handling. This way logging can display
+            # the method the client actually sent.
             if req.method == 'PUT' and req.headers.get('X-Copy-From'):
                 return self.handle_PUT(req, start_response)
             elif req.method == 'COPY':
+                req.environ['swift.orig_req_method'] = req.method
                 return self.handle_COPY(req, start_response)
             elif req.method == 'POST' and self.object_post_as_copy:
+                req.environ['swift.orig_req_method'] = req.method
                 return self.handle_object_post_as_copy(req, start_response)
             elif req.method == 'OPTIONS':
                 # Does not interfere with OPTIONS response from
@@ -423,8 +426,8 @@ class ServerSideCopyMiddleware(object):
         resp_headers['X-Copied-From-Account'] = quote(acct)
         resp_headers['X-Copied-From'] = quote(path)
         if 'last-modified' in source_resp.headers:
-                resp_headers['X-Copied-From-Last-Modified'] = \
-                    source_resp.headers['last-modified']
+            resp_headers['X-Copied-From-Last-Modified'] = \
+                source_resp.headers['last-modified']
         # Existing sys and user meta of source object is added to response
         # headers in addition to the new ones.
         _copy_headers(sink_req.headers, resp_headers)
@@ -498,7 +501,9 @@ class ServerSideCopyMiddleware(object):
                         source_resp.headers['X-Object-Manifest']
             sink_req.params = params
 
-        # Set data source, content length and etag for the PUT request
+        # Set swift.source, data source, content length and etag
+        # for the PUT request
+        sink_req.environ['swift.source'] = 'SSC'
         sink_req.environ['wsgi.input'] = FileLikeIter(source_resp.app_iter)
         sink_req.content_length = source_resp.content_length
         if (source_resp.status_int == HTTP_OK and

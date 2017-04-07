@@ -314,10 +314,10 @@ class TestObjectReplicator(unittest.TestCase):
                 (0, '', ['rsync', whole_path_from, rsync_mods]))
         start = replicator.replication_cycle
         self.assertGreaterEqual(start, 0)
-        self.assertLess(start, 9)
+        self.assertLessEqual(start, 9)
         with _mock_process(process_arg_checker):
             replicator.run_once()
-        self.assertEqual(start + 1, replicator.replication_cycle)
+        self.assertEqual((start + 1) % 10, replicator.replication_cycle)
         self.assertFalse(process_errors)
         self.assertFalse(self.logger.get_lines_for_level('error'))
         object_replicator.http_connect = was_connector
@@ -1751,8 +1751,7 @@ class TestObjectReplicator(unittest.TestCase):
         expected_tpool_calls = [
             mock.call(self.replicator._df_router[job['policy']]._get_hashes,
                       job['path'],
-                      do_listdir=do_listdir,
-                      reclaim_age=self.replicator.reclaim_age)
+                      do_listdir=do_listdir)
             for job, do_listdir in zip(jobs, do_listdir_results)
         ]
         for job in jobs:

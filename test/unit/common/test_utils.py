@@ -15,7 +15,7 @@
 
 """Tests for swift.common.utils"""
 from __future__ import print_function
-from test.unit import temptree, debug_logger
+from test.unit import temptree, debug_logger, make_timestamp_iter
 
 import ctypes
 import contextlib
@@ -25,6 +25,7 @@ import eventlet.event
 import functools
 import grp
 import logging
+import platform
 import os
 import mock
 import random
@@ -2576,6 +2577,35 @@ cluster_dfw1 = http://dfw1.host/v1/
         finally:
             utils.TRUE_VALUES = orig_trues
 
+    def test_config_positive_int_value(self):
+        expectations = {
+            # value : expected,
+            '1': 1,
+            1: 1,
+            '2': 2,
+            '1024': 1024,
+            '0': ValueError,
+            '-1': ValueError,
+            '0x01': ValueError,
+            'asdf': ValueError,
+            None: ValueError,
+            0: ValueError,
+            -1: ValueError,
+            '1.2': ValueError,  # string expresses float should be value error
+        }
+        for value, expected in expectations.items():
+            try:
+                rv = utils.config_positive_int_value(value)
+            except Exception as e:
+                if e.__class__ is not expected:
+                    raise
+                else:
+                    self.assertEqual(
+                        'Config option must be an positive int number, '
+                        'not "%s".' % value, e.message)
+            else:
+                self.assertEqual(expected, rv)
+
     def test_config_auto_int_value(self):
         expectations = {
             # (value, default) : expected,
@@ -3575,7 +3605,14 @@ cluster_dfw1 = http://dfw1.host/v1/
             called = {}
             # just ionice class uses default priority 0
             utils.modify_priority({'ionice_class': 'IOPRIO_CLASS_RT'}, logger)
-            self.assertEqual(called, {'syscall': (251, 1, pid, 1 << 13)})
+            architecture = os.uname()[4]
+            arch_bits = platform.architecture()[0]
+            if architecture == 'x86_64' and arch_bits == '64bit':
+                self.assertEqual(called, {'syscall': (251, 1, pid, 1 << 13)})
+            elif architecture == 'aarch64' and arch_bits == '64bit':
+                self.assertEqual(called, {'syscall': (30, 1, pid, 1 << 13)})
+            else:
+                self.fail("Unexpected call: %r" % called)
             called = {}
             # just ionice priority is ignored
             utils.modify_priority({'ionice_priority': '4'}, logger)
@@ -3590,7 +3627,16 @@ cluster_dfw1 = http://dfw1.host/v1/
                 'ionice_class': 'IOPRIO_CLASS_BE',
                 'ionice_priority': '4',
             }, logger)
-            self.assertEqual(called, {'syscall': (251, 1, pid, 2 << 13 | 4)})
+            if architecture == 'x86_64' and arch_bits == '64bit':
+                self.assertEqual(called, {
+                    'syscall': (251, 1, pid, 2 << 13 | 4)
+                })
+            elif architecture == 'aarch64' and arch_bits == '64bit':
+                self.assertEqual(called, {
+                    'syscall': (30, 1, pid, 2 << 13 | 4)
+                })
+            else:
+                self.fail("Unexpected call: %r" % called)
             called = {}
             # all
             utils.modify_priority({
@@ -3598,10 +3644,18 @@ cluster_dfw1 = http://dfw1.host/v1/
                 'ionice_class': 'IOPRIO_CLASS_IDLE',
                 'ionice_priority': '6',
             }, logger)
-            self.assertEqual(called, {
-                'setpriority': (0, pid, -15),
-                'syscall': (251, 1, pid, 3 << 13 | 6),
-            })
+            if architecture == 'x86_64' and arch_bits == '64bit':
+                self.assertEqual(called, {
+                    'setpriority': (0, pid, -15),
+                    'syscall': (251, 1, pid, 3 << 13 | 6),
+                })
+            elif architecture == 'aarch64' and arch_bits == '64bit':
+                self.assertEqual(called, {
+                    'setpriority': (0, pid, -15),
+                    'syscall': (30, 1, pid, 3 << 13 | 6),
+                })
+            else:
+                self.fail("Unexpected call: %r" % called)
 
     def test__NR_ioprio_set(self):
         with patch('os.uname', return_value=('', '', '', '', 'x86_64')), \
@@ -3609,6 +3663,14 @@ cluster_dfw1 = http://dfw1.host/v1/
             self.assertEqual(251, utils.NR_ioprio_set())
 
         with patch('os.uname', return_value=('', '', '', '', 'x86_64')), \
+                patch('platform.architecture', return_value=('32bit', '')):
+            self.assertRaises(OSError, utils.NR_ioprio_set)
+
+        with patch('os.uname', return_value=('', '', '', '', 'aarch64')), \
+                patch('platform.architecture', return_value=('64bit', '')):
+            self.assertEqual(30, utils.NR_ioprio_set())
+
+        with patch('os.uname', return_value=('', '', '', '', 'aarch64')), \
                 patch('platform.architecture', return_value=('32bit', '')):
             self.assertRaises(OSError, utils.NR_ioprio_set)
 
@@ -3905,12 +3967,13 @@ class TestUnlinkOlder(unittest.TestCase):
     def setUp(self):
         self.tempdir = mkdtemp()
         self.mtime = {}
+        self.ts = make_timestamp_iter()
 
     def tearDown(self):
         rmtree(self.tempdir, ignore_errors=True)
 
     def touch(self, fpath, mtime=None):
-        self.mtime[fpath] = mtime or time.time()
+        self.mtime[fpath] = mtime or next(self.ts)
         open(fpath, 'w')
 
     @contextlib.contextmanager
@@ -3929,23 +3992,23 @@ class TestUnlinkOlder(unittest.TestCase):
     def test_unlink_older_than_path_not_exists(self):
         path = os.path.join(self.tempdir, 'does-not-exist')
         # just make sure it doesn't blow up
-        utils.unlink_older_than(path, time.time())
+        utils.unlink_older_than(path, next(self.ts))
 
     def test_unlink_older_than_file(self):
         path = os.path.join(self.tempdir, 'some-file')
         self.touch(path)
         with self.assertRaises(OSError) as ctx:
-            utils.unlink_older_than(path, time.time())
+            utils.unlink_older_than(path, next(self.ts))
         self.assertEqual(ctx.exception.errno, errno.ENOTDIR)
 
     def test_unlink_older_than_now(self):
         self.touch(os.path.join(self.tempdir, 'test'))
         with self.high_resolution_getmtime():
-            utils.unlink_older_than(self.tempdir, time.time())
+            utils.unlink_older_than(self.tempdir, next(self.ts))
         self.assertEqual([], os.listdir(self.tempdir))
 
     def test_unlink_not_old_enough(self):
-        start = time.time()
+        start = next(self.ts)
         self.touch(os.path.join(self.tempdir, 'test'))
         with self.high_resolution_getmtime():
             utils.unlink_older_than(self.tempdir, start)
@@ -3953,7 +4016,7 @@ class TestUnlinkOlder(unittest.TestCase):
 
     def test_unlink_mixed(self):
         self.touch(os.path.join(self.tempdir, 'first'))
-        cutoff = time.time()
+        cutoff = next(self.ts)
         self.touch(os.path.join(self.tempdir, 'second'))
         with self.high_resolution_getmtime():
             utils.unlink_older_than(self.tempdir, cutoff)
@@ -3967,17 +4030,17 @@ class TestUnlinkOlder(unittest.TestCase):
             paths.append(path)
         # don't unlink everyone
         with self.high_resolution_getmtime():
-            utils.unlink_paths_older_than(paths[:2], time.time())
+            utils.unlink_paths_older_than(paths[:2], next(self.ts))
         self.assertEqual(['third'], os.listdir(self.tempdir))
 
     def test_unlink_empty_paths(self):
         # just make sure it doesn't blow up
-        utils.unlink_paths_older_than([], time.time())
+        utils.unlink_paths_older_than([], next(self.ts))
 
     def test_unlink_not_exists_paths(self):
         path = os.path.join(self.tempdir, 'does-not-exist')
         # just make sure it doesn't blow up
-        utils.unlink_paths_older_than([path], time.time())
+        utils.unlink_paths_older_than([path], next(self.ts))
 
 
 class TestSwiftInfo(unittest.TestCase):
@@ -5981,6 +6044,98 @@ class TestSocketStringParser(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     utils.parse_socket_string(addr, default)
 
+
+class TestHashForFileFunction(unittest.TestCase):
+    def setUp(self):
+        self.tempfilename = tempfile.mktemp()
+
+    def tearDown(self):
+        try:
+            os.unlink(self.tempfilename)
+        except OSError:
+            pass
+
+    def test_hash_for_file_smallish(self):
+        stub_data = 'some data'
+        with open(self.tempfilename, 'wb') as fd:
+            fd.write(stub_data)
+        with mock.patch('swift.common.utils.md5') as mock_md5:
+            mock_hasher = mock_md5.return_value
+            rv = utils.md5_hash_for_file(self.tempfilename)
+        self.assertTrue(mock_hasher.hexdigest.called)
+        self.assertEqual(rv, mock_hasher.hexdigest.return_value)
+        self.assertEqual([mock.call(stub_data)],
+                         mock_hasher.update.call_args_list)
+
+    def test_hash_for_file_big(self):
+        num_blocks = 10
+        block_size = utils.MD5_BLOCK_READ_BYTES
+        truncate = 523
+        start_char = ord('a')
+        expected_blocks = [chr(i) * block_size
+                           for i in range(start_char, start_char + num_blocks)]
+        full_data = ''.join(expected_blocks)
+        trimmed_data = full_data[:-truncate]
+        # sanity
+        self.assertEqual(len(trimmed_data), block_size * num_blocks - truncate)
+        with open(self.tempfilename, 'wb') as fd:
+            fd.write(trimmed_data)
+        with mock.patch('swift.common.utils.md5') as mock_md5:
+            mock_hasher = mock_md5.return_value
+            rv = utils.md5_hash_for_file(self.tempfilename)
+        self.assertTrue(mock_hasher.hexdigest.called)
+        self.assertEqual(rv, mock_hasher.hexdigest.return_value)
+        self.assertEqual(num_blocks, len(mock_hasher.update.call_args_list))
+        found_blocks = []
+        for i, (expected_block, call) in enumerate(zip(
+                expected_blocks, mock_hasher.update.call_args_list)):
+            args, kwargs = call
+            self.assertEqual(kwargs, {})
+            self.assertEqual(1, len(args))
+            block = args[0]
+            if i < num_blocks - 1:
+                self.assertEqual(block, expected_block)
+            else:
+                self.assertEqual(block, expected_block[:-truncate])
+            found_blocks.append(block)
+        self.assertEqual(''.join(found_blocks), trimmed_data)
+
+    def test_hash_for_file_empty(self):
+        with open(self.tempfilename, 'wb'):
+            pass
+        with mock.patch('swift.common.utils.md5') as mock_md5:
+            mock_hasher = mock_md5.return_value
+            rv = utils.md5_hash_for_file(self.tempfilename)
+        self.assertTrue(mock_hasher.hexdigest.called)
+        self.assertEqual(rv, mock_hasher.hexdigest.return_value)
+        self.assertEqual([], mock_hasher.update.call_args_list)
+
+    def test_hash_for_file_brittle(self):
+        data_to_expected_hash = {
+            '': 'd41d8cd98f00b204e9800998ecf8427e',
+            'some data': '1e50210a0202497fb79bc38b6ade6c34',
+            ('a' * 4096 * 10)[:-523]: '06a41551609656c85f14f659055dc6d3',
+        }
+        # unlike some other places where the concrete implementation really
+        # matters for backwards compatibility these brittle tests are probably
+        # not needed or justified, if a future maintainer rips them out later
+        # they're probably doing the right thing
+        failures = []
+        for stub_data, expected_hash in data_to_expected_hash.items():
+            with open(self.tempfilename, 'wb') as fd:
+                fd.write(stub_data)
+            rv = utils.md5_hash_for_file(self.tempfilename)
+            try:
+                self.assertEqual(expected_hash, rv)
+            except AssertionError:
+                trim_cap = 80
+                if len(stub_data) > trim_cap:
+                    stub_data = '%s...<truncated>' % stub_data[:trim_cap]
+                failures.append('hash for %r was %s instead of expected %s' % (
+                    stub_data, rv, expected_hash))
+        if failures:
+            self.fail('Some data did not compute expected hash:\n' +
+                      '\n'.join(failures))
 
 if __name__ == '__main__':
     unittest.main()

@@ -1,4 +1,3 @@
-# -*- coding:utf-8 -*-
 # Copyright (c) 2010-2012 OpenStack Foundation
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -28,6 +27,7 @@ import tempfile
 import uuid
 import xattr
 import re
+import six
 from collections import defaultdict
 from random import shuffle, randint
 from shutil import rmtree
@@ -583,8 +583,37 @@ class TestDiskFileRouter(unittest.TestCase):
 
 class BaseDiskFileTestMixin(object):
     """
-    Bag of helpers that are useful in the per-policy DiskFile test classes.
+    Bag of helpers that are useful in the per-policy DiskFile test classes,
+    plus common setUp and tearDown methods.
     """
+
+    # set mgr_cls on subclasses
+    mgr_cls = None
+
+    def setUp(self):
+        self.tmpdir = mkdtemp()
+        self.testdir = os.path.join(
+            self.tmpdir, 'tmp_test_obj_server_DiskFile')
+        self.existing_device = 'sda1'
+        self.existing_device2 = 'sda2'
+        for policy in POLICIES:
+            mkdirs(os.path.join(self.testdir, self.existing_device,
+                                diskfile.get_tmp_dir(policy)))
+            mkdirs(os.path.join(self.testdir, self.existing_device2,
+                                diskfile.get_tmp_dir(policy)))
+        self._orig_tpool_exc = tpool.execute
+        tpool.execute = lambda f, *args, **kwargs: f(*args, **kwargs)
+        self.conf = dict(devices=self.testdir, mount_check='false',
+                         keep_cache_size=2 * 1024, mb_per_sync=1)
+        self.logger = debug_logger('test-' + self.__class__.__name__)
+        self.df_mgr = self.mgr_cls(self.conf, self.logger)
+        self.df_router = diskfile.DiskFileRouter(self.conf, self.logger)
+        self._ts_iter = (Timestamp(t) for t in
+                         itertools.count(int(time())))
+
+    def tearDown(self):
+        rmtree(self.tmpdir, ignore_errors=True)
+        tpool.execute = self._orig_tpool_exc
 
     def _manager_mock(self, manager_attribute_name, df=None):
         mgr_cls = df._manager.__class__ if df else self.mgr_cls
@@ -627,37 +656,37 @@ class DiskFileManagerMixin(BaseDiskFileTestMixin):
     won't get picked up by test runners because it doesn't subclass
     unittest.TestCase and doesn't have [Tt]est in the name.
     """
-
-    # set mgr_cls on subclasses
-    mgr_cls = None
-
-    def setUp(self):
-        self.tmpdir = mkdtemp()
-        self.testdir = os.path.join(
-            self.tmpdir, 'tmp_test_obj_server_DiskFile')
-        self.existing_device1 = 'sda1'
-        self.existing_device2 = 'sda2'
-        for policy in POLICIES:
-            mkdirs(os.path.join(self.testdir, self.existing_device1,
-                                diskfile.get_tmp_dir(policy)))
-            mkdirs(os.path.join(self.testdir, self.existing_device2,
-                                diskfile.get_tmp_dir(policy)))
-        self._orig_tpool_exc = tpool.execute
-        tpool.execute = lambda f, *args, **kwargs: f(*args, **kwargs)
-        self.conf = dict(devices=self.testdir, mount_check='false',
-                         keep_cache_size=2 * 1024)
-        self.logger = debug_logger('test-' + self.__class__.__name__)
-        self.df_mgr = self.mgr_cls(self.conf, self.logger)
-        self.df_router = diskfile.DiskFileRouter(self.conf, self.logger)
-
-    def tearDown(self):
-        rmtree(self.tmpdir, ignore_errors=1)
-
     def _get_diskfile(self, policy, frag_index=None, **kwargs):
         df_mgr = self.df_router[policy]
         return df_mgr.get_diskfile('sda1', '0', 'a', 'c', 'o',
                                    policy=policy, frag_index=frag_index,
                                    **kwargs)
+
+    def test_cleanup_uses_configured_reclaim_age(self):
+        # verify that the reclaim_age used when cleaning up tombstones is
+        # either the default or the configured value
+        def do_test(ts, expect_reclaim):
+            for policy in POLICIES:
+                self.df_router = diskfile.DiskFileRouter(
+                    self.conf, self.logger)
+                df = self._get_diskfile(policy)
+                df.delete(ts.internal)
+                tombstone_file = os.path.join(df._datadir, ts.internal + '.ts')
+                # cleanup_ondisk_files always uses the configured value
+                df._manager.cleanup_ondisk_files(
+                    os.path.dirname(tombstone_file))
+                self.assertNotEqual(
+                    expect_reclaim, os.path.exists(tombstone_file))
+
+        # reclaim_age not configured so default should be used
+        do_test(Timestamp(time() - diskfile.DEFAULT_RECLAIM_AGE - 1), True)
+        do_test(Timestamp(time() - diskfile.DEFAULT_RECLAIM_AGE + 100), False)
+
+        # reclaim_age configured value should be used
+        self.conf['reclaim_age'] = 1000
+        do_test(Timestamp(time() - diskfile.DEFAULT_RECLAIM_AGE + 100), True)
+        do_test(Timestamp(time() - 1001), True)
+        do_test(Timestamp(time() + 100), False)
 
     def _test_get_ondisk_files(self, scenarios, policy,
                                frag_index=None, **kwargs):
@@ -700,8 +729,8 @@ class DiskFileManagerMixin(BaseDiskFileTestMixin):
             expected_after_cleanup = set([f[0] for f in test
                                           if (f[2] if len(f) > 2 else f[1])])
             if reclaim_age:
-                class_under_test.cleanup_ondisk_files(
-                    hashdir, reclaim_age=reclaim_age)
+                class_under_test.reclaim_age = reclaim_age
+                class_under_test.cleanup_ondisk_files(hashdir)
             else:
                 with mock.patch('swift.obj.diskfile.time') as mock_time:
                     # don't reclaim anything
@@ -850,10 +879,10 @@ class DiskFileManagerMixin(BaseDiskFileTestMixin):
         self.df_mgr.logger.increment = mock.MagicMock()
         ts = Timestamp(10000.0).internal
         with mock.patch('swift.obj.diskfile.write_pickle') as wp:
-            self.df_mgr.pickle_async_update(self.existing_device1,
+            self.df_mgr.pickle_async_update(self.existing_device,
                                             'a', 'c', 'o',
                                             dict(a=1, b=2), ts, POLICIES[0])
-            dp = self.df_mgr.construct_dev_path(self.existing_device1)
+            dp = self.df_mgr.construct_dev_path(self.existing_device)
             ohash = diskfile.hash_path('a', 'c', 'o')
             wp.assert_called_with({'a': 1, 'b': 2},
                                   os.path.join(
@@ -870,12 +899,12 @@ class DiskFileManagerMixin(BaseDiskFileTestMixin):
         # Double check settings
         self.df_mgr.replication_one_per_device = True
         self.df_mgr.replication_lock_timeout = 0.1
-        dev_path = os.path.join(self.testdir, self.existing_device1)
-        with self.df_mgr.replication_lock(self.existing_device1):
+        dev_path = os.path.join(self.testdir, self.existing_device)
+        with self.df_mgr.replication_lock(self.existing_device):
             lock_exc = None
             exc = None
             try:
-                with self.df_mgr.replication_lock(self.existing_device1):
+                with self.df_mgr.replication_lock(self.existing_device):
                     raise Exception(
                         '%r was not replication locked!' % dev_path)
             except ReplicationLockTimeout as err:
@@ -889,7 +918,7 @@ class DiskFileManagerMixin(BaseDiskFileTestMixin):
         # Double check settings
         self.df_mgr.replication_one_per_device = False
         self.df_mgr.replication_lock_timeout = 0.1
-        dev_path = os.path.join(self.testdir, self.existing_device1)
+        dev_path = os.path.join(self.testdir, self.existing_device)
         with self.df_mgr.replication_lock(dev_path):
             lock_exc = None
             exc = None
@@ -908,7 +937,7 @@ class DiskFileManagerMixin(BaseDiskFileTestMixin):
         # Double check settings
         self.df_mgr.replication_one_per_device = True
         self.df_mgr.replication_lock_timeout = 0.1
-        with self.df_mgr.replication_lock(self.existing_device1):
+        with self.df_mgr.replication_lock(self.existing_device):
             lock_exc = None
             try:
                 with self.df_mgr.replication_lock(self.existing_device2):
@@ -1062,8 +1091,7 @@ class DiskFileManagerMixin(BaseDiskFileTestMixin):
                 self.df_mgr, '/srv/dev/', '9',
                 'a', 'c', 'o', policy=POLICIES[0])
             cleanup.assert_called_once_with(
-                '/srv/dev/objects/9/900/9a7175077c01a23ade5956b8a2bba900',
-                604800)
+                '/srv/dev/objects/9/900/9a7175077c01a23ade5956b8a2bba900')
             readmeta.assert_called_once_with(
                 '/srv/dev/objects/9/900/9a7175077c01a23ade5956b8a2bba900/'
                 '1381679759.90941.data')
@@ -1095,7 +1123,7 @@ class DiskFileManagerMixin(BaseDiskFileTestMixin):
         self.df_mgr.get_dev_path = mock.MagicMock(return_value=None)
         exc = None
         try:
-            list(self.df_mgr.yield_suffixes(self.existing_device1, '9', 0))
+            list(self.df_mgr.yield_suffixes(self.existing_device, '9', 0))
         except DiskFileDeviceUnavailable as err:
             exc = err
         self.assertEqual(str(exc), '')
@@ -1103,7 +1131,7 @@ class DiskFileManagerMixin(BaseDiskFileTestMixin):
     def test_yield_suffixes(self):
         self.df_mgr._listdir = mock.MagicMock(return_value=[
             'abc', 'def', 'ghi', 'abcd', '012'])
-        dev = self.existing_device1
+        dev = self.existing_device
         self.assertEqual(
             list(self.df_mgr.yield_suffixes(dev, '9', POLICIES[0])),
             [(self.testdir + '/' + dev + '/objects/9/abc', 'abc'),
@@ -1114,7 +1142,7 @@ class DiskFileManagerMixin(BaseDiskFileTestMixin):
         self.df_mgr.get_dev_path = mock.MagicMock(return_value=None)
         exc = None
         try:
-            list(self.df_mgr.yield_hashes(self.existing_device1, '9',
+            list(self.df_mgr.yield_hashes(self.existing_device, '9',
                                           POLICIES[0]))
         except DiskFileDeviceUnavailable as err:
             exc = err
@@ -1126,7 +1154,7 @@ class DiskFileManagerMixin(BaseDiskFileTestMixin):
 
         with mock.patch('os.listdir', _listdir):
             self.assertEqual(list(self.df_mgr.yield_hashes(
-                self.existing_device1, '9', POLICIES[0])), [])
+                self.existing_device, '9', POLICIES[0])), [])
 
     def test_yield_hashes_empty_suffixes(self):
         def _listdir(path):
@@ -1134,12 +1162,12 @@ class DiskFileManagerMixin(BaseDiskFileTestMixin):
 
         with mock.patch('os.listdir', _listdir):
             self.assertEqual(
-                list(self.df_mgr.yield_hashes(self.existing_device1, '9',
+                list(self.df_mgr.yield_hashes(self.existing_device, '9',
                                               POLICIES[0],
                                               suffixes=['456'])), [])
 
     def _check_yield_hashes(self, policy, suffix_map, expected, **kwargs):
-        device = self.existing_device1
+        device = self.existing_device
         part = '9'
         part_path = os.path.join(
             self.testdir, device, diskfile.get_data_dir(policy), part)
@@ -1155,7 +1183,7 @@ class DiskFileManagerMixin(BaseDiskFileTestMixin):
                         return files
             self.fail('Unexpected listdir of %r' % path)
         expected_items = [
-            (os.path.join(part_path, hash_[-3:], hash_), hash_, timestamps)
+            (hash_, timestamps)
             for hash_, timestamps in expected.items()]
         with mock.patch('os.listdir', _listdir), \
                 mock.patch('os.unlink'):
@@ -2732,7 +2760,7 @@ class TestECDiskFileManager(DiskFileManagerMixin, unittest.TestCase):
         hash_ = os.path.basename(df._datadir)
         self.assertRaises(DiskFileNotExist,
                           self.df_mgr.get_diskfile_from_hash,
-                          self.existing_device1, '0', hash_,
+                          self.existing_device, '0', hash_,
                           POLICIES.default)  # sanity
         timestamp = Timestamp(time())
         for frag_index in (4, 7):
@@ -2740,12 +2768,12 @@ class TestECDiskFileManager(DiskFileManagerMixin, unittest.TestCase):
                            legacy_durable=legacy_durable)
 
         df4 = self.df_mgr.get_diskfile_from_hash(
-            self.existing_device1, '0', hash_, POLICIES.default, frag_index=4)
+            self.existing_device, '0', hash_, POLICIES.default, frag_index=4)
         self.assertEqual(df4._frag_index, 4)
         self.assertEqual(
             df4.read_metadata()['X-Object-Sysmeta-Ec-Frag-Index'], '4')
         df7 = self.df_mgr.get_diskfile_from_hash(
-            self.existing_device1, '0', hash_, POLICIES.default, frag_index=7)
+            self.existing_device, '0', hash_, POLICIES.default, frag_index=7)
         self.assertEqual(df7._frag_index, 7)
         self.assertEqual(
             df7.read_metadata()['X-Object-Sysmeta-Ec-Frag-Index'], '7')
@@ -2759,38 +2787,11 @@ class TestECDiskFileManager(DiskFileManagerMixin, unittest.TestCase):
 
 class DiskFileMixin(BaseDiskFileTestMixin):
 
-    # set mgr_cls on subclasses
-    mgr_cls = None
-
-    def setUp(self):
-        """Set up for testing swift.obj.diskfile"""
-        self.tmpdir = mkdtemp()
-        self.testdir = os.path.join(
-            self.tmpdir, 'tmp_test_obj_server_DiskFile')
-        self.existing_device = 'sda1'
-        for policy in POLICIES:
-            mkdirs(os.path.join(self.testdir, self.existing_device,
-                                diskfile.get_tmp_dir(policy)))
-        self._orig_tpool_exc = tpool.execute
-        tpool.execute = lambda f, *args, **kwargs: f(*args, **kwargs)
-        self.conf = dict(devices=self.testdir, mount_check='false',
-                         keep_cache_size=2 * 1024, mb_per_sync=1)
-        self.logger = debug_logger('test-' + self.__class__.__name__)
-        self.df_mgr = self.mgr_cls(self.conf, self.logger)
-        self.df_router = diskfile.DiskFileRouter(self.conf, self.logger)
-        self._ts_iter = (Timestamp(t) for t in
-                         itertools.count(int(time())))
-
     def ts(self):
         """
         Timestamps - forever.
         """
         return next(self._ts_iter)
-
-    def tearDown(self):
-        """Tear down for testing swift.obj.diskfile"""
-        rmtree(self.tmpdir, ignore_errors=1)
-        tpool.execute = self._orig_tpool_exc
 
     def _create_ondisk_file(self, df, data, timestamp, metadata=None,
                             ctype_timestamp=None,
@@ -3371,13 +3372,13 @@ class DiskFileMixin(BaseDiskFileTestMixin):
         verify(obj_name='3', csize=100000)
 
     def run_quarantine_invalids(self, invalid_type):
+        open_exc = invalid_type in ('Content-Length', 'Bad-Content-Length',
+                                    'Subtly-Corrupt-Xattrs',
+                                    'Corrupt-Xattrs', 'Truncated-Xattrs',
+                                    'Missing-Name', 'Bad-X-Delete-At')
+        open_collision = invalid_type == 'Bad-Name'
 
         def verify(*args, **kwargs):
-            open_exc = invalid_type in ('Content-Length', 'Bad-Content-Length',
-                                        'Corrupt-Xattrs', 'Truncated-Xattrs',
-                                        'Missing-Name', 'Bad-X-Delete-At')
-            open_collision = invalid_type == 'Bad-Name'
-            reader = None
             quarantine_msgs = []
             try:
                 df = self._get_open_disk_file(**kwargs)
@@ -3414,11 +3415,6 @@ class DiskFileMixin(BaseDiskFileTestMixin):
 
         def verify_air(params, start=0, adjustment=0):
             """verify (a)pp (i)ter (r)ange"""
-            open_exc = invalid_type in ('Content-Length', 'Bad-Content-Length',
-                                        'Corrupt-Xattrs', 'Truncated-Xattrs',
-                                        'Missing-Name', 'Bad-X-Delete-At')
-            open_collision = invalid_type == 'Bad-Name'
-            reader = None
             try:
                 df = self._get_open_disk_file(**params)
                 reader = df.reader()
@@ -5700,6 +5696,22 @@ class TestSuffixHashes(unittest.TestCase):
         with self.policy_in_message():
             unittest.TestCase.assertEqual(self, *args)
 
+    def get_different_suffix_df(self, df, **kwargs):
+        # returns diskfile in the same partition with different suffix
+        suffix_dir = os.path.dirname(df._datadir)
+        for i in itertools.count():
+            df2 = df._manager.get_diskfile(
+                df._device_path,
+                df._datadir.split('/')[-3],
+                df._account,
+                df._container,
+                'o%d' % i,
+                policy=df.policy,
+                **kwargs)
+            suffix_dir2 = os.path.dirname(df2._datadir)
+            if suffix_dir != suffix_dir2:
+                return df2
+
     def check_cleanup_ondisk_files(self, policy, input_files, output_files):
         orig_unlink = os.unlink
         file_list = list(input_files)
@@ -5924,7 +5936,7 @@ class TestSuffixHashes(unittest.TestCase):
     def test_cleanup_ondisk_files_purge_old_ts(self):
         for policy in self.iter_policies():
             # A single old .ts file will be removed
-            old_float = time() - (diskfile.ONE_WEEK + 1)
+            old_float = time() - (diskfile.DEFAULT_RECLAIM_AGE + 1)
             file1 = Timestamp(old_float).internal + '.ts'
             file_list = [file1]
             self.check_cleanup_ondisk_files(policy, file_list, [])
@@ -5932,7 +5944,7 @@ class TestSuffixHashes(unittest.TestCase):
     def test_cleanup_ondisk_files_keep_isolated_meta_purge_old_ts(self):
         for policy in self.iter_policies():
             # A single old .ts file will be removed despite presence of a .meta
-            old_float = time() - (diskfile.ONE_WEEK + 1)
+            old_float = time() - (diskfile.DEFAULT_RECLAIM_AGE + 1)
             file1 = Timestamp(old_float).internal + '.ts'
             file2 = Timestamp(time() + 2).internal + '.meta'
             file_list = [file1, file2]
@@ -5940,7 +5952,7 @@ class TestSuffixHashes(unittest.TestCase):
 
     def test_cleanup_ondisk_files_keep_single_old_data(self):
         for policy in self.iter_policies():
-            old_float = time() - (diskfile.ONE_WEEK + 1)
+            old_float = time() - (diskfile.DEFAULT_RECLAIM_AGE + 1)
             file1 = _make_datafilename(
                 Timestamp(old_float), policy, durable=True)
             file_list = [file1]
@@ -5949,7 +5961,7 @@ class TestSuffixHashes(unittest.TestCase):
     def test_cleanup_ondisk_drops_old_non_durable_data(self):
         for policy in self.iter_policies():
             if policy.policy_type == EC_POLICY:
-                old_float = time() - (diskfile.ONE_WEEK + 1)
+                old_float = time() - (diskfile.DEFAULT_RECLAIM_AGE + 1)
                 file1 = _make_datafilename(
                     Timestamp(old_float), policy, durable=False)
                 file_list = [file1]
@@ -5968,7 +5980,7 @@ class TestSuffixHashes(unittest.TestCase):
     def test_cleanup_ondisk_files_purges_single_old_meta(self):
         for policy in self.iter_policies():
             # A single old .meta file will be removed
-            old_float = time() - (diskfile.ONE_WEEK + 1)
+            old_float = time() - (diskfile.DEFAULT_RECLAIM_AGE + 1)
             file1 = Timestamp(old_float).internal + '.meta'
             file_list = [file1]
             self.check_cleanup_ondisk_files(policy, file_list, [])
@@ -6017,18 +6029,40 @@ class TestSuffixHashes(unittest.TestCase):
             df = df_mgr.get_diskfile('sda1', '0', 'a', 'c', 'o',
                                      policy=policy)
             suffix_dir = os.path.dirname(df._datadir)
+            suffix = os.path.basename(suffix_dir)
             part_path = os.path.join(self.devices, 'sda1',
                                      diskfile.get_data_dir(policy), '0')
             hashes_file = os.path.join(part_path, diskfile.HASH_FILE)
             inv_file = os.path.join(
                 part_path, diskfile.HASH_INVALIDATIONS_FILE)
-            self.assertFalse(os.path.exists(hashes_file))  # sanity
-            with mock.patch('swift.obj.diskfile.lock_path') as mock_lock:
-                df_mgr.invalidate_hash(suffix_dir)
-            self.assertFalse(mock_lock.called)
-            # does not create files
+            # sanity, new partition has no suffix hashing artifacts
             self.assertFalse(os.path.exists(hashes_file))
             self.assertFalse(os.path.exists(inv_file))
+            # invalidating a hash does not create the hashes_file
+            with mock.patch(
+                    'swift.obj.diskfile.BaseDiskFileManager.invalidate_hash',
+                    side_effect=diskfile.invalidate_hash) \
+                    as mock_invalidate_hash:
+                df.delete(self.ts())
+            self.assertFalse(os.path.exists(hashes_file))
+            # ... but does invalidate the suffix
+            self.assertEqual([mock.call(suffix_dir)],
+                             mock_invalidate_hash.call_args_list)
+            with open(inv_file) as f:
+                self.assertEqual(suffix, f.read().strip('\n'))
+            # ... and hashing suffixes finds (and hashes) the new suffix
+            hashes = df_mgr.get_hashes('sda1', '0', [], policy)
+            self.assertIn(suffix, hashes)
+            self.assertTrue(os.path.exists(hashes_file))
+            self.assertIn(os.path.basename(suffix_dir), hashes)
+            with open(hashes_file) as f:
+                found_hashes = pickle.load(f)
+                found_hashes.pop('updated')
+                self.assertTrue(found_hashes.pop('valid'))
+                self.assertEqual(hashes, found_hashes)
+            # ... and truncates the invalidations file
+            with open(inv_file) as f:
+                self.assertEqual('', f.read().strip('\n'))
 
     def test_invalidate_hash_empty_file_exists(self):
         for policy in self.iter_policies():
@@ -6044,6 +6078,194 @@ class TestSuffixHashes(unittest.TestCase):
             hashes = df_mgr.get_hashes('sda1', '0', [], policy)
             self.assertIn(suffix, hashes)  # sanity
 
+    def test_invalidate_hash_file_not_truncated_when_empty(self):
+        orig_open = open
+
+        def watch_open(*args, **kargs):
+            name = os.path.basename(args[0])
+            open_log[name].append(args[1])
+            return orig_open(*args, **kargs)
+
+        for policy in self.iter_policies():
+            df_mgr = self.df_router[policy]
+            part_path = os.path.join(self.devices, 'sda1',
+                                     diskfile.get_data_dir(policy), '0')
+            inv_file = os.path.join(
+                part_path, diskfile.HASH_INVALIDATIONS_FILE)
+            hash_file = os.path.join(
+                part_path, diskfile.HASH_FILE)
+
+            hashes = df_mgr.get_hashes('sda1', '0', [], policy)
+            self.assertEqual(hashes, {})
+            self.assertTrue(os.path.exists(hash_file))
+            # create something to hash
+            df = df_mgr.get_diskfile('sda1', '0', 'a', 'c', 'o',
+                                     policy=policy)
+            df.delete(self.ts())
+            self.assertTrue(os.path.exists(inv_file))
+            # invalidation file created, lets consolidate it
+            df_mgr.get_hashes('sda1', '0', [], policy)
+
+            open_log = defaultdict(list)
+            open_loc = '__builtin__.open' if six.PY2 else 'builtins.open'
+            with mock.patch(open_loc, watch_open):
+                self.assertTrue(os.path.exists(inv_file))
+                # no new suffixes get invalided... so no write iop
+                df_mgr.get_hashes('sda1', '0', [], policy)
+            # each file is opened once to read
+            expected = {
+                'hashes.pkl': ['rb'],
+                'hashes.invalid': ['rb'],
+            }
+            self.assertEqual(open_log, expected)
+
+    def _test_invalidate_hash_racing_get_hashes_diff_suffix(self, existing):
+        # a suffix can be changed or created by second process while new pkl is
+        # being calculated - verify that suffix is correct after next
+        # get_hashes call
+        for policy in self.iter_policies():
+            df_mgr = self.df_router[policy]
+            if existing:
+                # force hashes.pkl to exist
+                df_mgr.get_hashes('sda1', '0', [], policy)
+            orig_listdir = os.listdir
+            df = df_mgr.get_diskfile('sda1', '0', 'a', 'c', 'o',
+                                     policy=policy)
+            suffix = os.path.basename(os.path.dirname(df._datadir))
+            df2 = self.get_different_suffix_df(df)
+            suffix2 = os.path.basename(os.path.dirname(df2._datadir))
+            non_local = {'df2touched': False}
+            df.delete(self.ts())
+
+            def mock_listdir(*args, **kwargs):
+                # simulating an invalidation occurring in another process while
+                # get_hashes is executing
+                result = orig_listdir(*args, **kwargs)
+                if not non_local['df2touched']:
+                    non_local['df2touched'] = True
+                    # other process creates new suffix
+                    df2.delete(self.ts())
+                return result
+
+            with mock.patch('swift.obj.diskfile.os.listdir',
+                            mock_listdir):
+                # creates pkl file
+                hashes = df_mgr.get_hashes('sda1', '0', [], policy)
+
+            # second suffix added after directory listing, it's added later
+            self.assertIn(suffix, hashes)
+            self.assertNotIn(suffix2, hashes)
+            # updates pkl file
+            hashes = df_mgr.get_hashes('sda1', '0', [], policy)
+            self.assertIn(suffix, hashes)
+            self.assertIn(suffix2, hashes)
+
+    def test_invalidate_hash_racing_get_hashes_diff_suffix_new_part(self):
+        self._test_invalidate_hash_racing_get_hashes_diff_suffix(False)
+
+    def test_invalidate_hash_racing_get_hashes_diff_suffix_existing_part(self):
+        self._test_invalidate_hash_racing_get_hashes_diff_suffix(True)
+
+    def test_hash_invalidations_survive_racing_get_hashes_same_suffix(self):
+        # verify that when two processes concurrently call get_hashes, then any
+        # concurrent hash invalidation will survive and be consolidated on a
+        # subsequent call to get_hashes (i.e. ensure first get_hashes process
+        # does not ignore the concurrent hash invalidation that second
+        # get_hashes might have consolidated to hashes.pkl)
+        non_local = {}
+
+        for policy in self.iter_policies():
+            df_mgr = self.df_router[policy]
+            orig_hash_suffix = df_mgr._hash_suffix
+            # create hashes.pkl
+            df_mgr.get_hashes('sda1', '0', [], policy)
+
+            df = df_mgr.get_diskfile('sda1', '0', 'a', 'c', 'o',
+                                     policy=policy)
+            suffix_dir = os.path.dirname(df._datadir)
+            suffix = os.path.basename(suffix_dir)
+            part_dir = os.path.dirname(suffix_dir)
+            invalidations_file = os.path.join(
+                part_dir, diskfile.HASH_INVALIDATIONS_FILE)
+
+            non_local['hash'] = None
+            non_local['called'] = False
+
+            # delete will append suffix to hashes.invalid
+            df.delete(self.ts())
+            with open(invalidations_file) as f:
+                self.assertEqual(suffix, f.read().strip('\n'))  # sanity
+            hash1 = df_mgr._hash_suffix(suffix_dir)
+
+            def mock_hash_suffix(*args, **kwargs):
+                # after first get_hashes has called _hash_suffix, simulate a
+                # second process invalidating the same suffix, followed by a
+                # third process calling get_hashes and failing (or yielding)
+                # after consolidate_hashes has completed
+                result = orig_hash_suffix(*args, **kwargs)
+                if not non_local['called']:
+                    non_local['called'] = True
+                    # appends suffix to hashes.invalid
+                    df.delete(self.ts())
+                    # simulate another process calling get_hashes but failing
+                    # after hash invalidation have been consolidated
+                    hashes = df_mgr.consolidate_hashes(part_dir)
+                    self.assertTrue(hashes['valid'])
+                    # get the updated suffix hash...
+                    non_local['hash'] = orig_hash_suffix(suffix_dir)
+                return result
+
+            with mock.patch.object(df_mgr, '_hash_suffix', mock_hash_suffix):
+                # creates pkl file and repeats listing when pkl modified
+                hashes = df_mgr.get_hashes('sda1', '0', [], policy)
+
+            # first get_hashes should complete with suffix1 state
+            self.assertIn(suffix, hashes)
+            # sanity check - the suffix hash has changed...
+            self.assertNotEqual(hash1, non_local['hash'])
+            # the invalidation file has been truncated...
+            with open(invalidations_file, 'r') as f:
+                self.assertEqual('', f.read())
+            # so hashes should have the latest suffix hash...
+            self.assertEqual(hashes[suffix], non_local['hash'])
+
+    def _check_unpickle_error_and_get_hashes_failure(self, existing):
+        for policy in self.iter_policies():
+            df_mgr = self.df_router[policy]
+            df = df_mgr.get_diskfile('sda1', '0', 'a', 'c', 'o',
+                                     policy=policy)
+            suffix = os.path.basename(os.path.dirname(df._datadir))
+            if existing:
+                df.delete(self.ts())
+                hashes = df_mgr.get_hashes('sda1', '0', [], policy)
+            df.delete(self.ts())
+            part_path = os.path.join(self.devices, 'sda1',
+                                     diskfile.get_data_dir(policy), '0')
+            hashes_file = os.path.join(part_path, diskfile.HASH_FILE)
+            # write a corrupt hashes.pkl
+            open(hashes_file, 'w')
+            # simulate first call to get_hashes failing after attempting to
+            # consolidate hashes
+            with mock.patch('swift.obj.diskfile.os.listdir',
+                            side_effect=Exception()):
+                self.assertRaises(
+                    Exception, df_mgr.get_hashes, 'sda1', '0', [], policy)
+            # sanity on-disk state is invalid
+            with open(hashes_file) as f:
+                found_hashes = pickle.load(f)
+                found_hashes.pop('updated')
+                self.assertEqual(False, found_hashes.pop('valid'))
+            # verify subsequent call to get_hashes reaches correct outcome
+            hashes = df_mgr.get_hashes('sda1', '0', [], policy)
+            self.assertIn(suffix, hashes)
+            self.assertEqual([], df_mgr.logger.get_lines_for_level('warning'))
+
+    def test_unpickle_error_and_get_hashes_failure_new_part(self):
+        self._check_unpickle_error_and_get_hashes_failure(False)
+
+    def test_unpickle_error_and_get_hashes_failure_existing_part(self):
+        self._check_unpickle_error_and_get_hashes_failure(True)
+
     def test_invalidate_hash_consolidation(self):
         def assert_consolidation(suffixes):
             # verify that suffixes are invalidated after consolidation
@@ -6054,7 +6276,9 @@ class TestSuffixHashes(unittest.TestCase):
                 self.assertIn(suffix, hashes)
                 self.assertIsNone(hashes[suffix])
             with open(hashes_file, 'rb') as f:
-                self.assertEqual(hashes, pickle.load(f))
+                found_hashes = pickle.load(f)
+                self.assertTrue(hashes['valid'])
+                self.assertEqual(hashes, found_hashes)
             with open(invalidations_file, 'rb') as f:
                 self.assertEqual("", f.read())
             return hashes
@@ -6078,8 +6302,10 @@ class TestSuffixHashes(unittest.TestCase):
             invalidations_file = os.path.join(
                 part_path, diskfile.HASH_INVALIDATIONS_FILE)
             with open(hashes_file, 'rb') as f:
-                self.assertEqual(original_hashes, pickle.load(f))
-            self.assertFalse(os.path.exists(invalidations_file))
+                found_hashes = pickle.load(f)
+                found_hashes.pop('updated')
+                self.assertTrue(found_hashes.pop('valid'))
+                self.assertEqual(original_hashes, found_hashes)
 
             # invalidate the hash
             with mock.patch('swift.obj.diskfile.lock_path') as mock_lock:
@@ -6090,30 +6316,28 @@ class TestSuffixHashes(unittest.TestCase):
                 self.assertEqual(suffix + "\n", f.read())
             # hashes file is unchanged
             with open(hashes_file, 'rb') as f:
-                self.assertEqual(original_hashes, pickle.load(f))
+                found_hashes = pickle.load(f)
+                found_hashes.pop('updated')
+                self.assertTrue(found_hashes.pop('valid'))
+                self.assertEqual(original_hashes, found_hashes)
 
             # consolidate the hash and the invalidations
             hashes = assert_consolidation([suffix])
 
             # invalidate a different suffix hash in same partition but not in
             # existing hashes.pkl
-            i = 0
-            while True:
-                df2 = df_mgr.get_diskfile('sda1', '0', 'a', 'c', 'o%d' % i,
-                                          policy=policy)
-                i += 1
-                suffix_dir2 = os.path.dirname(df2._datadir)
-                if suffix_dir != suffix_dir2:
-                    break
-
+            df2 = self.get_different_suffix_df(df)
             df2.delete(self.ts())
+            suffix_dir2 = os.path.dirname(df2._datadir)
             suffix2 = os.path.basename(suffix_dir2)
             # suffix2 should be in invalidations file
             with open(invalidations_file, 'rb') as f:
                 self.assertEqual(suffix2 + "\n", f.read())
             # hashes file is not yet changed
             with open(hashes_file, 'rb') as f:
-                self.assertEqual(hashes, pickle.load(f))
+                found_hashes = pickle.load(f)
+                self.assertTrue(hashes['valid'])
+                self.assertEqual(hashes, found_hashes)
 
             # consolidate hashes
             hashes = assert_consolidation([suffix, suffix2])
@@ -6126,9 +6350,95 @@ class TestSuffixHashes(unittest.TestCase):
                 self.assertEqual("%s\n%s\n" % (suffix2, suffix2), f.read())
             # hashes file is not yet changed
             with open(hashes_file, 'rb') as f:
-                self.assertEqual(hashes, pickle.load(f))
+                found_hashes = pickle.load(f)
+                self.assertTrue(hashes['valid'])
+                self.assertEqual(hashes, found_hashes)
             # consolidate hashes
             assert_consolidation([suffix, suffix2])
+
+    def test_get_hashes_consolidates_suffix_rehash_once(self):
+        for policy in self.iter_policies():
+            df_mgr = self.df_router[policy]
+            df = df_mgr.get_diskfile('sda1', '0', 'a', 'c', 'o',
+                                     policy=policy)
+            df.delete(self.ts())
+            suffix_dir = os.path.dirname(df._datadir)
+
+            with mock.patch.object(df_mgr, 'consolidate_hashes',
+                                   side_effect=df_mgr.consolidate_hashes
+                                   ) as mock_consolidate_hashes, \
+                    mock.patch.object(df_mgr, '_hash_suffix',
+                                      side_effect=df_mgr._hash_suffix
+                                      ) as mock_hash_suffix:
+                # creates pkl file
+                df_mgr.get_hashes('sda1', '0', [], policy)
+                mock_consolidate_hashes.assert_called_once()
+                self.assertEqual([mock.call(suffix_dir)],
+                                 mock_hash_suffix.call_args_list)
+                # second object in path
+                df2 = self.get_different_suffix_df(df)
+                df2.delete(self.ts())
+                suffix_dir2 = os.path.dirname(df2._datadir)
+                mock_consolidate_hashes.reset_mock()
+                mock_hash_suffix.reset_mock()
+                # updates pkl file
+                df_mgr.get_hashes('sda1', '0', [], policy)
+                mock_consolidate_hashes.assert_called_once()
+                self.assertEqual([mock.call(suffix_dir2)],
+                                 mock_hash_suffix.call_args_list)
+
+    def test_consolidate_hashes_raises_exception(self):
+        # verify that if consolidate_hashes raises an exception then suffixes
+        # are rehashed and a hashes.pkl is written
+        for policy in self.iter_policies():
+            self.logger.clear()
+            df_mgr = self.df_router[policy]
+            # create something to hash
+            df = df_mgr.get_diskfile('sda1', '0', 'a', 'c', 'o',
+                                     policy=policy)
+            df.delete(self.ts())
+            suffix_dir = os.path.dirname(df._datadir)
+            suffix = os.path.basename(suffix_dir)
+            # no pre-existing hashes.pkl
+            with mock.patch.object(df_mgr, '_hash_suffix',
+                                   return_value='fake hash'):
+                with mock.patch.object(df_mgr, 'consolidate_hashes',
+                                       side_effect=Exception()):
+                    hashes = df_mgr.get_hashes('sda1', '0', [], policy)
+            self.assertEqual({suffix: 'fake hash'}, hashes)
+
+            # sanity check hashes file
+            part_path = os.path.join(self.devices, 'sda1',
+                                     diskfile.get_data_dir(policy), '0')
+            hashes_file = os.path.join(part_path, diskfile.HASH_FILE)
+
+            with open(hashes_file, 'rb') as f:
+                found_hashes = pickle.load(f)
+                found_hashes.pop('updated')
+                self.assertTrue(found_hashes.pop('valid'))
+                self.assertEqual(hashes, found_hashes)
+
+            # sanity check log warning
+            warnings = self.logger.get_lines_for_level('warning')
+            self.assertEqual(warnings, ["Unable to read %r" % hashes_file])
+
+            # repeat with pre-existing hashes.pkl
+            with mock.patch.object(df_mgr, '_hash_suffix',
+                                   return_value='new fake hash'):
+                with mock.patch.object(df_mgr, 'consolidate_hashes',
+                                       side_effect=Exception()):
+                    hashes = df_mgr.get_hashes('sda1', '0', [], policy)
+            self.assertEqual({suffix: 'new fake hash'}, hashes)
+
+            # sanity check hashes file
+            part_path = os.path.join(self.devices, 'sda1',
+                                     diskfile.get_data_dir(policy), '0')
+            hashes_file = os.path.join(part_path, diskfile.HASH_FILE)
+            with open(hashes_file, 'rb') as f:
+                found_hashes = pickle.load(f)
+                found_hashes.pop('updated')
+                self.assertTrue(found_hashes.pop('valid'))
+                self.assertEqual(hashes, found_hashes)
 
     # invalidate_hash tests - error handling
 
@@ -6223,15 +6533,16 @@ class TestSuffixHashes(unittest.TestCase):
                 'sda1', '0', 'a', 'c', 'o', policy=policy)
             suffix = os.path.basename(os.path.dirname(df._datadir))
             now = time()
-            # scale back the df manager's reclaim age a bit
-            df_mgr.reclaim_age = 1000
             # write a tombstone that's just a *little* older than reclaim time
-            df.delete(Timestamp(now - 10001))
+            df.delete(Timestamp(now - 1001))
             # write a meta file that's not quite so old
             ts_meta = Timestamp(now - 501)
             df.write_metadata({'X-Timestamp': ts_meta.internal})
             # sanity check
             self.assertEqual(2, len(os.listdir(df._datadir)))
+            # scale back the df manager's reclaim age a bit to make the
+            # tombstone reclaimable
+            df_mgr.reclaim_age = 1000
 
             hashes = df_mgr.get_hashes('sda1', '0', [], policy)
             # the tombstone is reclaimed, the meta file remains, the suffix
@@ -6355,8 +6666,8 @@ class TestSuffixHashes(unittest.TestCase):
             self.assertFalse(os.path.exists(df._datadir))
 
     def test_hash_suffix_one_reclaim_and_one_valid_tombstone(self):
+        paths, suffix = find_paths_with_matching_suffixes(2, 1)
         for policy in self.iter_policies():
-            paths, suffix = find_paths_with_matching_suffixes(2, 1)
             df_mgr = self.df_router[policy]
             a, c, o = paths[suffix][0]
             df1 = df_mgr.get_diskfile(
@@ -7197,6 +7508,71 @@ class TestSuffixHashes(unittest.TestCase):
                                        policy)
             self.assertEqual(hashes, {})
 
+    def _test_get_hashes_race(self, hash_breaking_function):
+        for policy in self.iter_policies():
+            df_mgr = self.df_router[policy]
+
+            df = df_mgr.get_diskfile(self.existing_device, '0', 'a', 'c',
+                                     'o', policy=policy, frag_index=3)
+            suffix = os.path.basename(os.path.dirname(df._datadir))
+
+            df2 = self.get_different_suffix_df(df, frag_index=5)
+            suffix2 = os.path.basename(os.path.dirname(df2._datadir))
+            part_path = os.path.dirname(os.path.dirname(
+                os.path.join(df._datadir)))
+            hashfile_path = os.path.join(part_path, diskfile.HASH_FILE)
+            # create hashes.pkl
+            hashes = df_mgr.get_hashes(self.existing_device, '0', [],
+                                       policy)
+            self.assertEqual(hashes, {})  # sanity
+            self.assertTrue(os.path.exists(hashfile_path))
+            # and optionally tamper with the hashes.pkl...
+            hash_breaking_function(hashfile_path)
+            non_local = {'called': False}
+            orig_hash_suffix = df_mgr._hash_suffix
+
+            # then create a suffix
+            df.delete(self.ts())
+
+            def mock_hash_suffix(*args, **kwargs):
+                # capture first call to mock_hash
+                if not non_local['called']:
+                    non_local['called'] = True
+                    df2.delete(self.ts())
+                    non_local['other_hashes'] = df_mgr.get_hashes(
+                        self.existing_device, '0', [], policy)
+                return orig_hash_suffix(*args, **kwargs)
+
+            with mock.patch.object(df_mgr, '_hash_suffix', mock_hash_suffix):
+                hashes = df_mgr.get_hashes(self.existing_device, '0', [],
+                                           policy)
+
+            self.assertTrue(non_local['called'])
+            self.assertIn(suffix, hashes)
+            self.assertIn(suffix2, hashes)
+
+    def test_get_hashes_race_invalid_pickle(self):
+        def hash_breaking_function(hashfile_path):
+            # create a garbage invalid zero-byte file which can not unpickle
+            open(hashfile_path, 'w').close()
+        self._test_get_hashes_race(hash_breaking_function)
+
+    def test_get_hashes_race_new_partition(self):
+        def hash_breaking_function(hashfile_path):
+            # simulate rebalanced part doing post-rsync REPLICATE
+            os.unlink(hashfile_path)
+            part_dir = os.path.dirname(hashfile_path)
+            os.unlink(os.path.join(part_dir, '.lock'))
+            # sanity
+            self.assertEqual([], os.listdir(os.path.dirname(hashfile_path)))
+        self._test_get_hashes_race(hash_breaking_function)
+
+    def test_get_hashes_race_existing_partition(self):
+        def hash_breaking_function(hashfile_path):
+            # no-op - simulate ok existing partition
+            self.assertTrue(os.path.exists(hashfile_path))
+        self._test_get_hashes_race(hash_breaking_function)
+
     def test_get_hashes_hash_suffix_enotdir(self):
         for policy in self.iter_policies():
             df_mgr = self.df_router[policy]
@@ -7250,36 +7626,124 @@ class TestSuffixHashes(unittest.TestCase):
             df_mgr = self.df_router[policy]
             # first create an empty pickle
             df_mgr.get_hashes(self.existing_device, '0', [], policy)
-            hashes_file = os.path.join(
-                self.devices, self.existing_device,
-                diskfile.get_data_dir(policy), '0', diskfile.HASH_FILE)
-            mtime = os.path.getmtime(hashes_file)
-            non_local = {'mtime': mtime}
-
+            non_local = {'suffix_count': 1}
             calls = []
 
-            def mock_getmtime(filename):
-                t = non_local['mtime']
+            def mock_read_hashes(filename):
+                rv = {'%03x' % i: 'fake'
+                      for i in range(non_local['suffix_count'])}
                 if len(calls) <= 3:
-                    # this will make the *next* call get a slightly
-                    # newer mtime than the last
-                    non_local['mtime'] += 1
+                    # this will make the *next* call get slightly
+                    # different content
+                    non_local['suffix_count'] += 1
                 # track exactly the value for every return
-                calls.append(t)
-                return t
-            with mock.patch('swift.obj.diskfile.getmtime',
-                            mock_getmtime):
+                calls.append(dict(rv))
+                rv['valid'] = True
+                return rv
+            with mock.patch('swift.obj.diskfile.read_hashes',
+                            mock_read_hashes):
                 df_mgr.get_hashes(self.existing_device, '0', ['123'],
                                   policy)
 
             self.assertEqual(calls, [
-                mtime + 0,  # read
-                mtime + 1,  # modified
-                mtime + 2,  # read
-                mtime + 3,  # modifed
-                mtime + 4,  # read
-                mtime + 4,  # not modifed
+                {'000': 'fake'},  # read
+                {'000': 'fake', '001': 'fake'},  # modification
+                {'000': 'fake', '001': 'fake', '002': 'fake'},  # read
+                {'000': 'fake', '001': 'fake', '002': 'fake',
+                 '003': 'fake'},  # modifed
+                {'000': 'fake', '001': 'fake', '002': 'fake',
+                 '003': 'fake', '004': 'fake'},  # read
+                {'000': 'fake', '001': 'fake', '002': 'fake',
+                 '003': 'fake', '004': 'fake'},  # not modifed
             ])
+
+
+class TestHashesHelpers(unittest.TestCase):
+
+    def setUp(self):
+        self.testdir = tempfile.mkdtemp()
+
+    def tearDown(self):
+        rmtree(self.testdir, ignore_errors=1)
+
+    def test_read_legacy_hashes(self):
+        hashes = {'stub': 'fake'}
+        hashes_file = os.path.join(self.testdir, diskfile.HASH_FILE)
+        with open(hashes_file, 'w') as f:
+            pickle.dump(hashes, f)
+        expected = {
+            'stub': 'fake',
+            'updated': -1,
+            'valid': True,
+        }
+        self.assertEqual(expected, diskfile.read_hashes(self.testdir))
+
+    def test_write_hashes_valid_updated(self):
+        hashes = {'stub': 'fake', 'valid': True}
+        now = time()
+        with mock.patch('swift.obj.diskfile.time.time', return_value=now):
+            diskfile.write_hashes(self.testdir, hashes)
+        hashes_file = os.path.join(self.testdir, diskfile.HASH_FILE)
+        with open(hashes_file) as f:
+            data = pickle.load(f)
+        expected = {
+            'stub': 'fake',
+            'updated': now,
+            'valid': True,
+        }
+        self.assertEqual(expected, data)
+
+    def test_write_hashes_invalid_updated(self):
+        hashes = {'valid': False}
+        now = time()
+        with mock.patch('swift.obj.diskfile.time.time', return_value=now):
+            diskfile.write_hashes(self.testdir, hashes)
+        hashes_file = os.path.join(self.testdir, diskfile.HASH_FILE)
+        with open(hashes_file) as f:
+            data = pickle.load(f)
+        expected = {
+            'updated': now,
+            'valid': False,
+        }
+        self.assertEqual(expected, data)
+
+    def test_write_hashes_safe_default(self):
+        hashes = {}
+        now = time()
+        with mock.patch('swift.obj.diskfile.time.time', return_value=now):
+            diskfile.write_hashes(self.testdir, hashes)
+        hashes_file = os.path.join(self.testdir, diskfile.HASH_FILE)
+        with open(hashes_file) as f:
+            data = pickle.load(f)
+        expected = {
+            'updated': now,
+            'valid': False,
+        }
+        self.assertEqual(expected, data)
+
+    def test_read_write_valid_hashes_mutation_and_transative_equality(self):
+        hashes = {'stub': 'fake', 'valid': True}
+        diskfile.write_hashes(self.testdir, hashes)
+        # write_hashes mutates the passed in hashes, it adds the updated key
+        self.assertIn('updated', hashes)
+        self.assertTrue(hashes['valid'])
+        result = diskfile.read_hashes(self.testdir)
+        # unpickling result in a new object
+        self.assertNotEqual(id(hashes), id(result))
+        # with the exactly the same value mutation from write_hashes
+        self.assertEqual(hashes, result)
+
+    def test_read_write_invalid_hashes_mutation_and_transative_equality(self):
+        hashes = {'valid': False}
+        diskfile.write_hashes(self.testdir, hashes)
+        # write_hashes mutates the passed in hashes, it adds the updated key
+        self.assertIn('updated', hashes)
+        self.assertFalse(hashes['valid'])
+        result = diskfile.read_hashes(self.testdir)
+        # unpickling result in a new object
+        self.assertNotEqual(id(hashes), id(result))
+        # with the exactly the same value mutation from write_hashes
+        self.assertEqual(hashes, result)
 
 
 if __name__ == '__main__':

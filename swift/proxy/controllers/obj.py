@@ -124,7 +124,7 @@ class BaseObjectController(Controller):
 
     def __init__(self, app, account_name, container_name, object_name,
                  **kwargs):
-        Controller.__init__(self, app)
+        super(BaseObjectController, self).__init__(app)
         self.account_name = unquote(account_name)
         self.container_name = unquote(container_name)
         self.object_name = unquote(object_name)
@@ -1747,7 +1747,12 @@ class MIMEPutter(Putter):
                    mime_boundary, multiphase=need_multiphase)
 
 
-def chunk_transformer(policy, nstreams):
+def chunk_transformer(policy):
+    """
+    A generator to transform a source chunk to erasure coded chunks for each
+    `send` call. The number of erasure coded chunks is as
+    policy.ec_n_unique_fragments.
+    """
     segment_size = policy.ec_segment_size
 
     buf = collections.deque()
@@ -1803,7 +1808,7 @@ def chunk_transformer(policy, nstreams):
         last_frags = policy.pyeclib_driver.encode(last_bytes)
         yield last_frags
     else:
-        yield [''] * nstreams
+        yield [''] * policy.ec_n_unique_fragments
 
 
 def trailing_metadata(policy, client_obj_hasher,
@@ -2178,6 +2183,7 @@ class ECObjectController(BaseObjectController):
             range_specs = self._convert_range(req, policy)
 
         safe_iter = GreenthreadSafeIterator(node_iter)
+
         # Sending the request concurrently to all nodes, and responding
         # with the first response isn't something useful for EC as all
         # nodes contain different fragments. Also EC has implemented it's
@@ -2204,8 +2210,11 @@ class ECObjectController(BaseObjectController):
             # getters in case some unforeseen scenario, or a misbehaving object
             # server, causes us to otherwise make endless requests e.g. if an
             # object server were to ignore frag_prefs and always respond with
-            # a frag that is already in a bucket.
-            max_extra_requests = 2 * policy.ec_nparity + policy.ec_ndata
+            # a frag that is already in a bucket. Now we're assuming it should
+            # be limit at most 2 * replicas.
+            max_extra_requests = (
+                (policy.object_ring.replica_count * 2) - policy.ec_ndata)
+
             for get, parts_iter in pile:
                 if get.last_status is None:
                     # We may have spawned getters that find the node iterator
@@ -2322,27 +2331,32 @@ class ECObjectController(BaseObjectController):
             logger=self.app.logger,
             need_multiphase=True)
 
-    def _determine_chunk_destinations(self, putters):
+    def _determine_chunk_destinations(self, putters, policy):
         """
         Given a list of putters, return a dict where the key is the putter
-        and the value is the node index to use.
+        and the value is the frag index to use.
 
-        This is done so that we line up handoffs using the same node index
+        This is done so that we line up handoffs using the same frag index
         (in the primary part list) as the primary that the handoff is standing
         in for.  This lets erasure-code fragment archives wind up on the
         preferred local primary nodes when possible.
+
+        :param putters: a list of swift.proxy.controllers.obj.MIMEPutter
+                        instance
+        :param policy: A policy instance which should be one of ECStoragePolicy
         """
-        # Give each putter a "chunk index": the index of the
+        # Give each putter a "frag index": the index of the
         # transformed chunk that we'll send to it.
         #
         # For primary nodes, that's just its index (primary 0 gets
         # chunk 0, primary 1 gets chunk 1, and so on). For handoffs,
         # we assign the chunk index of a missing primary.
         handoff_conns = []
-        chunk_index = {}
+        putter_to_frag_index = {}
         for p in putters:
             if p.node_index is not None:
-                chunk_index[p] = p.node_index
+                putter_to_frag_index[p] = policy.get_backend_index(
+                    p.node_index)
             else:
                 handoff_conns.append(p)
 
@@ -2351,12 +2365,35 @@ class ECObjectController(BaseObjectController):
         # nodes. Holes occur when a storage node is down, in which
         # case the connection is not replaced, and when a storage node
         # returns 507, in which case a handoff is used to replace it.
-        holes = [x for x in range(len(putters))
-                 if x not in chunk_index.values()]
 
+        # lack_list is a dict of list to keep hole indexes
+        # e.g. if we have 2 holes for frag index 0 with ec_duplication_factor=2
+        # lack_list is like {0: [0], 1: [0]}, and then, if 1 hole found
+        # for frag index 1, lack_list will be {0: [0, 1], 1: [0]}.
+        # After that, holes will be filled from bigger key
+        # (i.e. 1:[0] at first)
+
+        # Grouping all missing fragment indexes for each frag_index
+        available_indexes = putter_to_frag_index.values()
+        lack_list = collections.defaultdict(list)
+        for frag_index in range(policy.ec_n_unique_fragments):
+            # Set the missing index to lack_list
+            available_count = available_indexes.count(frag_index)
+            # N.B. it should be duplication_factor >= lack >= 0
+            lack = policy.ec_duplication_factor - available_count
+            # now we are missing one or more nodes to store the frag index
+            for lack_tier in range(lack):
+                lack_list[lack_tier].append(frag_index)
+
+        # Extract the lack_list to a flat list
+        holes = []
+        for lack_tier, indexes in sorted(lack_list.items(), reverse=True):
+            holes.extend(indexes)
+
+        # Fill putter_to_frag_index list with the hole list
         for hole, p in zip(holes, handoff_conns):
-            chunk_index[p] = hole
-        return chunk_index
+            putter_to_frag_index[p] = hole
+        return putter_to_frag_index
 
     def _transfer_data(self, req, policy, data_source, putters, nodes,
                        min_conns, etag_hasher):
@@ -2366,15 +2403,15 @@ class ECObjectController(BaseObjectController):
         This method was added in the PUT method extraction change
         """
         bytes_transferred = 0
-        chunk_transform = chunk_transformer(policy, len(nodes))
+        chunk_transform = chunk_transformer(policy)
         chunk_transform.send(None)
-        chunk_hashers = collections.defaultdict(md5)
+        frag_hashers = collections.defaultdict(md5)
 
         def send_chunk(chunk):
             # Note: there's two different hashers in here. etag_hasher is
             # hashing the original object so that we can validate the ETag
             # that the client sent (and etag_hasher is None if the client
-            # didn't send one). The hasher in chunk_hashers is hashing the
+            # didn't send one). The hasher in frag_hashers is hashing the
             # fragment archive being sent to the client; this lets us guard
             # against data corruption on the network between proxy and
             # object server.
@@ -2386,11 +2423,17 @@ class ECObjectController(BaseObjectController):
                 # or whatever we're doing, the transform will give us None.
                 return
 
+            updated_frag_indexes = set()
             for putter in list(putters):
-                ci = chunk_index[putter]
-                backend_chunk = backend_chunks[ci]
+                frag_index = putter_to_frag_index[putter]
+                backend_chunk = backend_chunks[frag_index]
                 if not putter.failed:
-                    chunk_hashers[ci].update(backend_chunk)
+                    # N.B. same frag_index will appear when using
+                    # ec_duplication_factor >= 2. So skip to feed the chunk
+                    # to hasher if the frag was updated already.
+                    if frag_index not in updated_frag_indexes:
+                        frag_hashers[frag_index].update(backend_chunk)
+                        updated_frag_indexes.add(frag_index)
                     putter.send_chunk(backend_chunk)
                 else:
                     putter.close()
@@ -2403,9 +2446,10 @@ class ECObjectController(BaseObjectController):
         try:
             with ContextPool(len(putters)) as pool:
 
-                # build our chunk index dict to place handoffs in the
+                # build our putter_to_frag_index dict to place handoffs in the
                 # same part nodes index as the primaries they are covering
-                chunk_index = self._determine_chunk_destinations(putters)
+                putter_to_frag_index = self._determine_chunk_destinations(
+                    putters, policy)
 
                 for putter in putters:
                     putter.spawn_sender_greenthread(
@@ -2452,14 +2496,14 @@ class ECObjectController(BaseObjectController):
                 footers = {(k, v) for k, v in footers.items()
                            if not k.lower().startswith('x-object-sysmeta-ec-')}
                 for putter in putters:
-                    ci = chunk_index[putter]
+                    frag_index = putter_to_frag_index[putter]
                     # Update any footers set by middleware with EC footers
                     trail_md = trailing_metadata(
                         policy, etag_hasher,
-                        bytes_transferred, ci)
+                        bytes_transferred, frag_index)
                     trail_md.update(footers)
                     # Etag footer must always be hash of what we sent
-                    trail_md['Etag'] = chunk_hashers[ci].hexdigest()
+                    trail_md['Etag'] = frag_hashers[frag_index].hexdigest()
                     putter.end_of_object_data(footer_metadata=trail_md)
 
                 for putter in putters:

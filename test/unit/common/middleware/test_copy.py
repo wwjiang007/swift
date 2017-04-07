@@ -150,13 +150,15 @@ class TestServerSideCopyMiddleware(unittest.TestCase):
         self.assertEqual(len(self.authorized), 1)
         self.assertRequestEqual(req, self.authorized[0])
 
-    def test_object_delete_pass_through(self):
-        self.app.register('DELETE', '/v1/a/c/o', swob.HTTPOk, {})
-        req = Request.blank('/v1/a/c/o', method='DELETE')
-        status, headers, body = self.call_ssc(req)
-        self.assertEqual(status, '200 OK')
-        self.assertEqual(len(self.authorized), 1)
-        self.assertRequestEqual(req, self.authorized[0])
+    def test_object_pass_through_methods(self):
+        for method in ['DELETE', 'GET', 'HEAD', 'REPLICATE']:
+            self.app.register(method, '/v1/a/c/o', swob.HTTPOk, {})
+            req = Request.blank('/v1/a/c/o', method=method)
+            status, headers, body = self.call_ssc(req)
+            self.assertEqual(status, '200 OK')
+            self.assertEqual(len(self.authorized), 1)
+            self.assertRequestEqual(req, self.authorized[0])
+            self.assertNotIn('swift.orig_req_method', req.environ)
 
     def test_POST_as_COPY_simple(self):
         self.app.register('GET', '/v1/a/c/o', swob.HTTPOk, {}, 'passed')
@@ -166,6 +168,8 @@ class TestServerSideCopyMiddleware(unittest.TestCase):
         self.assertEqual(status, '202 Accepted')
         self.assertEqual(len(self.authorized), 1)
         self.assertRequestEqual(req, self.authorized[0])
+        # For basic test cases, assert orig_req_method behavior
+        self.assertEqual(req.environ['swift.orig_req_method'], 'POST')
 
     def test_POST_as_COPY_201_return_202(self):
         self.app.register('GET', '/v1/a/c/o', swob.HTTPOk, {}, 'passed')
@@ -256,6 +260,10 @@ class TestServerSideCopyMiddleware(unittest.TestCase):
         self.assertEqual('/v1/a/c/o', self.authorized[0].path)
         self.assertEqual('PUT', self.authorized[1].method)
         self.assertEqual('/v1/a/c/o2', self.authorized[1].path)
+        self.assertEqual(self.app.swift_sources[0], 'SSC')
+        self.assertEqual(self.app.swift_sources[1], 'SSC')
+        # For basic test cases, assert orig_req_method behavior
+        self.assertNotIn('swift.orig_req_method', req.environ)
 
     def test_static_large_object_manifest(self):
         self.app.register('GET', '/v1/a/c/o', swob.HTTPOk,
@@ -661,6 +669,8 @@ class TestServerSideCopyMiddleware(unittest.TestCase):
             ('PUT', '/v1/a/c/o-copy')])
         self.assertIn('etag', self.app.headers[1])
         self.assertEqual(self.app.headers[1]['etag'], 'is sent')
+        # For basic test cases, assert orig_req_method behavior
+        self.assertEqual(req.environ['swift.orig_req_method'], 'COPY')
 
     def test_basic_DLO(self):
         self.app.register('GET', '/v1/a/c/o', swob.HTTPOk, {
@@ -1189,6 +1199,8 @@ class TestServerSideCopyMiddleware(unittest.TestCase):
         self.assertEqual(len(self.authorized), 1)
         self.assertEqual('OPTIONS', self.authorized[0].method)
         self.assertEqual('/v1/a/c/o', self.authorized[0].path)
+        # For basic test cases, assert orig_req_method behavior
+        self.assertNotIn('swift.orig_req_method', req.environ)
 
     def test_COPY_in_OPTIONS_response_CORS(self):
         self.app.register('OPTIONS', '/v1/a/c/o', swob.HTTPOk,
@@ -1454,6 +1466,10 @@ class TestServerSideCopyConfiguration(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.tmpdir)
 
+    def test_post_as_copy_defaults_to_false(self):
+        ssc = copy.filter_factory({})("no app here")
+        self.assertEqual(ssc.object_post_as_copy, False)
+
     def test_reading_proxy_conf_when_no_middleware_conf_present(self):
         proxy_conf = dedent("""
         [DEFAULT]
@@ -1501,12 +1517,49 @@ class TestServerSideCopyConfiguration(unittest.TestCase):
         conffile.write(proxy_conf)
         conffile.flush()
 
-        ssc = copy.filter_factory({
-            'object_post_as_copy': 'no',
-            '__file__': conffile.name
-        })("no app here")
+        with mock.patch('swift.common.middleware.copy.get_logger',
+                        return_value=debug_logger('copy')):
+            ssc = copy.filter_factory({
+                'object_post_as_copy': 'no',
+                '__file__': conffile.name
+            })("no app here")
 
         self.assertEqual(ssc.object_post_as_copy, False)
+        self.assertFalse(ssc.logger.get_lines_for_level('warning'))
+
+    def _test_post_as_copy_emits_warning(self, conf):
+        with mock.patch('swift.common.middleware.copy.get_logger',
+                        return_value=debug_logger('copy')):
+            ssc = copy.filter_factory(conf)("no app here")
+
+        self.assertEqual(ssc.object_post_as_copy, True)
+        log_lines = ssc.logger.get_lines_for_level('warning')
+        self.assertEqual(1, len(log_lines))
+        self.assertIn('object_post_as_copy=true is deprecated', log_lines[0])
+
+    def test_post_as_copy_emits_warning(self):
+        self._test_post_as_copy_emits_warning({'object_post_as_copy': 'yes'})
+
+        proxy_conf = dedent("""
+        [DEFAULT]
+        bind_ip = 10.4.5.6
+
+        [pipeline:main]
+        pipeline = catch_errors copy ye-olde-proxy-server
+
+        [filter:copy]
+        use = egg:swift#copy
+
+        [app:ye-olde-proxy-server]
+        use = egg:swift#proxy
+        object_post_as_copy = yes
+        """)
+
+        conffile = tempfile.NamedTemporaryFile()
+        conffile.write(proxy_conf)
+        conffile.flush()
+
+        self._test_post_as_copy_emits_warning({'__file__': conffile.name})
 
 
 @patch_policies(with_ec_default=True)

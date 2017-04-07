@@ -398,10 +398,9 @@ def loadapp(conf_file, global_conf=None, allow_modify_pipeline=True):
 
 def run_server(conf, logger, sock, global_conf=None):
     # Ensure TZ environment variable exists to avoid stat('/etc/localtime') on
-    # some platforms. This locks in reported times to the timezone in which
-    # the server first starts running in locations that periodically change
-    # timezones.
-    os.environ['TZ'] = time.strftime("%z", time.gmtime())
+    # some platforms. This locks in reported times to UTC.
+    os.environ['TZ'] = 'UTC+0'
+    time.tzset()
 
     wsgi.HttpProtocol.default_request_version = "HTTP/1.0"
     # Turn off logging requests by the underlying WSGI software.
@@ -1077,6 +1076,12 @@ class WSGIContext(object):
                 return val
         return None
 
+    def update_content_length(self, new_total_len):
+        self._response_headers = [
+            (h, v) for h, v in self._response_headers
+            if h.lower() != 'content-length']
+        self._response_headers.append(('Content-Length', str(new_total_len)))
+
 
 def make_env(env, method=None, path=None, agent='Swift', query_string=None,
              swift_source=None):
@@ -1112,8 +1117,7 @@ def make_env(env, method=None, path=None, agent='Swift', query_string=None,
                  'SERVER_PROTOCOL', 'swift.cache', 'swift.source',
                  'swift.trans_id', 'swift.authorize_override',
                  'swift.authorize', 'HTTP_X_USER_ID', 'HTTP_X_PROJECT_ID',
-                 'HTTP_REFERER', 'swift.orig_req_method', 'swift.log_info',
-                 'swift.infocache'):
+                 'HTTP_REFERER', 'swift.infocache'):
         if name in env:
             newenv[name] = env[name]
     if method:

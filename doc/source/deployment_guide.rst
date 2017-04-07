@@ -228,10 +228,11 @@ service trying to start is missing there will be an error.  The sections not
 used by the service are ignored.
 
 Consider the example of an object storage node.  By convention, configuration
-for the object-server, object-updater, object-replicator, and object-auditor
-exist in a single file ``/etc/swift/object-server.conf``::
+for the object-server, object-updater, object-replicator, object-auditor, and
+object-reconstructor exist in a single file ``/etc/swift/object-server.conf``::
 
     [DEFAULT]
+    reclaim_age = 604800
 
     [pipeline:main]
     pipeline = object-server
@@ -240,7 +241,6 @@ exist in a single file ``/etc/swift/object-server.conf``::
     use = egg:swift#object
 
     [object-replicator]
-    reclaim_age = 259200
 
     [object-updater]
 
@@ -417,9 +417,9 @@ The following configuration options are available:
 
 [DEFAULT]
 
-================================ ==========  ==========================================
+================================ ==========  ============================================
 Option                           Default     Description
--------------------------------- ----------  ------------------------------------------
+-------------------------------- ----------  --------------------------------------------
 swift_dir                        /etc/swift  Swift configuration directory
 devices                          /srv/node   Parent directory of where devices are
                                              mounted
@@ -515,6 +515,16 @@ network_chunk_size               65536       Size of chunks to read/write over t
 disk_chunk_size                  65536       Size of chunks to read/write to disk
 container_update_timeout         1           Time to wait while sending a container
                                              update on object update.
+reclaim_age                      604800      Time elapsed in seconds before the tombstone
+                                             file representing a deleted object can be
+                                             reclaimed.  This is the maximum window for
+                                             your consistency engine.  If a node that was
+                                             disconnected from the cluster because of a
+                                             fault is reintroduced into the cluster after
+                                             this window without having its data purged
+                                             it will result in dark data.  This setting
+                                             should be consistent across all object
+                                             services.
 nice_priority                    None        Scheduling priority of server processes.
                                              Niceness values range from -20 (most
                                              favorable to the process) to 19 (least
@@ -536,7 +546,7 @@ ionice_priority                  None        I/O scheduling priority of server
                                              priority of the process. Work only with
                                              ionice_class.
                                              Ignored if IOPRIO_CLASS_IDLE is set.
-================================ ==========  ==========================================
+================================ ==========  ============================================
 
 .. _object-server-options:
 
@@ -685,8 +695,6 @@ rsync_compress               no                        Allow rsync to compress d
                                                        process.
 stats_interval               300                       Interval in seconds between
                                                        logging replication statistics
-reclaim_age                  604800                    Time elapsed in seconds before an
-                                                       object can be reclaimed
 handoffs_first               false                     If set to True, partitions that
                                                        are not supposed to be on the
                                                        node will be replicated first.
@@ -1565,6 +1573,11 @@ cors_allow_origin                                               This is a list o
                                                                 header in addition to what
                                                                 the container has set.
 strict_cors_mode                      True
+cors_expose_headers                                             This is a list of headers that
+                                                                are included in the header
+                                                                Access-Control-Expose-Headers
+                                                                in addition to what the container
+                                                                has set.
 client_timeout                        60
 trans_id_suffix                                                 This optional suffix (default is empty)
                                                                 that would be appended to the swift
@@ -1690,12 +1703,7 @@ error_suppression_limit       10               Error count to consider a
                                                node error limited
 allow_account_management      false            Whether account PUTs and DELETEs
                                                are even callable
-object_post_as_copy           true             Set object_post_as_copy = false
-                                               to turn on fast posts where only
-                                               the metadata changes are stored
-                                               anew and the original data file
-                                               is kept in place. This makes for
-                                               quicker posts.
+object_post_as_copy           false            Deprecated.
 account_autocreate            false            If set to 'true' authorized
                                                accounts that do not yet exist
                                                within the Swift cluster will
@@ -1817,7 +1825,7 @@ auth_prefix            /auth/                          The HTTP request path
 token_life             86400                           The number of seconds a
                                                        token is valid.
 storage_url_scheme     default                         Scheme to return with
-                                                       storage urls: http,
+                                                       storage URLs: http,
                                                        https, or default
                                                        (chooses based on what
                                                        the server is running

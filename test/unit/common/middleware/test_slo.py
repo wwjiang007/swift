@@ -448,6 +448,37 @@ class TestSloPutManifest(SloTestCase):
             'Content-Type %r does not end with swift_bytes=100' %
             req.headers['Content-Type'])
 
+    def test_manifest_put_no_etag_success(self):
+        req = Request.blank(
+            '/v1/AUTH_test/c/man?multipart-manifest=put',
+            method='PUT', body=test_json_data)
+        resp = req.get_response(self.slo)
+        self.assertEqual(resp.status_int, 201)
+
+    def test_manifest_put_with_etag_success(self):
+        req = Request.blank(
+            '/v1/AUTH_test/c/man?multipart-manifest=put',
+            method='PUT', body=test_json_data)
+        req.headers['Etag'] = md5hex('etagoftheobjectsegment')
+        resp = req.get_response(self.slo)
+        self.assertEqual(resp.status_int, 201)
+
+    def test_manifest_put_with_etag_with_quotes_success(self):
+        req = Request.blank(
+            '/v1/AUTH_test/c/man?multipart-manifest=put',
+            method='PUT', body=test_json_data)
+        req.headers['Etag'] = '"%s"' % md5hex('etagoftheobjectsegment')
+        resp = req.get_response(self.slo)
+        self.assertEqual(resp.status_int, 201)
+
+    def test_manifest_put_bad_etag_fail(self):
+        req = Request.blank(
+            '/v1/AUTH_test/c/man?multipart-manifest=put',
+            method='PUT', body=test_json_data)
+        req.headers['Etag'] = md5hex('NOTetagoftheobjectsegment')
+        resp = req.get_response(self.slo)
+        self.assertEqual(resp.status_int, 422)
+
     def test_handle_multipart_put_disallow_empty_first_segment(self):
         test_json_data = json.dumps([{'path': '/cont/object',
                                       'etag': 'etagoftheobjectsegment',
@@ -3016,6 +3047,16 @@ class TestSloConditionalGetOldManifest(SloTestCase):
         self.assertEqual(self.app.calls, expected_app_calls)
         self.assertNotIn('X-Backend-Etag-Is-At', self.app.headers[0])
         self.assertNotIn('X-Backend-Etag-Is-At', self.app.headers[1])
+
+    def test_range_resume_download(self):
+        req = Request.blank(
+            '/v1/AUTH_test/gettest/manifest-abcd',
+            environ={'REQUEST_METHOD': 'GET'},
+            headers={'Range': 'bytes=20-'})
+        status, headers, body = self.call_slo(req)
+
+        self.assertEqual(status, '206 Partial Content')
+        self.assertEqual(body, 'ccccccccccdddddddddddddddddddd')
 
 
 class TestSloConditionalGetNewManifest(TestSloConditionalGetOldManifest):

@@ -108,6 +108,8 @@ class RingBuilder(object):
         # a device overrides this behavior as it's assumed that's only
         # done because of device failure.
         self._last_part_moves = None
+        # _part_moved_bitmap record parts have been moved
+        self._part_moved_bitmap = None
         # _last_part_moves_epoch indicates the time the offsets in
         # _last_part_moves is based on.
         self._last_part_moves_epoch = 0
@@ -124,6 +126,19 @@ class RingBuilder(object):
             self.logger.disabled = True
             # silence "no handler for X" error messages
             self.logger.addHandler(NullHandler())
+
+    def _set_part_moved(self, part):
+        self._last_part_moves[part] = 0
+        byte, bit = divmod(part, 8)
+        self._part_moved_bitmap[byte] |= (128 >> bit)
+
+    def _has_part_moved(self, part):
+        byte, bit = divmod(part, 8)
+        return bool(self._part_moved_bitmap[byte] & (128 >> bit))
+
+    def _can_part_move(self, part):
+        return (self._last_part_moves[part] >= self.min_part_hours and
+                not self._has_part_moved(part))
 
     @contextmanager
     def debug(self):
@@ -437,6 +452,7 @@ class RingBuilder(object):
         if self._last_part_moves is None:
             self.logger.debug("New builder; performing initial balance")
             self._last_part_moves = array('B', itertools.repeat(0, self.parts))
+        self._part_moved_bitmap = bytearray(max(2 ** (self.part_power - 3), 1))
         self._update_last_part_moves()
 
         replica_plan = self._build_replica_plan()
@@ -476,8 +492,8 @@ class RingBuilder(object):
                 break
         else:
             finish_status = 'Unable to finish'
-        self.logger.debug('%s rebalance plan after %s attempts' % (
-            finish_status, gather_count + 1))
+        self.logger.debug('%(status)s rebalance plan after %(count)s attempts',
+                          {'status': finish_status, 'count': gather_count + 1})
 
         self.devs_changed = False
         self.version += 1
@@ -727,10 +743,12 @@ class RingBuilder(object):
                     'Device %s has zero weight and '
                     'should not want any replicas' % (tier,))
             required = (wanted[tier] - weighted[tier]) / weighted[tier]
-            self.logger.debug('%s wants %s and is weighted for %s so '
-                              'therefore requires %s overload' % (
-                                  tier, wanted[tier], weighted[tier],
-                                  required))
+            self.logger.debug('%(tier)s wants %(wanted)s and is weighted for '
+                              '%(weight)s so therefore requires %(required)s '
+                              'overload', {'tier': tier,
+                                           'wanted': wanted[tier],
+                                           'weight': weighted[tier],
+                                           'required': required})
             if required > max_overload:
                 max_overload = required
         return max_overload
@@ -876,7 +894,7 @@ class RingBuilder(object):
                     dev_id = self._replica2part2dev[replica][part]
                     if dev_id in dev_ids:
                         self._replica2part2dev[replica][part] = NONE_DEV
-                        self._last_part_moves[part] = 0
+                        self._set_part_moved(part)
                         assign_parts[part].append(replica)
                         self.logger.debug(
                             "Gathered %d/%d from dev %d [dev removed]",
@@ -964,7 +982,7 @@ class RingBuilder(object):
         # Now we gather partitions that are "at risk" because they aren't
         # currently sufficient spread out across the cluster.
         for part in range(self.parts):
-            if self._last_part_moves[part] < self.min_part_hours:
+            if (not self._can_part_move(part)):
                 continue
             # First, add up the count of replicas at each tier for each
             # partition.
@@ -996,7 +1014,7 @@ class RingBuilder(object):
                 # has more than one replica of a part assigned to it - which
                 # would have only been possible on rings built with an older
                 # version of the code
-                if (self._last_part_moves[part] < self.min_part_hours and
+                if (not self._can_part_move(part) and
                         not replicas_at_tier[dev['tiers'][-1]] > 1):
                     continue
                 dev['parts_wanted'] += 1
@@ -1008,7 +1026,7 @@ class RingBuilder(object):
                 self._replica2part2dev[replica][part] = NONE_DEV
                 for tier in dev['tiers']:
                     replicas_at_tier[tier] -= 1
-                self._last_part_moves[part] = 0
+                self._set_part_moved(part)
 
     def _gather_parts_for_balance_can_disperse(self, assign_parts, start,
                                                replica_plan):
@@ -1025,7 +1043,7 @@ class RingBuilder(object):
         # they have more partitions than their parts_wanted.
         for offset in range(self.parts):
             part = (start + offset) % self.parts
-            if self._last_part_moves[part] < self.min_part_hours:
+            if (not self._can_part_move(part)):
                 continue
             # For each part we'll look at the devices holding those parts and
             # see if any are overweight, keeping track of replicas_at_tier as
@@ -1048,8 +1066,6 @@ class RingBuilder(object):
             overweight_dev_replica.sort(
                 key=lambda dr: dr[0]['parts_wanted'])
             for dev, replica in overweight_dev_replica:
-                if self._last_part_moves[part] < self.min_part_hours:
-                    break
                 if any(replica_plan[tier]['min'] <=
                        replicas_at_tier[tier] <
                        replica_plan[tier]['max']
@@ -1067,7 +1083,8 @@ class RingBuilder(object):
                 self._replica2part2dev[replica][part] = NONE_DEV
                 for tier in dev['tiers']:
                     replicas_at_tier[tier] -= 1
-                self._last_part_moves[part] = 0
+                self._set_part_moved(part)
+                break
 
     def _gather_parts_for_balance(self, assign_parts, replica_plan):
         """
@@ -1081,9 +1098,10 @@ class RingBuilder(object):
         random_half = random.randint(0, self.parts / 2)
         start = (self._last_part_gather_start + quarter_turn +
                  random_half) % self.parts
-        self.logger.debug('Gather start is %s '
-                          '(Last start was %s)' % (
-                              start, self._last_part_gather_start))
+        self.logger.debug('Gather start is %(start)s '
+                          '(Last start was %(last_start)s)',
+                          {'start': start,
+                           'last_start': self._last_part_gather_start})
         self._last_part_gather_start = start
 
         self._gather_parts_for_balance_can_disperse(
@@ -1107,7 +1125,7 @@ class RingBuilder(object):
         """
         for offset in range(self.parts):
             part = (start + offset) % self.parts
-            if self._last_part_moves[part] < self.min_part_hours:
+            if (not self._can_part_move(part)):
                 continue
             overweight_dev_replica = []
             for replica in self._replicas_for_part(part):
@@ -1123,20 +1141,19 @@ class RingBuilder(object):
 
             overweight_dev_replica.sort(
                 key=lambda dr: dr[0]['parts_wanted'])
-            for dev, replica in overweight_dev_replica:
-                if self._last_part_moves[part] < self.min_part_hours:
-                    break
-                # this is the most overweight_device holding a replica of this
-                # part we don't know where it's going to end up - but we'll
-                # pick it up and hope for the best.
-                dev['parts_wanted'] += 1
-                dev['parts'] -= 1
-                assign_parts[part].append(replica)
-                self.logger.debug(
-                    "Gathered %d/%d from dev %d [weight forced]",
-                    part, replica, dev['id'])
-                self._replica2part2dev[replica][part] = NONE_DEV
-                self._last_part_moves[part] = 0
+
+            dev, replica = overweight_dev_replica[0]
+            # this is the most overweight_device holding a replica of this
+            # part we don't know where it's going to end up - but we'll
+            # pick it up and hope for the best.
+            dev['parts_wanted'] += 1
+            dev['parts'] -= 1
+            assign_parts[part].append(replica)
+            self.logger.debug(
+                "Gathered %d/%d from dev %d [weight forced]",
+                part, replica, dev['id'])
+            self._replica2part2dev[replica][part] = NONE_DEV
+            self._set_part_moved(part)
 
     def _reassign_parts(self, reassign_parts, replica_plan):
         """
@@ -1693,13 +1710,13 @@ class RingBuilder(object):
         return matched_devs
 
     def increase_partition_power(self):
-        """ Increases ring partition power by one.
+        """
+        Increases ring partition power by one.
 
         Devices will be assigned to partitions like this:
 
         OLD: 0, 3, 7, 5, 2, 1, ...
         NEW: 0, 0, 3, 3, 7, 7, 5, 5, 2, 2, 1, 1, ...
-
         """
 
         new_replica2part2dev = []

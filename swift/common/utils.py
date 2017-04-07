@@ -117,9 +117,11 @@ def NR_ioprio_set():
     """Give __NR_ioprio_set value for your system."""
     architecture = os.uname()[4]
     arch_bits = platform.architecture()[0]
-    # check if supported system, now support only x86_64
+    # check if supported system, now support x86_64 and AArch64
     if architecture == 'x86_64' and arch_bits == '64bit':
         return 251
+    elif architecture == 'aarch64' and arch_bits == '64bit':
+        return 30
     raise OSError("Swift doesn't support ionice priority for %s %s" %
                   (architecture, arch_bits))
 
@@ -341,6 +343,21 @@ def config_true_value(value):
     """
     return value is True or \
         (isinstance(value, six.string_types) and value.lower() in TRUE_VALUES)
+
+
+def config_positive_int_value(value):
+    """
+    Returns positive int value if it can be cast by int() and it's an
+    integer > 0. (not including zero) Raises ValueError otherwise.
+    """
+    try:
+        value = int(value)
+        if value < 1:
+            raise ValueError()
+    except (TypeError, ValueError):
+        raise ValueError(
+            'Config option must be an positive int number, not "%s".' % value)
+    return value
 
 
 def config_auto_int_value(value, default):
@@ -2343,7 +2360,7 @@ def compute_eta(start_time, current_value, final_value):
 
 def unlink_older_than(path, mtime):
     """
-    Remove any file in a given path that that was last modified before mtime.
+    Remove any file in a given path that was last modified before mtime.
 
     :param path: path to remove file from
     :param mtime: timestamp of oldest file to keep
@@ -2354,7 +2371,7 @@ def unlink_older_than(path, mtime):
 
 def unlink_paths_older_than(filepaths, mtime):
     """
-    Remove any files from the given list that that were
+    Remove any files from the given list that were
     last modified before mtime.
 
     :param filepaths: a list of strings, the full paths of files to check
@@ -4202,3 +4219,20 @@ def safe_json_loads(value):
         except (TypeError, ValueError):
             pass
     return None
+
+
+MD5_BLOCK_READ_BYTES = 4096
+
+
+def md5_hash_for_file(fname):
+    """
+    Get the MD5 checksum of a file.
+
+    :param fname: path to file
+    :returns: MD5 checksum, hex encoded
+    """
+    with open(fname, 'rb') as f:
+        md5sum = md5()
+        for block in iter(lambda: f.read(MD5_BLOCK_READ_BYTES), ''):
+            md5sum.update(block)
+    return md5sum.hexdigest()

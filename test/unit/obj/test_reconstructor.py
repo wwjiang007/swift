@@ -25,6 +25,7 @@ import shutil
 import re
 import random
 import struct
+import collections
 from eventlet import Timeout, sleep
 
 from contextlib import closing, contextmanager
@@ -41,7 +42,7 @@ from swift.obj.reconstructor import REVERT
 
 from test.unit import (patch_policies, debug_logger, mocked_http_conn,
                        FabricatedRing, make_timestamp_iter,
-                       DEFAULT_TEST_EC_TYPE)
+                       DEFAULT_TEST_EC_TYPE, encode_frag_archive_bodies)
 from test.unit.obj.common import write_diskfile
 
 
@@ -62,24 +63,6 @@ def mock_ssync_sender(ssync_calls=None, response_callback=None, **kwargs):
 
     with mock.patch('swift.obj.reconstructor.ssync_sender', fake_ssync):
         yield fake_ssync
-
-
-def make_ec_archive_bodies(policy, test_body):
-    segment_size = policy.ec_segment_size
-    # split up the body into buffers
-    chunks = [test_body[x:x + segment_size]
-              for x in range(0, len(test_body), segment_size)]
-    # encode the buffers into fragment payloads
-    fragment_payloads = []
-    for chunk in chunks:
-        fragments = policy.pyeclib_driver.encode(chunk)
-        if not fragments:
-            break
-        fragment_payloads.append(fragments)
-
-    # join up the fragment payloads per node
-    ec_archive_bodies = [''.join(frags) for frags in zip(*fragment_payloads)]
-    return ec_archive_bodies
 
 
 def _create_test_rings(path):
@@ -620,19 +603,19 @@ class TestGlobalSetupObjectReconstructor(unittest.TestCase):
         self._run_once(18, extra_devices)
         stats_lines = set()
         for line in self.logger.get_lines_for_level('info'):
-            if 'devices reconstructed in' not in line:
+            if 'reconstructed in' not in line:
                 continue
-            stat_line = line.split('of', 1)[0].strip()
+            stat_line = line.split('reconstructed', 1)[0].strip()
             stats_lines.add(stat_line)
         acceptable = set([
-            '0/3 (0.00%) partitions',
+            '3/8 (37.50%) partitions',
+            '5/8 (62.50%) partitions',
             '8/8 (100.00%) partitions',
         ])
         matched = stats_lines & acceptable
         self.assertEqual(matched, acceptable,
                          'missing some expected acceptable:\n%s' % (
                              '\n'.join(sorted(acceptable - matched))))
-        self.assertEqual(self.reconstructor.reconstruction_device_count, 4)
         self.assertEqual(self.reconstructor.reconstruction_part_count, 8)
         self.assertEqual(self.reconstructor.part_count, 8)
 
@@ -646,9 +629,9 @@ class TestGlobalSetupObjectReconstructor(unittest.TestCase):
         self._run_once(2, extra_devices, 'sdc1')
         stats_lines = set()
         for line in self.logger.get_lines_for_level('info'):
-            if 'devices reconstructed in' not in line:
+            if 'reconstructed in' not in line:
                 continue
-            stat_line = line.split('of', 1)[0].strip()
+            stat_line = line.split('reconstructed', 1)[0].strip()
             stats_lines.add(stat_line)
         acceptable = set([
             '1/1 (100.00%) partitions',
@@ -657,37 +640,61 @@ class TestGlobalSetupObjectReconstructor(unittest.TestCase):
         self.assertEqual(matched, acceptable,
                          'missing some expected acceptable:\n%s' % (
                              '\n'.join(sorted(acceptable - matched))))
-        self.assertEqual(self.reconstructor.reconstruction_device_count, 1)
         self.assertEqual(self.reconstructor.reconstruction_part_count, 1)
         self.assertEqual(self.reconstructor.part_count, 1)
 
     def test_get_response(self):
         part = self.part_nums[0]
-        node = POLICIES[0].object_ring.get_part_nodes(int(part))[0]
-        for stat_code in (200, 400):
+        node = self.policy.object_ring.get_part_nodes(int(part))[0]
+
+        def do_test(stat_code):
             with mocked_http_conn(stat_code):
                 resp = self.reconstructor._get_response(node, part,
                                                         path='nada',
                                                         headers={},
-                                                        policy=POLICIES[0])
-                if resp:
-                    self.assertEqual(resp.status, 200)
-                else:
-                    self.assertEqual(
-                        len(self.reconstructor.logger.log_dict['warning']), 1)
+                                                        policy=self.policy)
+            return resp
 
-    def test_reconstructor_does_not_log_on_404(self):
-        part = self.part_nums[0]
-        node = POLICIES[0].object_ring.get_part_nodes(int(part))[0]
-        with mocked_http_conn(404):
-            self.reconstructor._get_response(node, part,
-                                             path='some_path',
-                                             headers={},
-                                             policy=POLICIES[0])
+        resp = do_test(200)
+        self.assertEqual(resp.status, 200)
 
-            # Make sure that no warnings are emitted for a 404
-            len_warning_lines = len(self.logger.get_lines_for_level('warning'))
-            self.assertEqual(len_warning_lines, 0)
+        resp = do_test(400)
+        # on the error case return value will be None instead of response
+        self.assertIsNone(resp)
+        # ... and log warnings for 400
+        for line in self.logger.get_lines_for_level('warning'):
+            self.assertIn('Invalid response 400', line)
+        self.logger._clear()
+
+        resp = do_test(Exception())
+        self.assertIsNone(resp)
+        # exception should result in error logs
+        for line in self.logger.get_lines_for_level('error'):
+            self.assertIn('Trying to GET', line)
+        self.logger._clear()
+
+        # Timeout also should result in error logs
+        resp = do_test(Timeout())
+        self.assertIsNone(resp)
+        for line in self.logger.get_lines_for_level('error'):
+            self.assertIn('Trying to GET', line)
+            # sanity Timeout has extra message in the error log
+            self.assertIn('Timeout', line)
+        self.logger.clear()
+
+        # we should get a warning on 503 (sanity)
+        resp = do_test(503)
+        self.assertIsNone(resp)
+        warnings = self.logger.get_lines_for_level('warning')
+        self.assertEqual(1, len(warnings))
+        self.assertIn('Invalid response 503', warnings[0])
+        self.logger.clear()
+
+        # ... but no messages should be emitted for 404
+        resp = do_test(404)
+        self.assertIsNone(resp)
+        for level, msgs in self.logger.lines_dict.items():
+            self.assertFalse(msgs)
 
     def test_reconstructor_skips_bogus_partition_dirs(self):
         # A directory in the wrong place shouldn't crash the reconstructor
@@ -717,8 +724,18 @@ class TestGlobalSetupObjectReconstructor(unittest.TestCase):
         self.assertFalse(self.reconstructor.check_ring(obj_ring))
         rmtree(testring, ignore_errors=1)
 
+    def test_reconstruct_check_ring(self):
+        # test reconstruct logs info when check_ring is false and that
+        # there are no jobs built
+        with mock.patch('swift.obj.reconstructor.ObjectReconstructor.'
+                        'check_ring', return_value=False):
+            self.reconstructor.reconstruct()
+        msgs = self.reconstructor.logger.get_lines_for_level('info')
+        self.assertIn('Ring change detected. Aborting'
+                      ' current reconstruction pass.', msgs[0])
+        self.assertEqual(self.reconstructor.reconstruction_count, 0)
+
     def test_build_reconstruction_jobs(self):
-        self.reconstructor.handoffs_first = False
         self.reconstructor._reset_stats()
         for part_info in self.reconstructor.collect_parts():
             jobs = self.reconstructor.build_reconstruction_jobs(part_info)
@@ -727,13 +744,40 @@ class TestGlobalSetupObjectReconstructor(unittest.TestCase):
                              object_reconstructor.REVERT))
             self.assert_expected_jobs(part_info['partition'], jobs)
 
-        self.reconstructor.handoffs_first = True
-        self.reconstructor._reset_stats()
-        for part_info in self.reconstructor.collect_parts():
-            jobs = self.reconstructor.build_reconstruction_jobs(part_info)
-            self.assertTrue(jobs[0]['job_type'] ==
-                            object_reconstructor.REVERT)
-            self.assert_expected_jobs(part_info['partition'], jobs)
+    def test_handoffs_only(self):
+        self.reconstructor.handoffs_only = True
+
+        found_job_types = set()
+
+        def fake_process_job(job):
+            # increment failure counter
+            self.reconstructor.handoffs_remaining += 1
+            found_job_types.add(job['job_type'])
+
+        self.reconstructor.process_job = fake_process_job
+
+        # only revert jobs
+        self.reconstructor.reconstruct()
+        self.assertEqual(found_job_types, {object_reconstructor.REVERT})
+        # but failures keep handoffs remaining
+        msgs = self.reconstructor.logger.get_lines_for_level('info')
+        self.assertIn('Next pass will continue to revert handoffs', msgs[-1])
+        self.logger._clear()
+
+        found_job_types = set()
+
+        def fake_process_job(job):
+            # success does not increment failure counter
+            found_job_types.add(job['job_type'])
+
+        self.reconstructor.process_job = fake_process_job
+
+        # only revert jobs ... but all handoffs cleared out successfully
+        self.reconstructor.reconstruct()
+        self.assertEqual(found_job_types, {object_reconstructor.REVERT})
+        # it's time to turn off handoffs_only
+        msgs = self.reconstructor.logger.get_lines_for_level('warning')
+        self.assertIn('You should disable handoffs_only', msgs[-1])
 
     def test_get_partners(self):
         # we're going to perform an exhaustive test of every possible
@@ -804,16 +848,14 @@ class TestGlobalSetupObjectReconstructor(unittest.TestCase):
             pass
         self.assertTrue(os.path.isfile(pol_1_part_1_path))  # sanity check
 
-        # since our collect_parts job is a generator, that yields directly
-        # into build_jobs and then spawns it's safe to do the remove_files
-        # without making reconstructor startup slow
-        self.reconstructor._reset_stats()
-        for part_info in self.reconstructor.collect_parts():
-            self.assertNotEqual(pol_1_part_1_path, part_info['part_path'])
+        self.reconstructor.process_job = lambda j: None
+        self.reconstructor.reconstruct()
+
         self.assertFalse(os.path.exists(pol_1_part_1_path))
         warnings = self.reconstructor.logger.get_lines_for_level('warning')
         self.assertEqual(1, len(warnings))
-        self.assertIn('Unexpected entity in data dir:', warnings[0])
+        self.assertIn(pol_1_part_1_path, warnings[0])
+        self.assertIn('not a directory', warnings[0].lower())
 
     def test_ignores_status_file(self):
         # Following fd86d5a, the auditor will leave status files on each device
@@ -867,7 +909,7 @@ class TestGlobalSetupObjectReconstructor(unittest.TestCase):
                     self.job['policy'], self.suffixes,
                     frag_index=self.job.get('frag_index'))
                 self.available_map = {}
-                for path, hash_, timestamps in hash_gen:
+                for hash_, timestamps in hash_gen:
                     self.available_map[hash_] = timestamps
                 context['available_map'] = self.available_map
                 ssync_calls.append(context)
@@ -930,7 +972,7 @@ class TestGlobalSetupObjectReconstructor(unittest.TestCase):
                                     filename.endswith(data_file_tail))
 
         # sanity check that some files should were deleted
-        self.assertTrue(n_files > n_files_after)
+        self.assertGreater(n_files, n_files_after)
 
     def test_get_part_jobs(self):
         # yeah, this test code expects a specific setup
@@ -989,9 +1031,8 @@ class TestGlobalSetupObjectReconstructor(unittest.TestCase):
             stat_method, stat_prefix = stat_key
             self.assertStatCount(stat_method, stat_prefix, expected)
         # part 2 should be totally empty
-        policy = POLICIES[1]
-        hash_gen = self.reconstructor._df_router[policy].yield_hashes(
-            'sda1', '2', policy)
+        hash_gen = self.reconstructor._df_router[self.policy].yield_hashes(
+            'sda1', '2', self.policy)
         for path, hash_, ts in hash_gen:
             self.fail('found %s with %s in %s' % (hash_, ts, path))
         # but the partition directory and hashes pkl still exist
@@ -1039,6 +1080,7 @@ class TestGlobalSetupObjectReconstructor(unittest.TestCase):
                                          self.logger.all_log_lines())
         self.assertEqual(self.reconstructor.suffix_sync, 8)
         self.assertEqual(self.reconstructor.suffix_count, 8)
+        self.assertEqual(self.reconstructor.reconstruction_count, 6)
         self.assertEqual(len(found_jobs), 6)
 
     def test_process_job_all_insufficient_storage(self):
@@ -1054,13 +1096,14 @@ class TestGlobalSetupObjectReconstructor(unittest.TestCase):
                         self.logger._clear()
                         self.reconstructor.process_job(job)
                         for line in self.logger.get_lines_for_level('error'):
-                            self.assertTrue('responded as unmounted' in line)
+                            self.assertIn('responded as unmounted', line)
                         self.assertEqual(0, count_stats(
                             self.logger, 'update_stats', 'suffix.hashes'))
                         self.assertEqual(0, count_stats(
                             self.logger, 'update_stats', 'suffix.syncs'))
         self.assertEqual(self.reconstructor.suffix_sync, 0)
         self.assertEqual(self.reconstructor.suffix_count, 0)
+        self.assertEqual(self.reconstructor.reconstruction_count, 6)
         self.assertEqual(len(found_jobs), 6)
 
     def test_process_job_all_client_error(self):
@@ -1076,13 +1119,14 @@ class TestGlobalSetupObjectReconstructor(unittest.TestCase):
                         self.logger._clear()
                         self.reconstructor.process_job(job)
                         for line in self.logger.get_lines_for_level('error'):
-                            self.assertTrue('Invalid response 400' in line)
+                            self.assertIn('Invalid response 400', line)
                         self.assertEqual(0, count_stats(
                             self.logger, 'update_stats', 'suffix.hashes'))
                         self.assertEqual(0, count_stats(
                             self.logger, 'update_stats', 'suffix.syncs'))
         self.assertEqual(self.reconstructor.suffix_sync, 0)
         self.assertEqual(self.reconstructor.suffix_count, 0)
+        self.assertEqual(self.reconstructor.reconstruction_count, 6)
         self.assertEqual(len(found_jobs), 6)
 
     def test_process_job_all_timeout(self):
@@ -1097,7 +1141,7 @@ class TestGlobalSetupObjectReconstructor(unittest.TestCase):
                     self.logger._clear()
                     self.reconstructor.process_job(job)
                     for line in self.logger.get_lines_for_level('error'):
-                        self.assertTrue('Timeout (Nones)' in line)
+                        self.assertIn('Timeout (Nones)', line)
                     self.assertStatCount(
                         'update_stats', 'suffix.hashes', 0)
                     self.assertStatCount(
@@ -1135,6 +1179,7 @@ class TestObjectReconstructor(unittest.TestCase):
         self.policy.object_ring.max_more_nodes = \
             self.policy.object_ring.replicas
         self.ts_iter = make_timestamp_iter()
+        self.fabricated_ring = FabricatedRing(replicas=14, devices=28)
 
     def _configure_reconstructor(self, **kwargs):
         self.conf.update(kwargs)
@@ -1156,6 +1201,122 @@ class TestObjectReconstructor(unittest.TestCase):
 
     def ts(self):
         return next(self.ts_iter)
+
+    def test_handoffs_only_default(self):
+        # sanity neither option added to default conf
+        self.conf.pop('handoffs_first', None)
+        self.conf.pop('handoffs_only', None)
+        self.reconstructor = object_reconstructor.ObjectReconstructor(
+            self.conf, logger=self.logger)
+        self.assertFalse(self.reconstructor.handoffs_only)
+
+    def test_handoffs_first_enables_handoffs_only(self):
+        self.conf['handoffs_first'] = "True"
+        self.conf.pop('handoffs_only', None)  # sanity
+        self.reconstructor = object_reconstructor.ObjectReconstructor(
+            self.conf, logger=self.logger)
+        self.assertTrue(self.reconstructor.handoffs_only)
+        warnings = self.logger.get_lines_for_level('warning')
+        expected = [
+            'The handoffs_first option is deprecated in favor '
+            'of handoffs_only. This option may be ignored in a '
+            'future release.',
+            'Handoff only mode is not intended for normal operation, '
+            'use handoffs_only with care.',
+        ]
+        self.assertEqual(expected, warnings)
+
+    def test_handoffs_only_ignores_handoffs_first(self):
+        self.conf['handoffs_first'] = "True"
+        self.conf['handoffs_only'] = "False"
+        self.reconstructor = object_reconstructor.ObjectReconstructor(
+            self.conf, logger=self.logger)
+        self.assertFalse(self.reconstructor.handoffs_only)
+        warnings = self.logger.get_lines_for_level('warning')
+        expected = [
+            'The handoffs_first option is deprecated in favor of '
+            'handoffs_only. This option may be ignored in a future release.',
+            'Ignored handoffs_first option in favor of handoffs_only.',
+        ]
+        self.assertEqual(expected, warnings)
+
+    def test_handoffs_only_enabled(self):
+        self.conf.pop('handoffs_first', None)  # sanity
+        self.conf['handoffs_only'] = "True"
+        self.reconstructor = object_reconstructor.ObjectReconstructor(
+            self.conf, logger=self.logger)
+        self.assertTrue(self.reconstructor.handoffs_only)
+        warnings = self.logger.get_lines_for_level('warning')
+        expected = [
+            'Handoff only mode is not intended for normal operation, '
+            'use handoffs_only with care.',
+        ]
+        self.assertEqual(expected, warnings)
+
+    def test_handoffs_only_true_and_first_true(self):
+        self.conf['handoffs_first'] = "True"
+        self.conf['handoffs_only'] = "True"
+        self.reconstructor = object_reconstructor.ObjectReconstructor(
+            self.conf, logger=self.logger)
+        self.assertTrue(self.reconstructor.handoffs_only)
+        warnings = self.logger.get_lines_for_level('warning')
+        expected = [
+            'The handoffs_first option is deprecated in favor of '
+            'handoffs_only. This option may be ignored in a future release.',
+            'Handoff only mode is not intended for normal operation, '
+            'use handoffs_only with care.',
+        ]
+        self.assertEqual(expected, warnings)
+
+    def test_handoffs_only_false_and_first_false(self):
+        self.conf['handoffs_only'] = "False"
+        self.conf['handoffs_first'] = "False"
+        self.reconstructor = object_reconstructor.ObjectReconstructor(
+            self.conf, logger=self.logger)
+        self.assertFalse(self.reconstructor.handoffs_only)
+        warnings = self.logger.get_lines_for_level('warning')
+        expected = [
+            'The handoffs_first option is deprecated in favor of '
+            'handoffs_only. This option may be ignored in a future release.',
+        ]
+        self.assertEqual(expected, warnings)
+
+    def test_handoffs_only_none_and_first_false(self):
+        self.conf['handoffs_first'] = "False"
+        self.conf.pop('handoffs_only', None)  # sanity
+        self.reconstructor = object_reconstructor.ObjectReconstructor(
+            self.conf, logger=self.logger)
+        self.assertFalse(self.reconstructor.handoffs_only)
+        warnings = self.logger.get_lines_for_level('warning')
+        expected = [
+            'The handoffs_first option is deprecated in favor of '
+            'handoffs_only. This option may be ignored in a future release.',
+        ]
+        self.assertEqual(expected, warnings)
+
+    def test_handoffs_only_false_and_first_none(self):
+        self.conf.pop('handoffs_first', None)  # sanity
+        self.conf['handoffs_only'] = "False"
+        self.reconstructor = object_reconstructor.ObjectReconstructor(
+            self.conf, logger=self.logger)
+        self.assertFalse(self.reconstructor.handoffs_only)
+        warnings = self.logger.get_lines_for_level('warning')
+        self.assertEqual(len(warnings), 0)
+
+    def test_handoffs_only_true_and_first_false(self):
+        self.conf['handoffs_first'] = "False"
+        self.conf['handoffs_only'] = "True"
+        self.reconstructor = object_reconstructor.ObjectReconstructor(
+            self.conf, logger=self.logger)
+        self.assertTrue(self.reconstructor.handoffs_only)
+        warnings = self.logger.get_lines_for_level('warning')
+        expected = [
+            'The handoffs_first option is deprecated in favor of '
+            'handoffs_only. This option may be ignored in a future release.',
+            'Handoff only mode is not intended for normal operation, '
+            'use handoffs_only with care.',
+        ]
+        self.assertEqual(expected, warnings)
 
     def test_two_ec_policies(self):
         with patch_policies([
@@ -1243,7 +1404,7 @@ class TestObjectReconstructor(unittest.TestCase):
         self.assertEqual(found_parts, expected_parts)
         for part_info in part_infos:
             self.assertEqual(part_info['policy'], self.policy)
-            self.assertTrue(part_info['local_dev'] in stub_ring_devs)
+            self.assertIn(part_info['local_dev'], stub_ring_devs)
             dev = part_info['local_dev']
             self.assertEqual(part_info['part_path'],
                              os.path.join(self.devices,
@@ -1295,7 +1456,7 @@ class TestObjectReconstructor(unittest.TestCase):
         self.assertEqual(found_parts, expected_parts)
         for part_info in part_infos:
             self.assertEqual(part_info['policy'], self.policy)
-            self.assertTrue(part_info['local_dev'] in stub_ring_devs)
+            self.assertIn(part_info['local_dev'], stub_ring_devs)
             dev = part_info['local_dev']
             self.assertEqual(part_info['part_path'],
                              os.path.join(self.devices,
@@ -1335,7 +1496,7 @@ class TestObjectReconstructor(unittest.TestCase):
         self.assertEqual(found_parts, expected_parts)
         for part_info in part_infos:
             self.assertEqual(part_info['policy'], self.policy)
-            self.assertTrue(part_info['local_dev'] in stub_ring_devs)
+            self.assertIn(part_info['local_dev'], stub_ring_devs)
             dev = part_info['local_dev']
             self.assertEqual(part_info['part_path'],
                              os.path.join(self.devices,
@@ -1429,7 +1590,7 @@ class TestObjectReconstructor(unittest.TestCase):
         for device in local_devs:
             utils.mkdirs(os.path.join(self.devices, device))
         fake_unlink = mock.MagicMock()
-        self.reconstructor.reclaim_age = 1000
+        self._configure_reconstructor(reclaim_age=1000)
         now = time.time()
         with mock.patch('swift.obj.reconstructor.whataremyips',
                         return_value=[self.ip]), \
@@ -1472,8 +1633,8 @@ class TestObjectReconstructor(unittest.TestCase):
         error_lines = self.logger.get_lines_for_level('error')
         self.assertEqual(len(error_lines), 1)
         line = error_lines[0]
-        self.assertTrue('Unable to create' in line)
-        self.assertTrue(datadir_path in line)
+        self.assertIn('Unable to create', line)
+        self.assertIn(datadir_path, line)
 
     def test_collect_parts_skips_invalid_paths(self):
         datadir_path = os.path.join(self.devices, self.local_dev['device'],
@@ -1488,28 +1649,47 @@ class TestObjectReconstructor(unittest.TestCase):
         error_lines = self.logger.get_lines_for_level('error')
         self.assertEqual(len(error_lines), 1)
         line = error_lines[0]
-        self.assertTrue('Unable to list partitions' in line)
-        self.assertTrue(datadir_path in line)
+        self.assertIn('Unable to list partitions', line)
+        self.assertIn(datadir_path, line)
 
-    def test_collect_parts_removes_non_partition_files(self):
+    def test_reconstruct_removes_non_partition_files(self):
         # create some junk next to partitions
         datadir_path = os.path.join(self.devices, self.local_dev['device'],
                                     diskfile.get_data_dir(self.policy))
         num_parts = 3
         for part in range(num_parts):
             utils.mkdirs(os.path.join(datadir_path, str(part)))
-        junk_file = os.path.join(datadir_path, 'junk')
-        with open(junk_file, 'w') as f:
-            f.write('junk')
+
+        # Add some clearly non-partition dentries
+        utils.mkdirs(os.path.join(datadir_path, 'not/a/partition'))
+        for junk_name in ('junk', '1234'):
+            junk_file = os.path.join(datadir_path, junk_name)
+            with open(junk_file, 'w') as f:
+                f.write('junk')
+
         with mock.patch('swift.obj.reconstructor.whataremyips',
-                        return_value=[self.ip]):
-            part_infos = list(self.reconstructor.collect_parts())
-        # the file is not included in the part_infos map
-        self.assertEqual(sorted(p['part_path'] for p in part_infos),
-                         sorted([os.path.join(datadir_path, str(i))
-                                 for i in range(num_parts)]))
-        # and gets cleaned up
-        self.assertFalse(os.path.exists(junk_file))
+                        return_value=[self.ip]), \
+                mock.patch('swift.obj.reconstructor.'
+                           'ObjectReconstructor.process_job'):
+            self.reconstructor.reconstruct()
+
+        # all the bad gets cleaned up
+        errors = []
+        for junk_name in ('junk', '1234', 'not'):
+            junk_file = os.path.join(datadir_path, junk_name)
+            if os.path.exists(junk_file):
+                errors.append('%s still exists!' % junk_file)
+
+        self.assertFalse(errors)
+
+        error_lines = self.logger.get_lines_for_level('warning')
+        self.assertIn('Unexpected entity in data dir: %r'
+                      % os.path.join(datadir_path, 'not'), error_lines)
+        self.assertIn('Unexpected entity in data dir: %r'
+                      % os.path.join(datadir_path, 'junk'), error_lines)
+        self.assertIn('Unexpected entity %r is not a directory'
+                      % os.path.join(datadir_path, '1234'), error_lines)
+        self.assertEqual(self.reconstructor.reconstruction_part_count, 6)
 
     def test_collect_parts_overrides(self):
         # setup multiple devices, with multiple parts
@@ -1640,7 +1820,7 @@ class TestObjectReconstructor(unittest.TestCase):
         self.assertEqual(job['device'], self.local_dev['device'])
 
     def test_build_jobs_primary(self):
-        ring = self.policy.object_ring = FabricatedRing()
+        ring = self.policy.object_ring = self.fabricated_ring
         # find a partition for which we're a primary
         for partition in range(2 ** ring.part_power):
             part_nodes = ring.get_part_nodes(partition)
@@ -1685,7 +1865,7 @@ class TestObjectReconstructor(unittest.TestCase):
         self.assertEqual(job['device'], self.local_dev['device'])
 
     def test_build_jobs_handoff(self):
-        ring = self.policy.object_ring = FabricatedRing()
+        ring = self.policy.object_ring = self.fabricated_ring
         # find a partition for which we're a handoff
         for partition in range(2 ** ring.part_power):
             part_nodes = ring.get_part_nodes(partition)
@@ -1704,7 +1884,7 @@ class TestObjectReconstructor(unittest.TestCase):
         }
         # since this part doesn't belong on us it doesn't matter what
         # frag_index we have
-        frag_index = random.randint(0, ring.replicas - 1)
+        frag_index = random.randint(0, self.policy.ec_n_unique_fragments - 1)
         stub_hashes = {
             '123': {frag_index: 'hash', None: 'hash'},
             'abc': {None: 'hash'},
@@ -1717,7 +1897,17 @@ class TestObjectReconstructor(unittest.TestCase):
         self.assertEqual(job['job_type'], object_reconstructor.REVERT)
         self.assertEqual(job['frag_index'], frag_index)
         self.assertEqual(sorted(job['suffixes']), sorted(stub_hashes.keys()))
-        self.assertEqual(len(job['sync_to']), 1)
+        self.assertEqual(
+            self.policy.ec_duplication_factor, len(job['sync_to']))
+        # the sync_to node should be different each other
+        node_ids = set([node['id'] for node in job['sync_to']])
+        self.assertEqual(len(node_ids),
+                         self.policy.ec_duplication_factor)
+        # but all the nodes have same backend index to sync
+        node_indexes = set(
+            self.policy.get_backend_index(node['index'])
+            for node in job['sync_to'])
+        self.assertEqual(1, len(node_indexes))
         self.assertEqual(job['sync_to'][0]['index'], frag_index)
         self.assertEqual(job['path'], part_path)
         self.assertEqual(job['partition'], partition)
@@ -1725,12 +1915,12 @@ class TestObjectReconstructor(unittest.TestCase):
         self.assertEqual(job['local_dev'], self.local_dev)
 
     def test_build_jobs_mixed(self):
-        ring = self.policy.object_ring = FabricatedRing()
+        ring = self.policy.object_ring = self.fabricated_ring
         # find a partition for which we're a primary
         for partition in range(2 ** ring.part_power):
             part_nodes = ring.get_part_nodes(partition)
             try:
-                frag_index = [n['id'] for n in part_nodes].index(
+                node_index = [n['id'] for n in part_nodes].index(
                     self.local_dev['id'])
             except ValueError:
                 pass
@@ -1747,8 +1937,10 @@ class TestObjectReconstructor(unittest.TestCase):
             'partition': partition,
             'part_path': part_path,
         }
-        other_frag_index = random.choice([f for f in range(ring.replicas)
-                                          if f != frag_index])
+        frag_index = self.policy.get_backend_index(node_index)
+        other_frag_index = random.choice(
+            [f for f in range(self.policy.ec_n_unique_fragments)
+             if f != node_index])
         stub_hashes = {
             '123': {frag_index: 'hash', None: 'hash'},
             '456': {other_frag_index: 'hash', None: 'hash'},
@@ -1782,11 +1974,12 @@ class TestObjectReconstructor(unittest.TestCase):
         job = revert_jobs[0]
         self.assertEqual(job['frag_index'], other_frag_index)
         self.assertEqual(job['suffixes'], ['456'])
-        self.assertEqual(len(job['sync_to']), 1)
+        self.assertEqual(len(job['sync_to']),
+                         self.policy.ec_duplication_factor)
         self.assertEqual(job['sync_to'][0]['index'], other_frag_index)
 
     def test_build_jobs_revert_only_tombstones(self):
-        ring = self.policy.object_ring = FabricatedRing()
+        ring = self.policy.object_ring = self.fabricated_ring
         # find a partition for which we're a handoff
         for partition in range(2 ** ring.part_power):
             part_nodes = ring.get_part_nodes(partition)
@@ -1869,7 +2062,8 @@ class TestObjectReconstructor(unittest.TestCase):
 
     def test_process_job_primary_in_sync(self):
         replicas = self.policy.object_ring.replicas
-        frag_index = random.randint(0, replicas - 1)
+        frag_index = random.randint(
+            0, self.policy.ec_n_unique_fragments - 1)
         sync_to = [n for n in self.policy.object_ring.devs
                    if n != self.local_dev][:2]
         # setup left and right hashes
@@ -1927,7 +2121,8 @@ class TestObjectReconstructor(unittest.TestCase):
 
     def test_process_job_primary_not_in_sync(self):
         replicas = self.policy.object_ring.replicas
-        frag_index = random.randint(0, replicas - 1)
+        frag_index = random.randint(
+            0, self.policy.ec_n_unique_fragments - 1)
         sync_to = [n for n in self.policy.object_ring.devs
                    if n != self.local_dev][:2]
         # setup left and right hashes
@@ -1989,7 +2184,8 @@ class TestObjectReconstructor(unittest.TestCase):
 
     def test_process_job_sync_missing_durable(self):
         replicas = self.policy.object_ring.replicas
-        frag_index = random.randint(0, replicas - 1)
+        frag_index = random.randint(
+            0, self.policy.ec_n_unique_fragments - 1)
         sync_to = [n for n in self.policy.object_ring.devs
                    if n != self.local_dev][:2]
         # setup left and right hashes
@@ -2057,7 +2253,8 @@ class TestObjectReconstructor(unittest.TestCase):
 
     def test_process_job_primary_some_in_sync(self):
         replicas = self.policy.object_ring.replicas
-        frag_index = random.randint(0, replicas - 1)
+        frag_index = random.randint(
+            0, self.policy.ec_n_unique_fragments - 1)
         sync_to = [n for n in self.policy.object_ring.devs
                    if n != self.local_dev][:2]
         # setup left and right hashes
@@ -2124,9 +2321,9 @@ class TestObjectReconstructor(unittest.TestCase):
                 self.fail('unexpected call %r' % call)
 
     def test_process_job_primary_down(self):
-        replicas = self.policy.object_ring.replicas
         partition = 0
-        frag_index = random.randint(0, replicas - 1)
+        frag_index = random.randint(
+            0, self.policy.ec_n_unique_fragments - 1)
         stub_hashes = {
             '123': {frag_index: 'hash', None: 'hash'},
             'abc': {frag_index: 'hash', None: 'hash'},
@@ -2193,9 +2390,9 @@ class TestObjectReconstructor(unittest.TestCase):
         self.assertEqual(expected_ssync_calls, found_ssync_calls)
 
     def test_process_job_suffix_call_errors(self):
-        replicas = self.policy.object_ring.replicas
         partition = 0
-        frag_index = random.randint(0, replicas - 1)
+        frag_index = random.randint(
+            0, self.policy.ec_n_unique_fragments - 1)
         stub_hashes = {
             '123': {frag_index: 'hash', None: 'hash'},
             'abc': {frag_index: 'hash', None: 'hash'},
@@ -2242,8 +2439,8 @@ class TestObjectReconstructor(unittest.TestCase):
         self.assertFalse(ssync_calls)
 
     def test_process_job_handoff(self):
-        replicas = self.policy.object_ring.replicas
-        frag_index = random.randint(0, replicas - 1)
+        frag_index = random.randint(
+            0, self.policy.ec_n_unique_fragments - 1)
         sync_to = [random.choice([n for n in self.policy.object_ring.devs
                                   if n != self.local_dev])]
         sync_to[0]['index'] = frag_index
@@ -2287,14 +2484,13 @@ class TestObjectReconstructor(unittest.TestCase):
         self.assertEqual(call['node'], sync_to[0])
         self.assertEqual(set(call['suffixes']), set(['123', 'abc']))
 
-    def test_process_job_revert_to_handoff(self):
-        replicas = self.policy.object_ring.replicas
-        frag_index = random.randint(0, replicas - 1)
+    def test_process_job_will_not_revert_to_handoff(self):
+        frag_index = random.randint(
+            0, self.policy.ec_n_unique_fragments - 1)
         sync_to = [random.choice([n for n in self.policy.object_ring.devs
                                   if n != self.local_dev])]
         sync_to[0]['index'] = frag_index
         partition = 0
-        handoff = next(self.policy.object_ring.get_more_nodes(partition))
 
         stub_hashes = {
             '123': {frag_index: 'hash', None: 'hash'},
@@ -2326,7 +2522,7 @@ class TestObjectReconstructor(unittest.TestCase):
 
         expected_suffix_calls = set([
             (node['replication_ip'], '/%s/0/123-abc' % node['device'])
-            for node in (sync_to[0], handoff)
+            for node in (sync_to[0],)
         ])
 
         ssync_calls = []
@@ -2347,9 +2543,9 @@ class TestObjectReconstructor(unittest.TestCase):
         self.assertEqual(call['node'], sync_to[0])
         self.assertEqual(set(call['suffixes']), set(['123', 'abc']))
 
-    def test_process_job_revert_is_handoff(self):
-        replicas = self.policy.object_ring.replicas
-        frag_index = random.randint(0, replicas - 1)
+    def test_process_job_revert_is_handoff_fails(self):
+        frag_index = random.randint(
+            0, self.policy.ec_n_unique_fragments - 1)
         sync_to = [random.choice([n for n in self.policy.object_ring.devs
                                   if n != self.local_dev])]
         sync_to[0]['index'] = frag_index
@@ -2377,15 +2573,13 @@ class TestObjectReconstructor(unittest.TestCase):
 
         def ssync_response_callback(*args):
             # in this test ssync always fails, until we encounter ourselves in
-            # the list of possible handoff's to sync to
+            # the list of possible handoff's to sync to, so handoffs_remaining
+            # should increment
             return False, {}
 
         expected_suffix_calls = set([
             (sync_to[0]['replication_ip'],
              '/%s/0/123-abc' % sync_to[0]['device'])
-        ] + [
-            (node['replication_ip'], '/%s/0/123-abc' % node['device'])
-            for node in handoff_nodes[:-1]
         ])
 
         ssync_calls = []
@@ -2401,16 +2595,16 @@ class TestObjectReconstructor(unittest.TestCase):
                                  for r in request_log.requests)
         self.assertEqual(expected_suffix_calls, found_suffix_calls)
 
-        # this is ssync call to primary (which fails) plus the ssync call to
-        # all of the handoffs (except the last one - which is the local_dev)
-        self.assertEqual(len(ssync_calls), len(handoff_nodes))
+        # this is ssync call to primary (which fails) and nothing else!
+        self.assertEqual(len(ssync_calls), 1)
         call = ssync_calls[0]
         self.assertEqual(call['node'], sync_to[0])
         self.assertEqual(set(call['suffixes']), set(['123', 'abc']))
+        self.assertEqual(self.reconstructor.handoffs_remaining, 1)
 
     def test_process_job_revert_cleanup(self):
-        replicas = self.policy.object_ring.replicas
-        frag_index = random.randint(0, replicas - 1)
+        frag_index = random.randint(
+            0, self.policy.ec_n_unique_fragments - 1)
         sync_to = [random.choice([n for n in self.policy.object_ring.devs
                                   if n != self.local_dev])]
         sync_to[0]['index'] = frag_index
@@ -2452,6 +2646,7 @@ class TestObjectReconstructor(unittest.TestCase):
         }
 
         def ssync_response_callback(*args):
+            # success should not increment handoffs_remaining
             return True, {ohash: {'ts_data': ts}}
 
         ssync_calls = []
@@ -2475,6 +2670,7 @@ class TestObjectReconstructor(unittest.TestCase):
         df_mgr.get_hashes(self.local_dev['device'], str(partition), [],
                           self.policy)
         self.assertFalse(os.access(df._datadir, os.F_OK))
+        self.assertEqual(self.reconstructor.handoffs_remaining, 0)
 
     def test_process_job_revert_cleanup_tombstone(self):
         sync_to = [random.choice([n for n in self.policy.object_ring.devs
@@ -2540,8 +2736,7 @@ class TestObjectReconstructor(unittest.TestCase):
 
         test_data = ('rebuild' * self.policy.ec_segment_size)[:-777]
         etag = md5(test_data).hexdigest()
-        ec_archive_bodies = make_ec_archive_bodies(self.policy, test_data)
-
+        ec_archive_bodies = encode_frag_archive_bodies(self.policy, test_data)
         broken_body = ec_archive_bodies.pop(1)
 
         responses = list()
@@ -2587,6 +2782,9 @@ class TestObjectReconstructor(unittest.TestCase):
             self.assertEqual(
                 [{'timestamp': '1234567890.12345', 'exclude': []}],
                 json.loads(called_header['X-Backend-Fragment-Preferences']))
+        # no error and warning
+        self.assertFalse(self.logger.get_lines_for_level('error'))
+        self.assertFalse(self.logger.get_lines_for_level('warning'))
 
     def test_reconstruct_fa_errors_works(self):
         job = {
@@ -2604,7 +2802,7 @@ class TestObjectReconstructor(unittest.TestCase):
 
         test_data = ('rebuild' * self.policy.ec_segment_size)[:-777]
         etag = md5(test_data).hexdigest()
-        ec_archive_bodies = make_ec_archive_bodies(self.policy, test_data)
+        ec_archive_bodies = encode_frag_archive_bodies(self.policy, test_data)
 
         broken_body = ec_archive_bodies.pop(4)
 
@@ -2630,6 +2828,57 @@ class TestObjectReconstructor(unittest.TestCase):
                 self.assertEqual(md5(fixed_body).hexdigest(),
                                  md5(broken_body).hexdigest())
 
+    def test_reconstruct_fa_error_with_invalid_header(self):
+        job = {
+            'partition': 0,
+            'policy': self.policy,
+        }
+        part_nodes = self.policy.object_ring.get_part_nodes(0)
+        node = part_nodes[4]
+        metadata = {
+            'name': '/a/c/o',
+            'Content-Length': 0,
+            'ETag': 'etag',
+            'X-Timestamp': '1234567890.12345',
+        }
+
+        test_data = ('rebuild' * self.policy.ec_segment_size)[:-777]
+        etag = md5(test_data).hexdigest()
+        ec_archive_bodies = encode_frag_archive_bodies(self.policy, test_data)
+
+        broken_body = ec_archive_bodies.pop(4)
+
+        base_responses = list()
+        for body in ec_archive_bodies:
+            headers = get_header_frag_index(self, body)
+            headers.update({'X-Object-Sysmeta-Ec-Etag': etag})
+            base_responses.append((200, body, headers))
+
+        responses = base_responses
+        # force the test to exercise the handling of this bad response by
+        # sticking it in near the front
+        error_index = random.randint(0, self.policy.ec_ndata - 1)
+        status, body, headers = responses[error_index]
+        # one esoteric failure is a literal string 'None' in place of the
+        # X-Object-Sysmeta-EC-Frag-Index
+        stub_node_job = {'some_keys': 'foo', 'but_not': 'frag_index'}
+        headers['X-Object-Sysmeta-Ec-Frag-Index'] = str(
+            stub_node_job.get('frag_index'))
+        # oops!
+        self.assertEqual('None',
+                         headers.get('X-Object-Sysmeta-Ec-Frag-Index'))
+        responses[error_index] = status, body, headers
+        codes, body_iter, headers_iter = zip(*responses)
+        with mocked_http_conn(*codes, body_iter=body_iter,
+                              headers=headers_iter):
+            df = self.reconstructor.reconstruct_fa(
+                job, node, dict(metadata))
+            fixed_body = ''.join(df.reader())
+            # ... this bad response should be ignored like any other failure
+            self.assertEqual(len(fixed_body), len(broken_body))
+            self.assertEqual(md5(fixed_body).hexdigest(),
+                             md5(broken_body).hexdigest())
+
     def test_reconstruct_parity_fa_with_data_node_failure(self):
         job = {
             'partition': 0,
@@ -2648,8 +2897,7 @@ class TestObjectReconstructor(unittest.TestCase):
         # segment size)
         test_data = ('rebuild' * self.policy.ec_segment_size)[:-454]
         etag = md5(test_data).hexdigest()
-        ec_archive_bodies = make_ec_archive_bodies(self.policy, test_data)
-
+        ec_archive_bodies = encode_frag_archive_bodies(self.policy, test_data)
         # the scheme is 10+4, so this gets a parity node
         broken_body = ec_archive_bodies.pop(-4)
 
@@ -2673,7 +2921,7 @@ class TestObjectReconstructor(unittest.TestCase):
                 self.assertEqual(md5(fixed_body).hexdigest(),
                                  md5(broken_body).hexdigest())
 
-    def test_reconstruct_fa_errors_fails(self):
+    def test_reconstruct_fa_exceptions_fails(self):
         job = {
             'partition': 0,
             'policy': self.policy,
@@ -2688,12 +2936,55 @@ class TestObjectReconstructor(unittest.TestCase):
             'X-Timestamp': '1234567890.12345'
         }
 
-        possible_errors = [404, Timeout(), Exception('kaboom!')]
+        possible_errors = [Timeout(), Exception('kaboom!')]
         codes = [random.choice(possible_errors) for i in
                  range(policy.object_ring.replicas - 1)]
         with mocked_http_conn(*codes):
             self.assertRaises(DiskFileError, self.reconstructor.reconstruct_fa,
                               job, node, metadata)
+        error_lines = self.logger.get_lines_for_level('error')
+        # # of replicas failed and one more error log to report not enough
+        # responses to reconstruct.
+        self.assertEqual(policy.object_ring.replicas, len(error_lines))
+        for line in error_lines[:-1]:
+            self.assertIn("Trying to GET", line)
+        self.assertIn(
+            'Unable to get enough responses (%s error responses)'
+            % (policy.object_ring.replicas - 1),
+            error_lines[-1],
+            "Unexpected error line found: %s" % error_lines[-1])
+        # no warning
+        self.assertFalse(self.logger.get_lines_for_level('warning'))
+
+    def test_reconstruct_fa_all_404s_fails(self):
+        job = {
+            'partition': 0,
+            'policy': self.policy,
+        }
+        part_nodes = self.policy.object_ring.get_part_nodes(0)
+        node = part_nodes[1]
+        policy = self.policy
+        metadata = {
+            'name': '/a/c/o',
+            'Content-Length': 0,
+            'ETag': 'etag',
+            'X-Timestamp': '1234567890.12345'
+        }
+
+        codes = [404 for i in range(policy.object_ring.replicas - 1)]
+        with mocked_http_conn(*codes):
+            self.assertRaises(DiskFileError, self.reconstructor.reconstruct_fa,
+                              job, node, metadata)
+        error_lines = self.logger.get_lines_for_level('error')
+        # only 1 log to report not enough responses
+        self.assertEqual(1, len(error_lines))
+        self.assertIn(
+            'Unable to get enough responses (%s error responses)'
+            % (policy.object_ring.replicas - 1),
+            error_lines[0],
+            "Unexpected error line found: %s" % error_lines[0])
+        # no warning
+        self.assertFalse(self.logger.get_lines_for_level('warning'))
 
     def test_reconstruct_fa_with_mixed_old_etag(self):
         job = {
@@ -2711,15 +3002,16 @@ class TestObjectReconstructor(unittest.TestCase):
 
         test_data = ('rebuild' * self.policy.ec_segment_size)[:-777]
         etag = md5(test_data).hexdigest()
-        ec_archive_bodies = make_ec_archive_bodies(self.policy, test_data)
+        ec_archive_bodies = encode_frag_archive_bodies(self.policy, test_data)
 
-        broken_body = ec_archive_bodies.pop(1)
-        ts = (utils.Timestamp(t) for t in itertools.count(int(time.time())))
         # bad response
-        bad_headers = {
+        broken_body = ec_archive_bodies.pop(1)
+        ts = make_timestamp_iter()
+        bad_headers = get_header_frag_index(self, broken_body)
+        bad_headers.update({
             'X-Object-Sysmeta-Ec-Etag': 'some garbage',
             'X-Backend-Timestamp': next(ts).internal,
-        }
+        })
 
         # good responses
         responses = list()
@@ -2730,8 +3022,8 @@ class TestObjectReconstructor(unittest.TestCase):
                             'X-Backend-Timestamp': t1})
             responses.append((200, body, headers))
 
-        # mixed together
-        error_index = random.randint(0, self.policy.ec_ndata)
+        # include the one older frag with different etag in first responses
+        error_index = random.randint(0, self.policy.ec_ndata - 1)
         error_headers = get_header_frag_index(self,
                                               (responses[error_index])[1])
         error_headers.update(bad_headers)
@@ -2745,6 +3037,10 @@ class TestObjectReconstructor(unittest.TestCase):
             self.assertEqual(len(fixed_body), len(broken_body))
             self.assertEqual(md5(fixed_body).hexdigest(),
                              md5(broken_body).hexdigest())
+
+        # no error and warning
+        self.assertFalse(self.logger.get_lines_for_level('error'))
+        self.assertFalse(self.logger.get_lines_for_level('warning'))
 
     def test_reconstruct_fa_with_mixed_new_etag(self):
         job = {
@@ -2762,10 +3058,10 @@ class TestObjectReconstructor(unittest.TestCase):
 
         test_data = ('rebuild' * self.policy.ec_segment_size)[:-777]
         etag = md5(test_data).hexdigest()
-        ec_archive_bodies = make_ec_archive_bodies(self.policy, test_data)
+        ec_archive_bodies = encode_frag_archive_bodies(self.policy, test_data)
 
         broken_body = ec_archive_bodies.pop(1)
-        ts = (utils.Timestamp(t) for t in itertools.count(int(time.time())))
+        ts = make_timestamp_iter()
 
         # good responses
         responses = list()
@@ -2786,8 +3082,8 @@ class TestObjectReconstructor(unittest.TestCase):
             self.assertEqual(md5(fixed_body).hexdigest(),
                              md5(broken_body).hexdigest())
 
-        # one newer etag can spoil the bunch
-        new_index = random.randint(0, len(responses) - self.policy.ec_nparity)
+        # one newer etag won't spoil the bunch
+        new_index = random.randint(0, self.policy.ec_ndata - 1)
         new_headers = get_header_frag_index(self, (responses[new_index])[1])
         new_headers.update({'X-Object-Sysmeta-Ec-Etag': 'some garbage',
                             'X-Backend-Timestamp': next(ts).internal})
@@ -2795,10 +3091,18 @@ class TestObjectReconstructor(unittest.TestCase):
         responses[new_index] = new_response
         codes, body_iter, headers = zip(*responses)
         with mocked_http_conn(*codes, body_iter=body_iter, headers=headers):
-            self.assertRaises(DiskFileError, self.reconstructor.reconstruct_fa,
-                              job, node, dict(metadata))
+            df = self.reconstructor.reconstruct_fa(
+                job, node, dict(metadata))
+            fixed_body = ''.join(df.reader())
+            self.assertEqual(len(fixed_body), len(broken_body))
+            self.assertEqual(md5(fixed_body).hexdigest(),
+                             md5(broken_body).hexdigest())
 
-    def test_reconstruct_fa_finds_itself_does_not_fail(self):
+        # no error and warning
+        self.assertFalse(self.logger.get_lines_for_level('error'))
+        self.assertFalse(self.logger.get_lines_for_level('warning'))
+
+    def test_reconstruct_fa_with_mixed_etag_with_same_timestamp(self):
         job = {
             'partition': 0,
             'policy': self.policy,
@@ -2814,31 +3118,198 @@ class TestObjectReconstructor(unittest.TestCase):
 
         test_data = ('rebuild' * self.policy.ec_segment_size)[:-777]
         etag = md5(test_data).hexdigest()
-        ec_archive_bodies = make_ec_archive_bodies(self.policy, test_data)
+        ec_archive_bodies = encode_frag_archive_bodies(self.policy, test_data)
+
+        broken_body = ec_archive_bodies.pop(1)
+
+        # good responses
+        responses = list()
+        for body in ec_archive_bodies:
+            headers = get_header_frag_index(self, body)
+            headers.update({'X-Object-Sysmeta-Ec-Etag': etag})
+            responses.append((200, body, headers))
+
+        # sanity check before negative test
+        codes, body_iter, headers = zip(*responses)
+        with mocked_http_conn(*codes, body_iter=body_iter, headers=headers):
+            df = self.reconstructor.reconstruct_fa(
+                job, node, dict(metadata))
+            fixed_body = ''.join(df.reader())
+            self.assertEqual(len(fixed_body), len(broken_body))
+            self.assertEqual(md5(fixed_body).hexdigest(),
+                             md5(broken_body).hexdigest())
+
+        # a response at same timestamp but different etag won't spoil the bunch
+        # N.B. (FIXME). if we choose the first response as garbage, the
+        # reconstruction fails because all other *correct* frags will be
+        # assumed as garbage. To avoid the freaky failing set randint
+        # as [1, self.policy.ec_ndata - 1] to make the first response
+        # always have the correct etag to reconstruct
+        new_index = random.randint(1, self.policy.ec_ndata - 1)
+        new_headers = get_header_frag_index(self, (responses[new_index])[1])
+        new_headers.update({'X-Object-Sysmeta-Ec-Etag': 'some garbage'})
+        new_response = (200, '', new_headers)
+        responses[new_index] = new_response
+        codes, body_iter, headers = zip(*responses)
+        with mocked_http_conn(*codes, body_iter=body_iter, headers=headers):
+            df = self.reconstructor.reconstruct_fa(
+                job, node, dict(metadata))
+            fixed_body = ''.join(df.reader())
+            self.assertEqual(len(fixed_body), len(broken_body))
+            self.assertEqual(md5(fixed_body).hexdigest(),
+                             md5(broken_body).hexdigest())
+
+        # expect an error log but no warnings
+        error_log_lines = self.logger.get_lines_for_level('error')
+        self.assertEqual(1, len(error_log_lines))
+        self.assertIn(
+            'Mixed Etag (some garbage, %s) for 10.0.0.1:1001/sdb/0/a/c/o '
+            'policy#%s frag#1' % (etag, int(self.policy)),
+            error_log_lines[0])
+        self.assertFalse(self.logger.get_lines_for_level('warning'))
+
+    def test_reconstruct_fa_with_mixed_not_enough_etags_fail(self):
+        job = {
+            'partition': 0,
+            'policy': self.policy,
+        }
+        part_nodes = self.policy.object_ring.get_part_nodes(0)
+        node = part_nodes[1]
+        metadata = {
+            'name': '/a/c/o',
+            'Content-Length': 0,
+            'ETag': 'etag',
+            'X-Timestamp': '1234567890.12345'
+        }
+
+        test_data = ('rebuild' * self.policy.ec_segment_size)[:-777]
+        ec_archive_dict = dict()
+        ts = make_timestamp_iter()
+        # create 3 different ec bodies
+        for i in range(3):
+            body = test_data[i:]
+            archive_bodies = encode_frag_archive_bodies(self.policy, body)
+            # pop the index to the destination node
+            archive_bodies.pop(1)
+            ec_archive_dict[
+                (md5(body).hexdigest(), next(ts).internal)] = archive_bodies
+
+        responses = list()
+        # fill out response list by 3 different etag bodies
+        for etag, ts in itertools.cycle(ec_archive_dict):
+            body = ec_archive_dict[(etag, ts)].pop(0)
+            headers = get_header_frag_index(self, body)
+            headers.update({'X-Object-Sysmeta-Ec-Etag': etag,
+                            'X-Backend-Timestamp': ts})
+            responses.append((200, body, headers))
+            if len(responses) >= (self.policy.object_ring.replicas - 1):
+                break
+
+        # sanity, there is 3 different etag and each etag
+        # doesn't have > ec_k bodies
+        etag_count = collections.Counter(
+            [in_resp_headers['X-Object-Sysmeta-Ec-Etag']
+             for _, _, in_resp_headers in responses])
+        self.assertEqual(3, len(etag_count))
+        for etag, count in etag_count.items():
+            self.assertLess(count, self.policy.ec_ndata)
+
+        codes, body_iter, headers = zip(*responses)
+        with mocked_http_conn(*codes, body_iter=body_iter, headers=headers):
+            self.assertRaises(DiskFileError, self.reconstructor.reconstruct_fa,
+                              job, node, metadata)
+
+        error_lines = self.logger.get_lines_for_level('error')
+        # 1 error log per etag to report not enough responses
+        self.assertEqual(3, len(error_lines))
+        for error_line in error_lines:
+            for expected_etag, ts in ec_archive_dict:
+                if expected_etag in error_line:
+                    break
+            else:
+                self.fail(
+                    "no expected etag %s found: %s" %
+                    (list(ec_archive_dict), error_line))
+            # remove the found etag which should not be found in the
+            # following error lines
+            del ec_archive_dict[(expected_etag, ts)]
+
+            expected = 'Unable to get enough responses (%s/10) to ' \
+                       'reconstruct 10.0.0.1:1001/sdb/0/a/c/o policy#0 ' \
+                       'frag#1 with ETag' % etag_count[expected_etag]
+            self.assertIn(
+                expected, error_line,
+                "Unexpected error line found: Expected: %s Got: %s"
+                % (expected, error_line))
+        # no warning
+        self.assertFalse(self.logger.get_lines_for_level('warning'))
+
+    def test_reconstruct_fa_finds_itself_does_not_fail(self):
+        # verify that reconstruction of a missing frag can cope with finding
+        # that missing frag in the responses it gets from other nodes while
+        # attempting to rebuild the missing frag
+        job = {
+            'partition': 0,
+            'policy': self.policy,
+        }
+        part_nodes = self.policy.object_ring.get_part_nodes(0)
+        broken_node = random.randint(0, self.policy.ec_ndata - 1)
+        metadata = {
+            'name': '/a/c/o',
+            'Content-Length': 0,
+            'ETag': 'etag',
+            'X-Timestamp': '1234567890.12345'
+        }
+
+        test_data = ('rebuild' * self.policy.ec_segment_size)[:-777]
+        etag = md5(test_data).hexdigest()
+        ec_archive_bodies = encode_frag_archive_bodies(self.policy, test_data)
 
         # instead of popping the broken body, we'll just leave it in the list
         # of responses and take away something else.
-        broken_body = ec_archive_bodies[1]
+        broken_body = ec_archive_bodies[broken_node]
         ec_archive_bodies = ec_archive_bodies[:-1]
 
         def make_header(body):
-            metadata = self.policy.pyeclib_driver.get_metadata(body)
-            frag_index = struct.unpack('h', metadata[:2])[0]
-            return {
-                'X-Object-Sysmeta-Ec-Frag-Index': frag_index,
-                'X-Object-Sysmeta-Ec-Etag': etag,
-            }
+            headers = get_header_frag_index(self, body)
+            headers.update({'X-Object-Sysmeta-Ec-Etag': etag})
+            return headers
 
         responses = [(200, body, make_header(body))
                      for body in ec_archive_bodies]
         codes, body_iter, headers = zip(*responses)
         with mocked_http_conn(*codes, body_iter=body_iter, headers=headers):
             df = self.reconstructor.reconstruct_fa(
-                job, node, metadata)
+                job, part_nodes[broken_node], metadata)
             fixed_body = ''.join(df.reader())
             self.assertEqual(len(fixed_body), len(broken_body))
             self.assertEqual(md5(fixed_body).hexdigest(),
                              md5(broken_body).hexdigest())
+
+        # no error, no warning
+        self.assertFalse(self.logger.get_lines_for_level('error'))
+        self.assertFalse(self.logger.get_lines_for_level('warning'))
+        # the found own frag will be reported in the debug message
+        debug_log_lines = self.logger.get_lines_for_level('debug')
+        # redundant frag found once in first ec_ndata responses
+        self.assertIn(
+            'Found existing frag #%s at' % broken_node,
+            debug_log_lines[0])
+
+        # N.B. in the future, we could avoid those check because
+        # definitely sending the copy rather than reconstruct will
+        # save resources. But one more reason, we're avoiding to
+        # use the dest index fragment even if it goes to reconstruct
+        # function is that it will cause a bunch of warning log from
+        # liberasurecode[1].
+        # 1: https://github.com/openstack/liberasurecode/blob/
+        #    master/src/erasurecode.c#L870
+        log_prefix = 'Reconstruct frag #%s with frag indexes' % broken_node
+        self.assertIn(log_prefix, debug_log_lines[1])
+        self.assertFalse(debug_log_lines[2:])
+        got_frag_index_list = json.loads(
+            debug_log_lines[1][len(log_prefix):])
+        self.assertNotIn(broken_node, got_frag_index_list)
 
     def test_reconstruct_fa_finds_duplicate_does_not_fail(self):
         job = {
@@ -2856,7 +3327,7 @@ class TestObjectReconstructor(unittest.TestCase):
 
         test_data = ('rebuild' * self.policy.ec_segment_size)[:-777]
         etag = md5(test_data).hexdigest()
-        ec_archive_bodies = make_ec_archive_bodies(self.policy, test_data)
+        ec_archive_bodies = encode_frag_archive_bodies(self.policy, test_data)
 
         broken_body = ec_archive_bodies.pop(1)
         # add some duplicates
@@ -2865,12 +3336,9 @@ class TestObjectReconstructor(unittest.TestCase):
                              ec_archive_bodies)[:-num_duplicates]
 
         def make_header(body):
-            metadata = self.policy.pyeclib_driver.get_metadata(body)
-            frag_index = struct.unpack('h', metadata[:2])[0]
-            return {
-                'X-Object-Sysmeta-Ec-Frag-Index': frag_index,
-                'X-Object-Sysmeta-Ec-Etag': etag,
-            }
+            headers = get_header_frag_index(self, body)
+            headers.update({'X-Object-Sysmeta-Ec-Etag': etag})
+            return headers
 
         responses = [(200, body, make_header(body))
                      for body in ec_archive_bodies]
@@ -2882,6 +3350,235 @@ class TestObjectReconstructor(unittest.TestCase):
             self.assertEqual(len(fixed_body), len(broken_body))
             self.assertEqual(md5(fixed_body).hexdigest(),
                              md5(broken_body).hexdigest())
+
+        # no error and warning
+        self.assertFalse(self.logger.get_lines_for_level('error'))
+        self.assertFalse(self.logger.get_lines_for_level('warning'))
+        debug_log_lines = self.logger.get_lines_for_level('debug')
+        self.assertEqual(1, len(debug_log_lines))
+        expected_prefix = 'Reconstruct frag #1 with frag indexes'
+        self.assertIn(expected_prefix, debug_log_lines[0])
+        got_frag_index_list = json.loads(
+            debug_log_lines[0][len(expected_prefix):])
+        self.assertNotIn(1, got_frag_index_list)
+
+    def test_reconstruct_fa_missing_headers(self):
+        # This is much negative tests asserting when the expected
+        # headers are missing in the responses to gather fragments
+        # to reconstruct
+
+        job = {
+            'partition': 0,
+            'policy': self.policy,
+        }
+        part_nodes = self.policy.object_ring.get_part_nodes(0)
+        node = part_nodes[1]
+        ts = make_timestamp_iter()
+        timestamp = next(ts)
+        metadata = {
+            'name': '/a/c/o',
+            'Content-Length': 0,
+            'ETag': 'etag',
+            'X-Timestamp': timestamp.normal
+        }
+
+        test_data = ('rebuild' * self.policy.ec_segment_size)[:-777]
+        etag = md5(test_data).hexdigest()
+        ec_archive_bodies = encode_frag_archive_bodies(self.policy, test_data)
+
+        broken_body = ec_archive_bodies.pop(1)
+
+        def make_header(body):
+            headers = get_header_frag_index(self, body)
+            headers.update(
+                {'X-Object-Sysmeta-Ec-Etag': etag,
+                 'X-Backend-Timestamp': timestamp.internal})
+            return headers
+
+        def test_missing_header(missing_header, expected_warning):
+            self.logger._clear()
+            responses = [(200, body, make_header(body))
+                         for body in ec_archive_bodies]
+
+            # To drop the header from the response[0], set None as the value
+            # explicitly instead of deleting the key because if no key exists
+            # in the dict, fake_http_connect will insert some key/value pairs
+            # automatically (e.g. X-Backend-Timestamp)
+            responses[0][2].update({missing_header: None})
+
+            codes, body_iter, headers = zip(*responses)
+            with mocked_http_conn(
+                    *codes, body_iter=body_iter, headers=headers):
+                df = self.reconstructor.reconstruct_fa(
+                    job, node, metadata)
+                fixed_body = ''.join(df.reader())
+                self.assertEqual(len(fixed_body), len(broken_body))
+                self.assertEqual(md5(fixed_body).hexdigest(),
+                                 md5(broken_body).hexdigest())
+
+            # no errors
+            self.assertFalse(self.logger.get_lines_for_level('error'))
+            # ...but warning for the missing header
+            warning_log_lines = self.logger.get_lines_for_level('warning')
+            self.assertEqual(1, len(warning_log_lines))
+            self.assertIn(expected_warning, warning_log_lines)
+
+        message_base = \
+            "Invalid resp from 10.0.0.0:1000/sda/0/a/c/o policy#0"
+
+        test_missing_header(
+            'X-Object-Sysmeta-Ec-Frag-Index',
+            "%s %s" % (message_base,
+                       "(invalid X-Object-Sysmeta-Ec-Frag-Index: None)"))
+
+        message_base += ", frag index 0"
+        test_missing_header(
+            'X-Object-Sysmeta-Ec-Etag',
+            "%s %s" % (message_base, "(missing Etag)"))
+        test_missing_header(
+            'X-Backend-Timestamp',
+            "%s %s" % (message_base, "(missing X-Backend-Timestamp)"))
+
+    def test_reconstruct_fa_invalid_frag_index_headers(self):
+        # This is much negative tests asserting when the expected
+        # ec frag index header has invalid value in the responses
+        # to gather fragments to reconstruct
+
+        job = {
+            'partition': 0,
+            'policy': self.policy,
+        }
+        part_nodes = self.policy.object_ring.get_part_nodes(0)
+        node = part_nodes[1]
+        metadata = {
+            'name': '/a/c/o',
+            'Content-Length': 0,
+            'ETag': 'etag',
+            'X-Timestamp': '1234567890.12345'
+        }
+
+        test_data = ('rebuild' * self.policy.ec_segment_size)[:-777]
+        etag = md5(test_data).hexdigest()
+        ec_archive_bodies = encode_frag_archive_bodies(self.policy, test_data)
+
+        broken_body = ec_archive_bodies.pop(1)
+
+        def make_header(body):
+            headers = get_header_frag_index(self, body)
+            headers.update({'X-Object-Sysmeta-Ec-Etag': etag})
+            return headers
+
+        def test_invalid_ec_frag_index_header(invalid_frag_index):
+            self.logger._clear()
+            responses = [(200, body, make_header(body))
+                         for body in ec_archive_bodies]
+
+            responses[0][2].update({
+                'X-Object-Sysmeta-Ec-Frag-Index': invalid_frag_index})
+
+            codes, body_iter, headers = zip(*responses)
+            with mocked_http_conn(
+                    *codes, body_iter=body_iter, headers=headers):
+                df = self.reconstructor.reconstruct_fa(
+                    job, node, metadata)
+                fixed_body = ''.join(df.reader())
+                self.assertEqual(len(fixed_body), len(broken_body))
+                self.assertEqual(md5(fixed_body).hexdigest(),
+                                 md5(broken_body).hexdigest())
+
+            # no errors
+            self.assertFalse(self.logger.get_lines_for_level('error'))
+            # ...but warning for the invalid header
+            warning_log_lines = self.logger.get_lines_for_level('warning')
+            self.assertEqual(1, len(warning_log_lines))
+            expected_message = \
+                "Invalid resp from 10.0.0.0:1000/sda/0/a/c/o " \
+                "policy#0 (invalid X-Object-Sysmeta-Ec-Frag-Index: %r)" % \
+                invalid_frag_index
+            self.assertIn(expected_message, warning_log_lines)
+
+        for value in ('None', 'invalid'):
+            test_invalid_ec_frag_index_header(value)
+
+
+@patch_policies([ECStoragePolicy(0, name='ec', is_default=True,
+                                 ec_type=DEFAULT_TEST_EC_TYPE,
+                                 ec_ndata=10, ec_nparity=4,
+                                 ec_segment_size=4096,
+                                 ec_duplication_factor=2)],
+                fake_ring_args=[{'replicas': 28}])
+class TestObjectReconstructorECDuplicationFactor(TestObjectReconstructor):
+    def setUp(self):
+        super(TestObjectReconstructorECDuplicationFactor, self).setUp()
+        self.fabricated_ring = FabricatedRing(replicas=28, devices=56)
+
+    def _test_reconstruct_with_duplicate_frags_no_errors(self, index):
+        job = {
+            'partition': 0,
+            'policy': self.policy,
+        }
+        part_nodes = self.policy.object_ring.get_part_nodes(0)
+        node = part_nodes[index]
+        metadata = {
+            'name': '/a/c/o',
+            'Content-Length': 0,
+            'ETag': 'etag',
+            'X-Timestamp': '1234567890.12345',
+        }
+
+        test_data = ('rebuild' * self.policy.ec_segment_size)[:-777]
+        etag = md5(test_data).hexdigest()
+        ec_archive_bodies = encode_frag_archive_bodies(self.policy, test_data)
+
+        broken_body = ec_archive_bodies.pop(index)
+
+        responses = list()
+        for body in ec_archive_bodies:
+            headers = get_header_frag_index(self, body)
+            headers.update({'X-Object-Sysmeta-Ec-Etag': etag})
+            responses.append((200, body, headers))
+
+        # make a hook point at
+        # swift.obj.reconstructor.ObjectReconstructor._get_response
+        called_headers = []
+        orig_func = object_reconstructor.ObjectReconstructor._get_response
+
+        def _get_response_hook(self, node, part, path, headers, policy):
+            called_headers.append(headers)
+            return orig_func(self, node, part, path, headers, policy)
+
+        # need parity + 1 node failures to reach duplicated fragments
+        failed_start_at = (
+            self.policy.ec_n_unique_fragments - self.policy.ec_nparity - 1)
+
+        # set Timeout for node #9, #10, #11, #12, #13
+        for i in range(self.policy.ec_nparity + 1):
+            responses[failed_start_at + i] = (Timeout(), '', '')
+
+        codes, body_iter, headers = zip(*responses)
+        get_response_path = \
+            'swift.obj.reconstructor.ObjectReconstructor._get_response'
+        with mock.patch(get_response_path, _get_response_hook):
+            with mocked_http_conn(
+                    *codes, body_iter=body_iter, headers=headers):
+                df = self.reconstructor.reconstruct_fa(
+                    job, node, metadata)
+                fixed_body = ''.join(df.reader())
+                self.assertEqual(len(fixed_body), len(broken_body))
+                self.assertEqual(md5(fixed_body).hexdigest(),
+                                 md5(broken_body).hexdigest())
+                for called_header in called_headers:
+                    called_header = HeaderKeyDict(called_header)
+                    self.assertIn('Content-Length', called_header)
+                    self.assertEqual(called_header['Content-Length'], '0')
+                    self.assertIn('User-Agent', called_header)
+                    user_agent = called_header['User-Agent']
+                    self.assertTrue(user_agent.startswith('obj-reconstructor'))
+
+    def test_reconstruct_with_duplicate_frags_no_errors(self):
+        # any fragments can be broken
+        for index in range(28):
+            self._test_reconstruct_with_duplicate_frags_no_errors(index)
 
 
 if __name__ == '__main__':
