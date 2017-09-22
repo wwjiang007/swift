@@ -279,7 +279,7 @@ class FakeApp(object):
         if ((env['PATH_INFO'] in (
                 '/v1/a/c3', '/v1/a/c4', '/v1/a/c8', '/v1/a/c9'))
             and (env['QUERY_STRING'] ==
-                 'delimiter=/&format=json&prefix=subdir/')):
+                 'delimiter=/&prefix=subdir/')):
             headers.update({'X-Container-Object-Count': '12',
                             'X-Container-Bytes-Used': '73763',
                             'X-Container-Read': '.r:*',
@@ -296,14 +296,14 @@ class FakeApp(object):
                  {"subdir":"subdir3/subsubdir/"}]
             '''.strip()
         elif env['PATH_INFO'] == '/v1/a/c3' and env['QUERY_STRING'] == \
-                'delimiter=/&format=json&prefix=subdiry/':
+                'delimiter=/&prefix=subdiry/':
             headers.update({'X-Container-Object-Count': '12',
                             'X-Container-Bytes-Used': '73763',
                             'X-Container-Read': '.r:*',
                             'Content-Type': 'application/json; charset=utf-8'})
             body = '[]'
         elif env['PATH_INFO'] == '/v1/a/c3' and env['QUERY_STRING'] == \
-                'limit=1&format=json&delimiter=/&limit=1&prefix=subdirz/':
+                'limit=1&delimiter=/&prefix=subdirz/':
             headers.update({'X-Container-Object-Count': '12',
                             'X-Container-Bytes-Used': '73763',
                             'X-Container-Read': '.r:*',
@@ -315,7 +315,7 @@ class FakeApp(object):
                   "last_modified":"2011-03-24T04:27:52.709100"}]
             '''.strip()
         elif env['PATH_INFO'] == '/v1/a/c6' and env['QUERY_STRING'] == \
-                'limit=1&format=json&delimiter=/&limit=1&prefix=subdir/':
+                'limit=1&delimiter=/&prefix=subdir/':
             headers.update({'X-Container-Object-Count': '12',
                             'X-Container-Bytes-Used': '73763',
                             'X-Container-Read': '.r:*',
@@ -329,9 +329,9 @@ class FakeApp(object):
             '''.strip()
         elif env['PATH_INFO'] == '/v1/a/c10' and (
                 env['QUERY_STRING'] ==
-                'delimiter=/&format=json&prefix=%E2%98%83/' or
+                'delimiter=/&prefix=%E2%98%83/' or
                 env['QUERY_STRING'] ==
-                'delimiter=/&format=json&prefix=%E2%98%83/%E2%98%83/'):
+                'delimiter=/&prefix=%E2%98%83/%E2%98%83/'):
             headers.update({'X-Container-Object-Count': '12',
                             'X-Container-Bytes-Used': '73763',
                             'X-Container-Read': '.r:*',
@@ -346,7 +346,7 @@ class FakeApp(object):
             '''.strip()
         elif 'prefix=' in env['QUERY_STRING']:
             return Response(status='204 No Content')(env, start_response)
-        elif 'format=json' in env['QUERY_STRING']:
+        else:
             headers.update({'X-Container-Object-Count': '12',
                             'X-Container-Bytes-Used': '73763',
                             'Content-Type': 'application/json; charset=utf-8'})
@@ -397,15 +397,6 @@ class FakeApp(object):
                   "content_type":"text/plain",
                   "last_modified":"2011-03-24T04:27:52.935560"}]
             '''.strip()
-        else:
-            headers.update({'X-Container-Object-Count': '12',
-                            'X-Container-Bytes-Used': '73763',
-                            'Content-Type': 'text/plain; charset=utf-8'})
-            body = '\n'.join(['401error.html', '404error.html', 'index.html',
-                              'listing.css', 'one.txt', 'subdir/1.txt',
-                              'subdir/2.txt', u'subdir/\u2603.txt', 'subdir2',
-                              'subdir3/subsubdir/index.html', 'two.txt',
-                              u'\u2603/\u2603/one.txt'])
         return Response(status='200 Ok', headers=headers,
                         body=body)(env, start_response)
 
@@ -481,8 +472,8 @@ class TestStaticWeb(unittest.TestCase):
     def test_container2(self):
         resp = Request.blank('/v1/a/c2').get_response(self.test_staticweb)
         self.assertEqual(resp.status_int, 200)
-        self.assertEqual(resp.content_type, 'text/plain')
-        self.assertEqual(len(resp.body.split('\n')),
+        self.assertEqual(resp.content_type, 'application/json')
+        self.assertEqual(len(json.loads(resp.body)),
                          int(resp.headers['x-container-object-count']))
 
     def test_container2_web_mode_explicitly_off(self):
@@ -490,8 +481,8 @@ class TestStaticWeb(unittest.TestCase):
             '/v1/a/c2',
             headers={'x-web-mode': 'false'}).get_response(self.test_staticweb)
         self.assertEqual(resp.status_int, 200)
-        self.assertEqual(resp.content_type, 'text/plain')
-        self.assertEqual(len(resp.body.split('\n')),
+        self.assertEqual(resp.content_type, 'application/json')
+        self.assertEqual(len(json.loads(resp.body)),
                          int(resp.headers['x-container-object-count']))
 
     def test_container2_web_mode_explicitly_on(self):
@@ -507,7 +498,7 @@ class TestStaticWeb(unittest.TestCase):
 
     def test_container2json(self):
         resp = Request.blank(
-            '/v1/a/c2?format=json').get_response(self.test_staticweb)
+            '/v1/a/c2').get_response(self.test_staticweb)
         self.assertEqual(resp.status_int, 200)
         self.assertEqual(resp.content_type, 'application/json')
         self.assertEqual(len(json.loads(resp.body)),
@@ -515,7 +506,7 @@ class TestStaticWeb(unittest.TestCase):
 
     def test_container2json_web_mode_explicitly_off(self):
         resp = Request.blank(
-            '/v1/a/c2?format=json',
+            '/v1/a/c2',
             headers={'x-web-mode': 'false'}).get_response(self.test_staticweb)
         self.assertEqual(resp.status_int, 200)
         self.assertEqual(resp.content_type, 'application/json')
@@ -524,7 +515,7 @@ class TestStaticWeb(unittest.TestCase):
 
     def test_container2json_web_mode_explicitly_on(self):
         resp = Request.blank(
-            '/v1/a/c2?format=json',
+            '/v1/a/c2',
             headers={'x-web-mode': 'true'}).get_response(self.test_staticweb)
         self.assertEqual(resp.status_int, 404)
 
@@ -554,8 +545,8 @@ class TestStaticWeb(unittest.TestCase):
         resp = Request.blank(
             '/v1/a/c3/subdir/').get_response(self.test_staticweb)
         self.assertEqual(resp.status_int, 200)
-        self.assertTrue('Listing of /v1/a/c3/subdir/' in resp.body)
-        self.assertTrue('</style>' in resp.body)
+        self.assertIn('Listing of /v1/a/c3/subdir/', resp.body)
+        self.assertIn('</style>', resp.body)
         self.assertNotIn('<link', resp.body)
         self.assertNotIn('listing.css', resp.body)
 
@@ -588,8 +579,8 @@ class TestStaticWeb(unittest.TestCase):
     def test_container4indexhtml(self):
         resp = Request.blank('/v1/a/c4/').get_response(self.test_staticweb)
         self.assertEqual(resp.status_int, 200)
-        self.assertTrue('Listing of /v1/a/c4/' in resp.body)
-        self.assertTrue('href="listing.css"' in resp.body)
+        self.assertIn('Listing of /v1/a/c4/', resp.body)
+        self.assertIn('href="listing.css"', resp.body)
 
     def test_container4indexhtmlauthed(self):
         resp = Request.blank('/v1/a/c4').get_response(self.test_staticweb)
@@ -609,16 +600,16 @@ class TestStaticWeb(unittest.TestCase):
         resp = Request.blank(
             '/v1/a/c4/unknown').get_response(self.test_staticweb)
         self.assertEqual(resp.status_int, 404)
-        self.assertTrue("Chrome's 404 fancy-page sucks." in resp.body)
+        self.assertIn("Chrome's 404 fancy-page sucks.", resp.body)
 
     def test_container4subdir(self):
         resp = Request.blank(
             '/v1/a/c4/subdir/').get_response(self.test_staticweb)
         self.assertEqual(resp.status_int, 200)
-        self.assertTrue('Listing of /v1/a/c4/subdir/' in resp.body)
+        self.assertIn('Listing of /v1/a/c4/subdir/', resp.body)
         self.assertNotIn('</style>', resp.body)
-        self.assertTrue('<link' in resp.body)
-        self.assertTrue('href="../listing.css"' in resp.body)
+        self.assertIn('<link', resp.body)
+        self.assertIn('href="../listing.css"', resp.body)
         self.assertEqual(resp.headers['content-type'],
                          'text/html; charset=UTF-8')
 
@@ -768,7 +759,7 @@ class TestStaticWeb(unittest.TestCase):
         resp = Request.blank('/v1/a/c11a/subdir/').get_response(
             self.test_staticweb)
         self.assertEqual(resp.status_int, 404)
-        self.assertTrue('Index File Not Found' in resp.body)
+        self.assertIn('Index File Not Found', resp.body)
 
     def test_container11subdirmarkeraltdirtype(self):
         resp = Request.blank('/v1/a/c11a/subdir2/').get_response(
@@ -784,20 +775,20 @@ class TestStaticWeb(unittest.TestCase):
         resp = Request.blank('/v1/a/c12/').get_response(
             self.test_staticweb)
         self.assertEqual(resp.status_int, 200)
-        self.assertTrue('index file' in resp.body)
+        self.assertIn('index file', resp.body)
 
     def test_container_404_has_css(self):
         resp = Request.blank('/v1/a/c13/').get_response(
             self.test_staticweb)
         self.assertEqual(resp.status_int, 404)
-        self.assertTrue('listing.css' in resp.body)
+        self.assertIn('listing.css', resp.body)
 
     def test_container_404_has_no_css(self):
         resp = Request.blank('/v1/a/c7/').get_response(
             self.test_staticweb)
         self.assertEqual(resp.status_int, 404)
         self.assertNotIn('listing.css', resp.body)
-        self.assertTrue('<style' in resp.body)
+        self.assertIn('<style', resp.body)
 
     def test_subrequest_once_if_possible(self):
         resp = Request.blank(

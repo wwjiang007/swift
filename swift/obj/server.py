@@ -26,14 +26,15 @@ import math
 from swift import gettext_ as _
 from hashlib import md5
 
-from eventlet import sleep, wsgi, Timeout
+from eventlet import sleep, wsgi, Timeout, tpool
 from eventlet.greenthread import spawn
 
 from swift.common.utils import public, get_logger, \
     config_true_value, timing_stats, replication, \
     normalize_delete_at_timestamp, get_log_line, Timestamp, \
     get_expirer_container, parse_mime_headers, \
-    iter_multipart_mime_documents, extract_swift_bytes, safe_json_loads
+    iter_multipart_mime_documents, extract_swift_bytes, safe_json_loads, \
+    config_auto_int_value
 from swift.common.bufferedhttp import http_connect
 from swift.common.constraints import check_object_creation, \
     valid_timestamp, check_utf8
@@ -197,6 +198,34 @@ class ObjectController(BaseStorageServer):
             conf.get('replication_failure_threshold') or 100)
         self.replication_failure_ratio = float(
             conf.get('replication_failure_ratio') or 1.0)
+
+        servers_per_port = int(conf.get('servers_per_port', '0') or 0)
+        if servers_per_port:
+            # The typical servers-per-port deployment also uses one port per
+            # disk, so you really get N servers per disk. In that case,
+            # having a pool of 20 threads per server per disk is far too
+            # much. For example, given a 60-disk chassis and 4 servers per
+            # disk, the default configuration will give us 21 threads per
+            # server (the main thread plus the twenty tpool threads), for a
+            # total of around 60 * 21 * 4 = 5040 threads. This is clearly
+            # too high.
+            #
+            # Instead, we use a tpool size of 1, giving us 2 threads per
+            # process. In the example above, that's 60 * 2 * 4 = 480
+            # threads, which is reasonable since there are 240 processes.
+            default_tpool_size = 1
+        else:
+            # If we're not using servers-per-port, then leave the tpool size
+            # alone. The default (20) is typically good enough for one
+            # object server handling requests for many disks.
+            default_tpool_size = None
+
+        tpool_size = config_auto_int_value(
+            conf.get('eventlet_tpool_num_threads'),
+            default_tpool_size)
+
+        if tpool_size:
+            tpool.set_num_threads(tpool_size)
 
     def get_diskfile(self, device, partition, account, container, obj,
                      policy, **kwargs):
@@ -513,10 +542,13 @@ class ObjectController(BaseStorageServer):
         if new_delete_at and new_delete_at < time.time():
             return HTTPBadRequest(body='X-Delete-At in past', request=request,
                                   content_type='text/plain')
+        next_part_power = request.headers.get('X-Backend-Next-Part-Power')
         try:
             disk_file = self.get_diskfile(
                 device, partition, account, container, obj,
-                policy=policy)
+                policy=policy, open_expired=config_true_value(
+                    request.headers.get('x-backend-replication', 'false')),
+                next_part_power=next_part_power)
         except DiskFileDeviceUnavailable:
             return HTTPInsufficientStorage(drive=device, request=request)
         try:
@@ -653,9 +685,6 @@ class ObjectController(BaseStorageServer):
         if error_response:
             return error_response
         new_delete_at = int(request.headers.get('X-Delete-At') or 0)
-        if new_delete_at and new_delete_at < time.time():
-            return HTTPBadRequest(body='X-Delete-At in past', request=request,
-                                  content_type='text/plain')
         try:
             fsize = request.message_length()
         except ValueError as e:
@@ -677,10 +706,12 @@ class ObjectController(BaseStorageServer):
         # nodes; handoff nodes should 409 subrequests to over-write an
         # existing data fragment until they offloaded the existing fragment
         frag_index = request.headers.get('X-Backend-Ssync-Frag-Index')
+        next_part_power = request.headers.get('X-Backend-Next-Part-Power')
         try:
             disk_file = self.get_diskfile(
                 device, partition, account, container, obj,
-                policy=policy, frag_index=frag_index)
+                policy=policy, frag_index=frag_index,
+                next_part_power=next_part_power)
         except DiskFileDeviceUnavailable:
             return HTTPInsufficientStorage(drive=device, request=request)
         try:
@@ -877,7 +908,9 @@ class ObjectController(BaseStorageServer):
         try:
             disk_file = self.get_diskfile(
                 device, partition, account, container, obj,
-                policy=policy, frag_prefs=frag_prefs)
+                policy=policy, frag_prefs=frag_prefs,
+                open_expired=config_true_value(
+                    request.headers.get('x-backend-replication', 'false')))
         except DiskFileDeviceUnavailable:
             return HTTPInsufficientStorage(drive=device, request=request)
         try:
@@ -939,7 +972,9 @@ class ObjectController(BaseStorageServer):
         try:
             disk_file = self.get_diskfile(
                 device, partition, account, container, obj,
-                policy=policy, frag_prefs=frag_prefs)
+                policy=policy, frag_prefs=frag_prefs,
+                open_expired=config_true_value(
+                    request.headers.get('x-backend-replication', 'false')))
         except DiskFileDeviceUnavailable:
             return HTTPInsufficientStorage(drive=device, request=request)
         try:
@@ -989,10 +1024,11 @@ class ObjectController(BaseStorageServer):
         device, partition, account, container, obj, policy = \
             get_name_and_placement(request, 5, 5, True)
         req_timestamp = valid_timestamp(request)
+        next_part_power = request.headers.get('X-Backend-Next-Part-Power')
         try:
             disk_file = self.get_diskfile(
                 device, partition, account, container, obj,
-                policy=policy)
+                policy=policy, next_part_power=next_part_power)
         except DiskFileDeviceUnavailable:
             return HTTPInsufficientStorage(drive=device, request=request)
         try:

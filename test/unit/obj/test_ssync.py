@@ -24,7 +24,7 @@ import itertools
 from six.moves import urllib
 
 from swift.common.exceptions import DiskFileNotExist, DiskFileError, \
-    DiskFileDeleted
+    DiskFileDeleted, DiskFileExpired
 from swift.common import utils
 from swift.common.storage_policy import POLICIES, EC_POLICY
 from swift.common.utils import Timestamp
@@ -33,6 +33,7 @@ from swift.obj.reconstructor import RebuildingECDiskFileStream, \
     ObjectReconstructor
 from swift.obj.replicator import ObjectReplicator
 
+from test import listen_zero
 from test.unit import patch_policies, debug_logger, encode_frag_archive_bodies
 from test.unit.obj.common import BaseTest
 
@@ -60,7 +61,7 @@ class TestBaseSsync(BaseTest):
         self.ts_iter = (Timestamp(t)
                         for t in itertools.count(int(time.time())))
         self.rx_ip = '127.0.0.1'
-        sock = eventlet.listen((self.rx_ip, 0))
+        sock = listen_zero()
         self.rx_server = eventlet.spawn(
             eventlet.wsgi.server, sock, self.rx_controller, self.rx_logger)
         self.rx_port = sock.getsockname()[1]
@@ -146,7 +147,7 @@ class TestBaseSsync(BaseTest):
     def _open_rx_diskfile(self, obj_name, policy, frag_index=None):
         df = self.rx_controller.get_diskfile(
             self.device, self.partition, 'a', 'c', obj_name, policy=policy,
-            frag_index=frag_index)
+            frag_index=frag_index, open_expired=True)
         df.open()
         return df
 
@@ -164,7 +165,9 @@ class TestBaseSsync(BaseTest):
                 self.assertNotEqual(v, rx_metadata.pop(k, None))
                 continue
             else:
-                self.assertEqual(v, rx_metadata.pop(k), k)
+                actual = rx_metadata.pop(k)
+                self.assertEqual(v, actual, 'Expected %r but got %r for %s' %
+                                 (v, actual, k))
         self.assertFalse(rx_metadata)
         expected_body = self._get_object_data(tx_df._name,
                                               frag_index=frag_index)
@@ -1342,6 +1345,133 @@ class TestSsyncReplication(TestBaseSsync):
             metadata = df.get_metadata()
             self.assertEqual(metadata['X-Object-Meta-Test'], oname)
             self.assertEqual(metadata['X-Object-Sysmeta-Test'], 'sys_' + oname)
+
+    def test_expired_object(self):
+        # verify that expired objects sync
+        policy = POLICIES.default
+        rx_node_index = 0
+        tx_df_mgr = self.daemon._df_router[policy]
+        t1 = next(self.ts_iter)
+        obj_name = 'o1'
+        metadata = {'X-Delete-At': '0', 'Content-Type': 'plain/text'}
+        df = self._make_diskfile(
+            obj=obj_name, body=self._get_object_data('/a/c/%s' % obj_name),
+            extra_metadata=metadata, timestamp=t1, policy=policy,
+            df_mgr=tx_df_mgr, verify=False)
+        with self.assertRaises(DiskFileExpired):
+            df.open()  # sanity check - expired
+
+        # create ssync sender instance...
+        suffixes = [os.path.basename(os.path.dirname(df._datadir))]
+        job = {'device': self.device,
+               'partition': self.partition,
+               'policy': policy}
+        node = dict(self.rx_node)
+        node.update({'index': rx_node_index})
+        sender = ssync_sender.Sender(self.daemon, node, job, suffixes)
+        # wrap connection from tx to rx to capture ssync messages...
+        sender.connect, trace = self.make_connect_wrapper(sender)
+
+        # run the sync protocol...
+        success, in_sync_objs = sender()
+
+        self.assertEqual(1, len(in_sync_objs))
+        self.assertTrue(success)
+        # allow the expired sender diskfile to be opened for verification
+        df._open_expired = True
+        self._verify_ondisk_files({obj_name: [df]}, policy)
+
+    def _check_no_longer_expired_object(self, obj_name, df, policy):
+        # verify that objects with x-delete-at metadata that are not expired
+        # can be sync'd
+        rx_node_index = 0
+
+        def do_ssync():
+            # create ssync sender instance...
+            suffixes = [os.path.basename(os.path.dirname(df._datadir))]
+            job = {'device': self.device,
+                   'partition': self.partition,
+                   'policy': policy}
+            node = dict(self.rx_node)
+            node.update({'index': rx_node_index})
+            sender = ssync_sender.Sender(self.daemon, node, job, suffixes)
+            # wrap connection from tx to rx to capture ssync messages...
+            sender.connect, trace = self.make_connect_wrapper(sender)
+
+            # run the sync protocol...
+            return sender()
+
+        with self.assertRaises(DiskFileExpired):
+            df.open()  # sanity check - expired
+        t1_meta = next(self.ts_iter)
+        df.write_metadata({'X-Timestamp': t1_meta.internal})  # no x-delete-at
+        df.open()  # sanity check - no longer expired
+
+        success, in_sync_objs = do_ssync()
+        self.assertEqual(1, len(in_sync_objs))
+        self.assertTrue(success)
+        self._verify_ondisk_files({obj_name: [df]}, policy)
+
+        # update object metadata with x-delete-at in distant future
+        t2_meta = next(self.ts_iter)
+        df.write_metadata({'X-Timestamp': t2_meta.internal,
+                           'X-Delete-At': str(int(t2_meta) + 10000)})
+        df.open()  # sanity check - not expired
+
+        success, in_sync_objs = do_ssync()
+        self.assertEqual(1, len(in_sync_objs))
+        self.assertTrue(success)
+        self._verify_ondisk_files({obj_name: [df]}, policy)
+
+        # update object metadata with x-delete-at in not so distant future to
+        # check that we can update rx with older x-delete-at than it's current
+        t3_meta = next(self.ts_iter)
+        df.write_metadata({'X-Timestamp': t3_meta.internal,
+                           'X-Delete-At': str(int(t2_meta) + 5000)})
+        df.open()  # sanity check - not expired
+
+        success, in_sync_objs = do_ssync()
+        self.assertEqual(1, len(in_sync_objs))
+        self.assertTrue(success)
+        self._verify_ondisk_files({obj_name: [df]}, policy)
+
+    def test_no_longer_expired_object_syncs(self):
+        policy = POLICIES.default
+        # simulate o1 that was PUT with x-delete-at that is now expired but
+        # later had a POST that had no x-delete-at: object should not expire.
+        tx_df_mgr = self.daemon._df_router[policy]
+        t1 = next(self.ts_iter)
+        obj_name = 'o1'
+        metadata = {'X-Delete-At': '0', 'Content-Type': 'plain/text'}
+        df = self._make_diskfile(
+            obj=obj_name, body=self._get_object_data('/a/c/%s' % obj_name),
+            extra_metadata=metadata, timestamp=t1, policy=policy,
+            df_mgr=tx_df_mgr, verify=False)
+
+        self._check_no_longer_expired_object(obj_name, df, policy)
+
+    def test_no_longer_expired_object_syncs_meta(self):
+        policy = POLICIES.default
+        # simulate o1 that was PUT with x-delete-at that is now expired but
+        # later had a POST that had no x-delete-at: object should not expire.
+        tx_df_mgr = self.daemon._df_router[policy]
+        rx_df_mgr = self.rx_controller._diskfile_router[policy]
+        t1 = next(self.ts_iter)
+        obj_name = 'o1'
+        metadata = {'X-Delete-At': '0', 'Content-Type': 'plain/text'}
+        df = self._make_diskfile(
+            obj=obj_name, body=self._get_object_data('/a/c/%s' % obj_name),
+            extra_metadata=metadata, timestamp=t1, policy=policy,
+            df_mgr=tx_df_mgr, verify=False)
+        # rx got the .data file but is missing the .meta
+        rx_df = self._make_diskfile(
+            obj=obj_name, body=self._get_object_data('/a/c/%s' % obj_name),
+            extra_metadata=metadata, timestamp=t1, policy=policy,
+            df_mgr=rx_df_mgr, verify=False)
+        with self.assertRaises(DiskFileExpired):
+            rx_df.open()  # sanity check - expired
+
+        self._check_no_longer_expired_object(obj_name, df, policy)
 
     def test_meta_file_not_synced_to_legacy_receiver(self):
         # verify that the sender does sync a data file to a legacy receiver,

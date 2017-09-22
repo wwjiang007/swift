@@ -20,10 +20,10 @@ import textwrap
 import six
 from six.moves.configparser import ConfigParser
 from swift.common.utils import (
-    config_true_value, SWIFT_CONF_FILE, whataremyips, list_from_csv,
+    config_true_value, quorum_size, whataremyips, list_from_csv,
     config_positive_int_value)
 from swift.common.ring import Ring, RingData
-from swift.common.utils import quorum_size
+from swift.common import utils
 from swift.common.exceptions import RingLoadError
 from pyeclib.ec_iface import ECDriver, ECDriverError, VALID_EC_TYPES
 
@@ -111,7 +111,7 @@ def get_policy_string(base, policy_or_index):
                             storage Policy-0 is assumed.
 
     :returns: base name with policy index added
-    :raises: PolicyError if no policy exists with the given policy_index
+    :raises PolicyError: if no policy exists with the given policy_index
     """
     if isinstance(policy_or_index, BaseStoragePolicy):
         policy = policy_or_index
@@ -130,7 +130,7 @@ def split_policy_string(policy_string):
 
     :param policy_string: base name with policy index added
 
-    :raises: PolicyError if given index does not map to a valid policy
+    :raises PolicyError: if given index does not map to a valid policy
     :returns: a tuple, in the form (base, policy) where base is the base
               string and policy is the StoragePolicy instance for the
               index encoded in the policy_string.
@@ -288,7 +288,7 @@ class BaseStoragePolicy(object):
         to check policy names before setting them.
 
         :param name: a name string for a single policy name.
-        :raises: PolicyError if the policy name is invalid.
+        :raises PolicyError: if the policy name is invalid.
         """
         if not name:
             raise PolicyError('Invalid name %r' % name, self.idx)
@@ -468,14 +468,10 @@ class ECStoragePolicy(BaseStoragePolicy):
                 'See https://bugs.launchpad.net/swift/+bug/1639691 for '
                 'more information.' % self.name)
             if not is_deprecated:
-                # TODO: To fully close bug 1639691, uncomment the raise and
-                # removing the warning below. This will be in the Pike release
-                # at the earliest.
-                logger.warning(
-                    'In a future release, this will prevent services from '
-                    'starting unless the policy is marked as deprecated.')
-                # raise PolicyError('Storage policy %s MUST be deprecated' %
-                #                   self.name)
+                raise PolicyError(
+                    'Storage policy %s uses an EC configuration known to harm '
+                    'data durability. This policy MUST be deprecated.'
+                    % self.name)
 
         # Initialize PyECLib EC backend
         try:
@@ -932,12 +928,12 @@ def reload_storage_policies():
     """
     global _POLICIES
     policy_conf = ConfigParser()
-    policy_conf.read(SWIFT_CONF_FILE)
+    policy_conf.read(utils.SWIFT_CONF_FILE)
     try:
         _POLICIES = parse_storage_policies(policy_conf)
     except PolicyError as e:
         raise SystemExit('ERROR: Invalid Storage Policy Configuration '
-                         'in %s (%s)' % (SWIFT_CONF_FILE, e))
+                         'in %s (%s)' % (utils.SWIFT_CONF_FILE, e))
 
 
 # parse configuration and setup singleton

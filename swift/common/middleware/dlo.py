@@ -151,7 +151,7 @@ class GetContext(WSGIContext):
             method='GET',
             headers={'x-auth-token': req.headers.get('x-auth-token')},
             agent=('%(orig)s ' + 'DLO MultipartGET'), swift_source='DLO')
-        con_req.query_string = 'format=json&prefix=%s' % quote(prefix)
+        con_req.query_string = 'prefix=%s' % quote(prefix)
         if marker:
             con_req.query_string += '&marker=%s' % quote(marker)
 
@@ -232,8 +232,6 @@ class GetContext(WSGIContext):
         container = unquote(container)
         obj_prefix = unquote(obj_prefix)
 
-        # manifest might point to a different container
-        req.acl = None
         version, account, _junk = req.split_path(2, 3, True)
         error_response, segments = self._get_container_listing(
             req, version, account, container, obj_prefix)

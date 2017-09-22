@@ -10,8 +10,10 @@ This section documents setting up a virtual machine for doing Swift
 development.  The virtual machine will emulate running a four node Swift
 cluster. To begin:
 
-* Get an Ubuntu 14.04 LTS server image or try something
-  Fedora/CentOS.
+* Get a linux system server image, this guide will cover:
+  * Ubuntu 14.04, 16.04 LTS
+  * Fedora/CentOS.
+  * OpenSuse
 
 * Create guest virtual machine from the image.
 
@@ -57,6 +59,16 @@ Installing dependencies
                          python-netifaces python-pip python-dns \
                          python-mock
 
+* On ``OpenSuse``::
+
+        sudo zypper install curl gcc memcached rsync sqlite3 xfsprogs git-core \
+                            libffi-devel liberasurecode-devel python2-setuptools \
+                            libopenssl-devel
+        sudo zypper install python2-coverage python-devel python2-nose \
+                            python-xattr python-eventlet python2-greenlet \
+                            python2-netifaces python2-pip python2-dnspython \
+                            python2-mock
+
   Note: This installs necessary system dependencies and *most* of the python
   dependencies. Later in the process setuptools/distribute or pip will install
   and/or upgrade packages.
@@ -96,6 +108,13 @@ another device when creating the VM, and follow these instructions:
         sudo chown -R ${USER}:${USER} /var/run/swift
         # **Make sure to include the trailing slash after /srv/$x/**
         for x in {1..4}; do sudo chown -R ${USER}:${USER} /srv/$x/; done
+
+     Note: For OpenSuse users, a user's primary group is `users`, so you have 2 options:
+
+     * Change `${USER}:${USER}` to `${USER}:users` in all references of this guide; or
+     * Create a group for your username and add yourself to it::
+
+        sudo groupadd ${USER} && sudo gpasswd -a ${USER} ${USER}
 
      Note: We create the mount points and mount the storage disk under
      /mnt/sdb1. This disk will contain one directory per simulated swift node,
@@ -147,6 +166,13 @@ these instructions:
         # **Make sure to include the trailing slash after /srv/$x/**
         for x in {1..4}; do sudo chown -R ${USER}:${USER} /srv/$x/; done
 
+     Note: For OpenSuse users, a user's primary group is `users`, so you have 2 options:
+
+     * Change `${USER}:${USER}` to `${USER}:users` in all references of this guide; or
+     * Create a group for your username and add yourself to it::
+
+        sudo groupadd ${USER} && sudo gpasswd -a ${USER} ${USER}
+
      Note: We create the mount points and mount the loopback file under
      /mnt/sdb1. This file will contain one directory per simulated swift node,
      each owned by the current swift user.
@@ -173,6 +199,8 @@ Note that on some systems you might have to create ``/etc/rc.local``.
 
 On Fedora 19 or later, you need to place these in ``/etc/rc.d/rc.local``.
 
+On OpenSuse you need to place these in ``/etc/init.d/boot.local``.
+
 ----------------
 Getting the code
 ----------------
@@ -196,7 +224,10 @@ Getting the code
 
   #. Build a development installation of swift::
 
-        cd $HOME/swift; sudo pip install -r requirements.txt; sudo python setup.py develop; cd -
+        cd $HOME/swift; sudo pip install --no-binary cryptography -r requirements.txt; sudo python setup.py develop; cd -
+
+     Note: Due to a difference in libssl.so naming in OpenSuse to other Linux distros the wheel/binary wont work so the
+     cryptography must be built, thus the ``--no-binary cryptography``.
 
      Fedora 19 or later users might have to perform the following if development
      installation of swift fails::
@@ -231,6 +262,8 @@ Setting up rsync
 
      One might have to create the above files to perform the edits.
 
+     On OpenSuse, nothing needs to happen here.
+
   #. On platforms with SELinux in ``Enforcing`` mode, either set to ``Permissive``::
 
         sudo setenforce Permissive
@@ -253,6 +286,11 @@ Setting up rsync
      * On Fedora, run::
 
         sudo systemctl restart xinetd.service
+        sudo systemctl enable rsyncd.service
+        sudo systemctl start rsyncd.service
+
+     * On OpenSuse, run::
+
         sudo systemctl enable rsyncd.service
         sudo systemctl start rsyncd.service
 
@@ -304,6 +342,13 @@ Optional: Setting up rsyslog for individual logging
 
         sudo cp $HOME/swift/doc/saio/rsyslog.d/10-swift.conf /etc/rsyslog.d/
 
+     Note: OpenSuse may have the systemd logger installed, so if you want this
+     to work, you need to install rsyslog::
+
+        sudo zypper install rsyslog
+        sudo systemctl start rsyslog.service
+        sudo systemctl enable rsyslog.service
+
      Be sure to review that conf file to determine if you want all the logs
      in one file vs. all the logs separated out, and if you want hourly logs
      for stats processing. For convenience, we provide its default contents
@@ -332,7 +377,7 @@ Optional: Setting up rsyslog for individual logging
         sudo chmod -R g+w /var/log/swift
         sudo service rsyslog restart
 
-     * On Fedora::
+     * On Fedora and OpenSuse::
 
         sudo chown -R root:adm /var/log/swift
         sudo chmod -R g+w /var/log/swift
@@ -494,34 +539,35 @@ Setting up scripts for running Swift
      for 2x replication, but those rings only use 4 devices::
 
         Device d0r1z1-127.0.0.1:6010R127.0.0.1:6010/sdb1_"" with 1.0 weight got id 0
-        Device d1r1z2-127.0.0.1:6020R127.0.0.1:6020/sdb2_"" with 1.0 weight got id 1
-        Device d2r1z3-127.0.0.1:6030R127.0.0.1:6030/sdb3_"" with 1.0 weight got id 2
-        Device d3r1z4-127.0.0.1:6040R127.0.0.1:6040/sdb4_"" with 1.0 weight got id 3
-        Reassigned 1024 (100.00%) partitions. Balance is now 0.00.  Dispersion is now 0.00
+        Device d1r1z2-127.0.0.2:6020R127.0.0.2:6020/sdb2_"" with 1.0 weight got id 1
+        Device d2r1z3-127.0.0.3:6030R127.0.0.3:6030/sdb3_"" with 1.0 weight got id 2
+        Device d3r1z4-127.0.0.4:6040R127.0.0.4:6040/sdb4_"" with 1.0 weight got id 3
+        Reassigned 3072 (300.00%) partitions. Balance is now 0.00.  Dispersion is now 0.00
         Device d0r1z1-127.0.0.1:6010R127.0.0.1:6010/sdb1_"" with 1.0 weight got id 0
-        Device d1r1z2-127.0.0.1:6020R127.0.0.1:6020/sdb2_"" with 1.0 weight got id 1
-        Device d2r1z3-127.0.0.1:6030R127.0.0.1:6030/sdb3_"" with 1.0 weight got id 2
-        Device d3r1z4-127.0.0.1:6040R127.0.0.1:6040/sdb4_"" with 1.0 weight got id 3
-        Reassigned 1024 (100.00%) partitions. Balance is now 0.00.  Dispersion is now 0.00
+        Device d1r1z2-127.0.0.2:6020R127.0.0.2:6020/sdb2_"" with 1.0 weight got id 1
+        Device d2r1z3-127.0.0.3:6030R127.0.0.3:6030/sdb3_"" with 1.0 weight got id 2
+        Device d3r1z4-127.0.0.4:6040R127.0.0.4:6040/sdb4_"" with 1.0 weight got id 3
+        Reassigned 2048 (200.00%) partitions. Balance is now 0.00.  Dispersion is now 0.00
         Device d0r1z1-127.0.0.1:6010R127.0.0.1:6010/sdb1_"" with 1.0 weight got id 0
         Device d1r1z1-127.0.0.1:6010R127.0.0.1:6010/sdb5_"" with 1.0 weight got id 1
-        Device d2r1z2-127.0.0.1:6020R127.0.0.1:6020/sdb2_"" with 1.0 weight got id 2
-        Device d3r1z2-127.0.0.1:6020R127.0.0.1:6020/sdb6_"" with 1.0 weight got id 3
-        Device d4r1z3-127.0.0.1:6030R127.0.0.1:6030/sdb3_"" with 1.0 weight got id 4
-        Device d5r1z3-127.0.0.1:6030R127.0.0.1:6030/sdb7_"" with 1.0 weight got id 5
-        Device d6r1z4-127.0.0.1:6040R127.0.0.1:6040/sdb4_"" with 1.0 weight got id 6
-        Device d7r1z4-127.0.0.1:6040R127.0.0.1:6040/sdb8_"" with 1.0 weight got id 7
-        Reassigned 1024 (100.00%) partitions. Balance is now 0.00.  Dispersion is now 0.00
+        Device d2r1z2-127.0.0.2:6020R127.0.0.2:6020/sdb2_"" with 1.0 weight got id 2
+        Device d3r1z2-127.0.0.2:6020R127.0.0.2:6020/sdb6_"" with 1.0 weight got id 3
+        Device d4r1z3-127.0.0.3:6030R127.0.0.3:6030/sdb3_"" with 1.0 weight got id 4
+        Device d5r1z3-127.0.0.3:6030R127.0.0.3:6030/sdb7_"" with 1.0 weight got id 5
+        Device d6r1z4-127.0.0.4:6040R127.0.0.4:6040/sdb4_"" with 1.0 weight got id 6
+        Device d7r1z4-127.0.0.4:6040R127.0.0.4:6040/sdb8_"" with 1.0 weight got id 7
+        Reassigned 6144 (600.00%) partitions. Balance is now 0.00.  Dispersion is now 0.00
         Device d0r1z1-127.0.0.1:6011R127.0.0.1:6011/sdb1_"" with 1.0 weight got id 0
-        Device d1r1z2-127.0.0.1:6021R127.0.0.1:6021/sdb2_"" with 1.0 weight got id 1
-        Device d2r1z3-127.0.0.1:6031R127.0.0.1:6031/sdb3_"" with 1.0 weight got id 2
-        Device d3r1z4-127.0.0.1:6041R127.0.0.1:6041/sdb4_"" with 1.0 weight got id 3
-        Reassigned 1024 (100.00%) partitions. Balance is now 0.00.  Dispersion is now 0.00
+        Device d1r1z2-127.0.0.2:6021R127.0.0.2:6021/sdb2_"" with 1.0 weight got id 1
+        Device d2r1z3-127.0.0.3:6031R127.0.0.3:6031/sdb3_"" with 1.0 weight got id 2
+        Device d3r1z4-127.0.0.4:6041R127.0.0.4:6041/sdb4_"" with 1.0 weight got id 3
+        Reassigned 3072 (300.00%) partitions. Balance is now 0.00.  Dispersion is now 0.00
         Device d0r1z1-127.0.0.1:6012R127.0.0.1:6012/sdb1_"" with 1.0 weight got id 0
-        Device d1r1z2-127.0.0.1:6022R127.0.0.1:6022/sdb2_"" with 1.0 weight got id 1
-        Device d2r1z3-127.0.0.1:6032R127.0.0.1:6032/sdb3_"" with 1.0 weight got id 2
-        Device d3r1z4-127.0.0.1:6042R127.0.0.1:6042/sdb4_"" with 1.0 weight got id 3
-        Reassigned 1024 (100.00%) partitions. Balance is now 0.00.  Dispersion is now 0.00
+        Device d1r1z2-127.0.0.2:6022R127.0.0.2:6022/sdb2_"" with 1.0 weight got id 1
+        Device d2r1z3-127.0.0.3:6032R127.0.0.3:6032/sdb3_"" with 1.0 weight got id 2
+        Device d3r1z4-127.0.0.4:6042R127.0.0.4:6042/sdb4_"" with 1.0 weight got id 3
+        Reassigned 3072 (300.00%) partitions. Balance is now 0.00.  Dispersion is now 0.00
+
 
   #. Read more about Storage Policies and your SAIO :doc:`policies_saio`
 

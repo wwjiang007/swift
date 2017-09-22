@@ -49,7 +49,6 @@ import json
 import logging
 import time
 from bisect import bisect
-from swift import gettext_ as _
 from hashlib import md5
 
 from eventlet.green import socket
@@ -163,10 +162,13 @@ class MemcacheRing(object):
     def _exception_occurred(self, server, e, action='talking',
                             sock=None, fp=None, got_connection=True):
         if isinstance(e, Timeout):
-            logging.error(_("Timeout %(action)s to memcached: %(server)s"),
+            logging.error("Timeout %(action)s to memcached: %(server)s",
                           {'action': action, 'server': server})
+        elif isinstance(e, socket.error):
+            logging.error("Error %(action)s to memcached: %(server)s: %(err)s",
+                          {'action': action, 'server': server, 'err': e})
         else:
-            logging.exception(_("Error %(action)s to memcached: %(server)s"),
+            logging.exception("Error %(action)s to memcached: %(server)s",
                               {'action': action, 'server': server})
         try:
             if fp:
@@ -191,7 +193,7 @@ class MemcacheRing(object):
                                     if err > now - ERROR_LIMIT_TIME]
             if len(self._errors[server]) > ERROR_LIMIT_COUNT:
                 self._error_limited[server] = now + ERROR_LIMIT_DURATION
-                logging.error(_('Error limiting server %s'), server)
+                logging.error('Error limiting server %s', server)
 
     def _get_conns(self, key):
         """
@@ -239,10 +241,10 @@ class MemcacheRing(object):
                           to memcache, or with pickle if configured to use
                           pickle instead of JSON (to avoid cache poisoning)
         :param time: the time to live
-        :min_compress_len: minimum compress length, this parameter was added
-                           to keep the signature compatible with
-                           python-memcached interface. This implementation
-                           ignores it.
+        :param min_compress_len: minimum compress length, this parameter was
+                                 added to keep the signature compatible with
+                                 python-memcached interface. This
+                                 implementation ignores it.
         """
         key = md5hash(key)
         timeout = sanitize_timeout(time)
@@ -430,8 +432,8 @@ class MemcacheRing(object):
         Gets multiple values from memcache for the given keys.
 
         :param keys: keys for values to be retrieved from memcache
-        :param servery_key: key to use in determining which server in the ring
-                            is used
+        :param server_key: key to use in determining which server in the ring
+                           is used
         :returns: list of values
         """
         server_key = md5hash(server_key)

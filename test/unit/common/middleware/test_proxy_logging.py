@@ -122,7 +122,7 @@ class TestProxyLogging(unittest.TestCase):
                     self.assertAlmostEqual(exp_timing, timing_call[0][1],
                                            places=4)
         if not found:
-            self.assertTrue(False, 'assertTiming: %s not found in %r' % (
+            self.fail('assertTiming: %s not found in %r' % (
                 exp_metric, timing_calls))
 
     def assertTimingSince(self, exp_metric, app, exp_start=None):
@@ -137,7 +137,7 @@ class TestProxyLogging(unittest.TestCase):
                     self.assertAlmostEqual(exp_start, timing_call[0][1],
                                            places=4)
         if not found:
-            self.assertTrue(False, 'assertTimingSince: %s not found in %r' % (
+            self.fail('assertTimingSince: %s not found in %r' % (
                 exp_metric, timing_calls))
 
     def assertNotTiming(self, not_exp_metric, app):
@@ -449,8 +449,8 @@ class TestProxyLogging(unittest.TestCase):
         [x for x in resp]
         log_parts = self._log_parts(app)
         headers = unquote(log_parts[14]).split('\n')
-        self.assertTrue('First: 1' in headers)
-        self.assertTrue('Second: 2' in headers)
+        self.assertIn('First: 1', headers)
+        self.assertIn('Second: 2', headers)
         self.assertNotIn('Third: 3', headers)
         self.assertNotIn('Host: localhost:80', headers)
 

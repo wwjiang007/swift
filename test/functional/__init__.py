@@ -39,8 +39,9 @@ from six.moves.http_client import HTTPException
 
 from swift.common.middleware.memcache import MemcacheMiddleware
 from swift.common.storage_policy import parse_storage_policies, PolicyError
+from swift.common.utils import set_swift_dir
 
-from test import get_config
+from test import get_config, listen_zero
 from test.functional.swift_test_client import Account, Connection, Container, \
     ResponseError
 # This has the side effect of mocking out the xattr module so that unit tests
@@ -105,9 +106,6 @@ skip, skip2, skip3, skip_service_tokens, skip_if_no_reseller_admin = \
 
 orig_collate = ''
 insecure = False
-
-orig_hash_path_suff_pref = ('', '')
-orig_swift_conf_name = None
 
 in_process = False
 _testdir = _test_servers = _test_coros = _test_socks = None
@@ -259,7 +257,7 @@ def _in_process_setup_ring(swift_conf, conf_src_dir, testdir):
             device = 'sd%c1' % chr(len(obj_sockets) + ord('a'))
             utils.mkdirs(os.path.join(_testdir, 'sda1'))
             utils.mkdirs(os.path.join(_testdir, 'sda1', 'tmp'))
-            obj_socket = eventlet.listen(('localhost', 0))
+            obj_socket = listen_zero()
             obj_sockets.append(obj_socket)
             dev['port'] = obj_socket.getsockname()[1]
             dev['ip'] = '127.0.0.1'
@@ -271,7 +269,7 @@ def _in_process_setup_ring(swift_conf, conf_src_dir, testdir):
         # make default test ring, 3 replicas, 4 partitions, 3 devices
         # which will work for a replication policy or a 2+1 EC policy
         _info('No source object ring file, creating 3rep/4part/3dev ring')
-        obj_sockets = [eventlet.listen(('localhost', 0)) for _ in (0, 1, 2)]
+        obj_sockets = [listen_zero() for _ in (0, 1, 2)]
         replica2part2dev_id = [[0, 1, 2, 0],
                                [1, 2, 0, 1],
                                [2, 0, 1, 2]]
@@ -413,6 +411,7 @@ def in_process_setup(the_object_server=object_server):
     utils.mkdirs(os.path.join(_testdir, 'sdc1', 'tmp'))
 
     swift_conf = _in_process_setup_swift_conf(swift_conf_src, _testdir)
+    _info('prepared swift.conf: %s' % swift_conf)
 
     # Call the associated method for the value of
     # 'SWIFT_TEST_IN_PROCESS_CONF_LOADER', if one exists
@@ -437,12 +436,11 @@ def in_process_setup(the_object_server=object_server):
 
     obj_sockets = _in_process_setup_ring(swift_conf, conf_src_dir, _testdir)
 
-    global orig_swift_conf_name
-    orig_swift_conf_name = utils.SWIFT_CONF_FILE
-    utils.SWIFT_CONF_FILE = swift_conf
-    constraints.reload_constraints()
-    storage_policy.SWIFT_CONF_FILE = swift_conf
-    storage_policy.reload_storage_policies()
+    # load new swift.conf file
+    if set_swift_dir(os.path.dirname(swift_conf)):
+        constraints.reload_constraints()
+        storage_policy.reload_storage_policies()
+
     global config
     if constraints.SWIFT_CONSTRAINTS_LOADED:
         # Use the swift constraints that are loaded for the test framework
@@ -453,16 +451,13 @@ def in_process_setup(the_object_server=object_server):
     else:
         # In-process swift constraints were not loaded, somethings wrong
         raise SkipTest
-    global orig_hash_path_suff_pref
-    orig_hash_path_suff_pref = utils.HASH_PATH_PREFIX, utils.HASH_PATH_SUFFIX
-    utils.validate_hash_conf()
 
     global _test_socks
     _test_socks = []
     # We create the proxy server listening socket to get its port number so
     # that we can add it as the "auth_port" value for the functional test
     # clients.
-    prolis = eventlet.listen(('localhost', 0))
+    prolis = listen_zero()
     _test_socks.append(prolis)
 
     # The following set of configuration values is used both for the
@@ -510,19 +505,10 @@ def in_process_setup(the_object_server=object_server):
         'password6': 'testing6'
     })
 
-    # If an env var explicitly specifies the proxy-server object_post_as_copy
-    # option then use its value, otherwise leave default config unchanged.
-    object_post_as_copy = os.environ.get(
-        'SWIFT_TEST_IN_PROCESS_OBJECT_POST_AS_COPY')
-    if object_post_as_copy is not None:
-        object_post_as_copy = config_true_value(object_post_as_copy)
-        config['object_post_as_copy'] = str(object_post_as_copy)
-        _debug('Setting object_post_as_copy to %r' % object_post_as_copy)
-
-    acc1lis = eventlet.listen(('localhost', 0))
-    acc2lis = eventlet.listen(('localhost', 0))
-    con1lis = eventlet.listen(('localhost', 0))
-    con2lis = eventlet.listen(('localhost', 0))
+    acc1lis = listen_zero()
+    acc2lis = listen_zero()
+    con1lis = listen_zero()
+    con2lis = listen_zero()
     _test_socks += [acc1lis, acc2lis, con1lis, con2lis] + obj_sockets
 
     account_ring_path = os.path.join(_testdir, 'account.ring.gz')
@@ -616,7 +602,8 @@ def in_process_setup(the_object_server=object_server):
                 node['ip'], node['port'], node['device'], partition, 'PUT',
                 '/' + act, {'X-Timestamp': ts, 'x-trans-id': act})
             resp = conn.getresponse()
-            assert(resp.status == 201)
+            assert resp.status == 201, 'Unable to create account: %s\n%s' % (
+                resp.status, resp.body)
 
     create_account('AUTH_test')
     create_account('AUTH_test2')
@@ -917,10 +904,7 @@ def teardown_package():
             rmtree(os.path.dirname(_testdir))
         except Exception:
             pass
-        utils.HASH_PATH_PREFIX, utils.HASH_PATH_SUFFIX = \
-            orig_hash_path_suff_pref
-        utils.SWIFT_CONF_FILE = orig_swift_conf_name
-        constraints.reload_constraints()
+
         reset_globals()
 
 

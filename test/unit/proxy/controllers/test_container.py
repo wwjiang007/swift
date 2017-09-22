@@ -14,13 +14,14 @@
 # limitations under the License.
 
 import mock
+import socket
 import unittest
 
 from eventlet import Timeout
 
 from swift.common.swob import Request
 from swift.proxy import server as proxy_server
-from swift.proxy.controllers.base import headers_to_container_info
+from swift.proxy.controllers.base import headers_to_container_info, Controller
 from test.unit import fake_http_connect, FakeRing, FakeMemcache
 from swift.common.storage_policy import StoragePolicy
 from swift.common.request_helpers import get_sys_meta_prefix
@@ -110,6 +111,24 @@ class TestContainerController(TestRingBase):
         from_memcache = self.app.memcache.get('container/a/c')
         self.assertTrue(from_memcache)
 
+    @mock.patch('swift.proxy.controllers.container.clear_info_cache')
+    @mock.patch.object(Controller, 'make_requests')
+    def test_container_cache_cleared_after_PUT(
+            self, mock_make_requests, mock_clear_info_cache):
+        parent_mock = mock.Mock()
+        parent_mock.attach_mock(mock_make_requests, 'make_requests')
+        parent_mock.attach_mock(mock_clear_info_cache, 'clear_info_cache')
+        controller = proxy_server.ContainerController(self.app, 'a', 'c')
+        callback = self._make_callback_func({})
+        req = Request.blank('/v1/a/c')
+        with mock.patch('swift.proxy.controllers.base.http_connect',
+                        fake_http_connect(200, 200, give_connect=callback)):
+            controller.PUT(req)
+
+        # Ensure cache is cleared after the PUT request
+        self.assertEqual(parent_mock.mock_calls[0][0], 'make_requests')
+        self.assertEqual(parent_mock.mock_calls[1][0], 'clear_info_cache')
+
     def test_swift_owner(self):
         owner_headers = {
             'x-container-read': 'value', 'x-container-write': 'value',
@@ -180,7 +199,7 @@ class TestContainerController(TestRingBase):
         self.assertNotEqual(context['headers']['x-timestamp'], '1.0')
 
     def test_node_errors(self):
-        self.app.sort_nodes = lambda n: n
+        self.app.sort_nodes = lambda n, *args, **kwargs: n
 
         for method in ('PUT', 'DELETE', 'POST'):
             def test_status_map(statuses, expected):
@@ -193,34 +212,32 @@ class TestContainerController(TestRingBase):
                     self.assertEqual(req['method'], method)
                     self.assertTrue(req['path'].endswith('/a/c'))
 
-            base_status = [201] * 3
+            base_status = [201] * self.CONTAINER_REPLICAS
             # test happy path
             test_status_map(list(base_status), 201)
-            for i in range(3):
+            for i in range(self.CONTAINER_REPLICAS):
                 self.assertEqual(node_error_count(
                     self.app, self.container_ring.devs[i]), 0)
             # single node errors and test isolation
-            for i in range(3):
-                status_list = list(base_status)
-                status_list[i] = 503
-                status_list.append(201)
-                test_status_map(status_list, 201)
-                for j in range(3):
+            for i in range(self.CONTAINER_REPLICAS):
+                test_status_map(base_status[:i] + [503] + base_status[i:], 201)
+                for j in range(self.CONTAINER_REPLICAS):
                     expected = 1 if j == i else 0
                     self.assertEqual(node_error_count(
                         self.app, self.container_ring.devs[j]), expected)
             # timeout
-            test_status_map((201, Timeout(), 201, 201), 201)
+            test_status_map(base_status[:1] + [Timeout()] + base_status[1:],
+                            201)
             self.assertEqual(node_error_count(
                 self.app, self.container_ring.devs[1]), 1)
 
             # exception
-            test_status_map((Exception('kaboom!'), 201, 201, 201), 201)
+            test_status_map([Exception('kaboom!')] + base_status, 201)
             self.assertEqual(node_error_count(
                 self.app, self.container_ring.devs[0]), 1)
 
             # insufficient storage
-            test_status_map((201, 201, 507, 201), 201)
+            test_status_map(base_status[:2] + [507] + base_status[2:], 201)
             self.assertEqual(node_error_count(
                 self.app, self.container_ring.devs[2]),
                 self.app.error_suppression_limit + 1)
@@ -229,7 +246,8 @@ class TestContainerController(TestRingBase):
         nodes = self.app.container_ring.replicas
         handoffs = self.app.request_node_count(nodes) - nodes
         GET_TEST_CASES = [
-            ([], 503),
+            ([socket.error()] * (nodes + handoffs), 503),
+            ([500] * (nodes + handoffs), 503),
             ([200], 200),
             ([404, 200], 200),
             ([404] * nodes + [200], 200),
@@ -258,6 +276,13 @@ class TestContainerController(TestRingBase):
         if failures:
             self.fail('Some requests did not have expected response:\n' +
                       '\n'.join(failures))
+
+        # One more test, simulating all nodes being error-limited
+        with mocked_http_conn(), mock.patch.object(self.app, 'iter_nodes',
+                                                   return_value=[]):
+            req = Request.blank('/v1/a/c')
+            resp = req.get_response(self.app)
+            self.assertEqual(resp.status_int, 503)
 
     def test_response_code_for_PUT(self):
         PUT_TEST_CASES = [

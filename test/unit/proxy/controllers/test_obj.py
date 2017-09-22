@@ -14,6 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import collections
 import email.parser
 import itertools
 import math
@@ -195,11 +196,12 @@ class BaseObjectControllerMixin(object):
 
     def test_iter_nodes_local_first_noops_when_no_affinity(self):
         # this test needs a stable node order - most don't
-        self.app.sort_nodes = lambda l: l
+        self.app.sort_nodes = lambda l, *args, **kwargs: l
         controller = self.controller_cls(
             self.app, 'a', 'c', 'o')
-        self.app.write_affinity_is_local_fn = None
-        object_ring = self.policy.object_ring
+        policy = self.policy
+        self.app.get_policy_options(policy).write_affinity_is_local_fn = None
+        object_ring = policy.object_ring
         all_nodes = object_ring.get_part_nodes(1)
         all_nodes.extend(object_ring.get_more_nodes(1))
 
@@ -213,10 +215,11 @@ class BaseObjectControllerMixin(object):
     def test_iter_nodes_local_first_moves_locals_first(self):
         controller = self.controller_cls(
             self.app, 'a', 'c', 'o')
-        self.app.write_affinity_is_local_fn = (
+        policy_conf = self.app.get_policy_options(self.policy)
+        policy_conf.write_affinity_is_local_fn = (
             lambda node: node['region'] == 1)
         # we'll write to one more than replica count local nodes
-        self.app.write_affinity_node_count = lambda r: r + 1
+        policy_conf.write_affinity_node_count_fn = lambda r: r + 1
 
         object_ring = self.policy.object_ring
         # make our fake ring have plenty of nodes, and not get limited
@@ -234,7 +237,7 @@ class BaseObjectControllerMixin(object):
 
         # make sure we have enough local nodes (sanity)
         all_local_nodes = [n for n in all_nodes if
-                           self.app.write_affinity_is_local_fn(n)]
+                           policy_conf.write_affinity_is_local_fn(n)]
         self.assertGreaterEqual(len(all_local_nodes), self.replicas() + 1)
 
         # finally, create the local_first_nodes iter and flatten it out
@@ -252,7 +255,8 @@ class BaseObjectControllerMixin(object):
     def test_iter_nodes_local_first_best_effort(self):
         controller = self.controller_cls(
             self.app, 'a', 'c', 'o')
-        self.app.write_affinity_is_local_fn = (
+        policy_conf = self.app.get_policy_options(self.policy)
+        policy_conf.write_affinity_is_local_fn = (
             lambda node: node['region'] == 1)
 
         object_ring = self.policy.object_ring
@@ -266,7 +270,7 @@ class BaseObjectControllerMixin(object):
         self.assertEqual(len(all_nodes), self.replicas() +
                          POLICIES.default.object_ring.max_more_nodes)
         all_local_nodes = [n for n in all_nodes if
-                           self.app.write_affinity_is_local_fn(n)]
+                           policy_conf.write_affinity_is_local_fn(n)]
         self.assertEqual(len(all_local_nodes), self.replicas())
         # but the local nodes we do have are at the front of the local iter
         first_n_local_first_nodes = local_first_nodes[:len(all_local_nodes)]
@@ -275,6 +279,86 @@ class BaseObjectControllerMixin(object):
         # but we *still* don't *skip* any nodes
         self.assertEqual(len(all_nodes), len(local_first_nodes))
         self.assertEqual(sorted(all_nodes), sorted(local_first_nodes))
+
+    def test_iter_nodes_local_handoff_first_noops_when_no_affinity(self):
+        # this test needs a stable node order - most don't
+        self.app.sort_nodes = lambda l, *args, **kwargs: l
+        controller = self.controller_cls(
+            self.app, 'a', 'c', 'o')
+        policy = self.policy
+        self.app.get_policy_options(policy).write_affinity_is_local_fn = None
+        object_ring = policy.object_ring
+        all_nodes = object_ring.get_part_nodes(1)
+        all_nodes.extend(object_ring.get_more_nodes(1))
+
+        local_first_nodes = list(controller.iter_nodes_local_first(
+            object_ring, 1, local_handoffs_first=True))
+
+        self.maxDiff = None
+
+        self.assertEqual(all_nodes, local_first_nodes)
+
+    def test_iter_nodes_handoff_local_first_default(self):
+        controller = self.controller_cls(
+            self.app, 'a', 'c', 'o')
+        policy_conf = self.app.get_policy_options(self.policy)
+        policy_conf.write_affinity_is_local_fn = (
+            lambda node: node['region'] == 1)
+
+        object_ring = self.policy.object_ring
+        primary_nodes = object_ring.get_part_nodes(1)
+        handoff_nodes_iter = object_ring.get_more_nodes(1)
+        all_nodes = primary_nodes + list(handoff_nodes_iter)
+        handoff_nodes_iter = object_ring.get_more_nodes(1)
+        local_handoffs = [n for n in handoff_nodes_iter if
+                          policy_conf.write_affinity_is_local_fn(n)]
+
+        prefered_nodes = list(controller.iter_nodes_local_first(
+            object_ring, 1, local_handoffs_first=True))
+
+        self.assertEqual(len(all_nodes), self.replicas() +
+                         POLICIES.default.object_ring.max_more_nodes)
+
+        first_primary_nodes = prefered_nodes[:len(primary_nodes)]
+        self.assertEqual(sorted(primary_nodes), sorted(first_primary_nodes))
+
+        handoff_count = self.replicas() - len(primary_nodes)
+        first_handoffs = prefered_nodes[len(primary_nodes):][:handoff_count]
+        self.assertEqual(first_handoffs, local_handoffs[:handoff_count])
+
+    def test_iter_nodes_handoff_local_first_non_default(self):
+        # Obviously this test doesn't work if we're testing 1 replica.
+        # In that case, we don't have any failovers to check.
+        if self.replicas() == 1:
+            return
+
+        controller = self.controller_cls(
+            self.app, 'a', 'c', 'o')
+        policy_conf = self.app.get_policy_options(self.policy)
+        policy_conf.write_affinity_is_local_fn = (
+            lambda node: node['region'] == 1)
+        policy_conf.write_affinity_handoff_delete_count = 1
+
+        object_ring = self.policy.object_ring
+        primary_nodes = object_ring.get_part_nodes(1)
+        handoff_nodes_iter = object_ring.get_more_nodes(1)
+        all_nodes = primary_nodes + list(handoff_nodes_iter)
+        handoff_nodes_iter = object_ring.get_more_nodes(1)
+        local_handoffs = [n for n in handoff_nodes_iter if
+                          policy_conf.write_affinity_is_local_fn(n)]
+
+        prefered_nodes = list(controller.iter_nodes_local_first(
+            object_ring, 1, local_handoffs_first=True))
+
+        self.assertEqual(len(all_nodes), self.replicas() +
+                         POLICIES.default.object_ring.max_more_nodes)
+
+        first_primary_nodes = prefered_nodes[:len(primary_nodes)]
+        self.assertEqual(sorted(primary_nodes), sorted(first_primary_nodes))
+
+        handoff_count = policy_conf.write_affinity_handoff_delete_count
+        first_handoffs = prefered_nodes[len(primary_nodes):][:handoff_count]
+        self.assertEqual(first_handoffs, local_handoffs[:handoff_count])
 
     def test_connect_put_node_timeout(self):
         controller = self.controller_cls(
@@ -364,6 +448,36 @@ class BaseObjectControllerMixin(object):
         codes = [204] * self.replicas()
         with set_http_connect(507, *codes):
             resp = req.get_response(self.app)
+        self.assertEqual(resp.status_int, 204)
+
+    def test_DELETE_write_affinity_before_replication(self):
+        policy_conf = self.app.get_policy_options(self.policy)
+        policy_conf.write_affinity_handoff_delete_count = self.replicas() / 2
+        policy_conf.write_affinity_is_local_fn = (
+            lambda node: node['region'] == 1)
+        handoff_count = policy_conf.write_affinity_handoff_delete_count
+
+        req = swift.common.swob.Request.blank('/v1/a/c/o', method='DELETE')
+        codes = [204] * self.replicas() + [404] * handoff_count
+        with set_http_connect(*codes):
+            resp = req.get_response(self.app)
+
+        self.assertEqual(resp.status_int, 204)
+
+    def test_DELETE_write_affinity_after_replication(self):
+        policy_conf = self.app.get_policy_options(self.policy)
+        policy_conf.write_affinity_handoff_delete_count = self.replicas() / 2
+        policy_conf.write_affinity_is_local_fn = (
+            lambda node: node['region'] == 1)
+        handoff_count = policy_conf.write_affinity_handoff_delete_count
+
+        req = swift.common.swob.Request.blank('/v1/a/c/o', method='DELETE')
+        codes = ([204] * (self.replicas() - handoff_count) +
+                 [404] * handoff_count +
+                 [204] * handoff_count)
+        with set_http_connect(*codes):
+            resp = req.get_response(self.app)
+
         self.assertEqual(resp.status_int, 204)
 
     def test_POST_non_int_delete_after(self):
@@ -474,7 +588,7 @@ class BaseObjectControllerMixin(object):
     def test_HEAD_x_newest_with_two_vector_timestamps(self):
         req = swob.Request.blank('/v1/a/c/o', method='HEAD',
                                  headers={'X-Newest': 'true'})
-        ts = (utils.Timestamp(time.time(), offset=offset)
+        ts = (utils.Timestamp.now(offset=offset)
               for offset in itertools.count())
         timestamps = [next(ts) for i in range(self.replicas())]
         newest_timestamp = timestamps[-1]
@@ -574,6 +688,80 @@ class BaseObjectControllerMixin(object):
                                    self.replicas(policy))
 
                 self.assertEqual(container_updates, expected)
+
+    def _check_write_affinity(
+            self, conf, policy_conf, policy, affinity_regions, affinity_count):
+        conf['policy_config'] = policy_conf
+        app = PatchedObjControllerApp(
+            conf, FakeMemcache(), account_ring=FakeRing(),
+            container_ring=FakeRing(), logger=self.logger)
+
+        controller = self.controller_cls(app, 'a', 'c', 'o')
+
+        object_ring = app.get_object_ring(int(policy))
+        # make our fake ring have plenty of nodes, and not get limited
+        # artificially by the proxy max request node count
+        object_ring.max_more_nodes = 100
+
+        all_nodes = object_ring.get_part_nodes(1)
+        all_nodes.extend(object_ring.get_more_nodes(1))
+
+        # make sure we have enough local nodes (sanity)
+        all_local_nodes = [n for n in all_nodes if
+                           n['region'] in affinity_regions]
+        self.assertGreaterEqual(len(all_local_nodes), affinity_count)
+
+        # finally, create the local_first_nodes iter and flatten it out
+        local_first_nodes = list(controller.iter_nodes_local_first(
+            object_ring, 1, policy))
+
+        # check that the required number of local nodes were moved up the order
+        node_regions = [node['region'] for node in local_first_nodes]
+        self.assertTrue(
+            all(r in affinity_regions for r in node_regions[:affinity_count]),
+            'Unexpected region found in local nodes, expected %s but got %s' %
+            (affinity_regions, node_regions))
+        return app
+
+    def test_write_affinity_not_configured(self):
+        # default is no write affinity so expect both regions 0 and 1
+        self._check_write_affinity({}, {}, POLICIES[0], [0, 1],
+                                   2 * self.replicas(POLICIES[0]))
+        self._check_write_affinity({}, {}, POLICIES[1], [0, 1],
+                                   2 * self.replicas(POLICIES[1]))
+
+    def test_write_affinity_proxy_server_config(self):
+        # without overrides policies use proxy-server config section options
+        conf = {'write_affinity_node_count': '1 * replicas',
+                'write_affinity': 'r0'}
+        self._check_write_affinity(conf, {}, POLICIES[0], [0],
+                                   self.replicas(POLICIES[0]))
+        self._check_write_affinity(conf, {}, POLICIES[1], [0],
+                                   self.replicas(POLICIES[1]))
+
+    def test_write_affinity_per_policy_config(self):
+        # check only per-policy configuration is sufficient
+        conf = {}
+        policy_conf = {'0': {'write_affinity_node_count': '1 * replicas',
+                             'write_affinity': 'r1'},
+                       '1': {'write_affinity_node_count': '5',
+                             'write_affinity': 'r0'}}
+        self._check_write_affinity(conf, policy_conf, POLICIES[0], [1],
+                                   self.replicas(POLICIES[0]))
+        self._check_write_affinity(conf, policy_conf, POLICIES[1], [0], 5)
+
+    def test_write_affinity_per_policy_config_overrides_and_inherits(self):
+        # check per-policy config is preferred over proxy-server section config
+        conf = {'write_affinity_node_count': '1 * replicas',
+                'write_affinity': 'r0'}
+        policy_conf = {'0': {'write_affinity': 'r1'},
+                       '1': {'write_affinity_node_count': '3 * replicas'}}
+        # policy 0 inherits default node count, override affinity to r1
+        self._check_write_affinity(conf, policy_conf, POLICIES[0], [1],
+                                   self.replicas(POLICIES[0]))
+        # policy 1 inherits default affinity to r0, overrides node count
+        self._check_write_affinity(conf, policy_conf, POLICIES[1], [0],
+                                   3 * self.replicas(POLICIES[1]))
 
 # end of BaseObjectControllerMixin
 
@@ -843,7 +1031,7 @@ class TestReplicatedObjController(BaseObjectControllerMixin,
 
     def test_PUT_connect_exceptions(self):
         object_ring = self.app.get_object_ring(None)
-        self.app.sort_nodes = lambda n: n  # disable shuffle
+        self.app.sort_nodes = lambda n, *args, **kwargs: n  # disable shuffle
 
         def test_status_map(statuses, expected):
             self.app._error_limiting = {}
@@ -1110,10 +1298,11 @@ class TestReplicatedObjController(BaseObjectControllerMixin,
 
     def test_GET_simple(self):
         req = swift.common.swob.Request.blank('/v1/a/c/o')
-        with set_http_connect(200):
+        with set_http_connect(200, headers={'Connection': 'close'}):
             resp = req.get_response(self.app)
         self.assertEqual(resp.status_int, 200)
         self.assertIn('Accept-Ranges', resp.headers)
+        self.assertNotIn('Connection', resp.headers)
 
     def test_GET_transfer_encoding_chunked(self):
         req = swift.common.swob.Request.blank('/v1/a/c/o')
@@ -1214,7 +1403,7 @@ class TestReplicatedObjController(BaseObjectControllerMixin,
         test_indexes = [None] + [int(p) for p in POLICIES]
         for policy_index in test_indexes:
             self.app.container_info['storage_policy'] = policy_index
-            put_timestamp = utils.Timestamp(time.time()).normal
+            put_timestamp = utils.Timestamp.now().normal
             req = swob.Request.blank(
                 '/v1/a/c/o', method='PUT', headers={
                     'Content-Length': 0,
@@ -1228,7 +1417,7 @@ class TestReplicatedObjController(BaseObjectControllerMixin,
         test_indexes = [None] + [int(p) for p in POLICIES]
         for policy_index in test_indexes:
             self.app.container_info['storage_policy'] = policy_index
-            put_timestamp = utils.Timestamp(time.time()).normal
+            put_timestamp = utils.Timestamp.now().normal
             req = swob.Request.blank(
                 '/v1/a/c/o', method='PUT', headers={
                     'Content-Length': 0,
@@ -1421,8 +1610,109 @@ def capture_http_requests(get_response):
         yield fake_conn
 
 
+class ECObjectControllerMixin(BaseObjectControllerMixin):
+    # Add a few helper methods for EC tests.
+    def _make_ec_archive_bodies(self, test_body, policy=None):
+        policy = policy or self.policy
+        return encode_frag_archive_bodies(policy, test_body)
+
+    def _make_ec_object_stub(self, pattern='test', policy=None,
+                             timestamp=None):
+        policy = policy or self.policy
+        test_body = pattern * policy.ec_segment_size
+        test_body = test_body[:-random.randint(1, 1000)]
+        return make_ec_object_stub(test_body, policy, timestamp)
+
+    def _fake_ec_node_response(self, node_frags):
+        return fake_ec_node_response(node_frags, self.policy)
+
+    def test_GET_with_duplicate_but_sufficient_frag_indexes(self):
+        obj1 = self._make_ec_object_stub()
+        # proxy should ignore duplicated frag indexes and continue search for
+        # a set of unique indexes, finding last one on a handoff
+        node_frags = [
+            {'obj': obj1, 'frag': 0},
+            {'obj': obj1, 'frag': 0},  # duplicate frag
+            {'obj': obj1, 'frag': 1},
+            {'obj': obj1, 'frag': 1},  # duplicate frag
+            {'obj': obj1, 'frag': 2},
+            {'obj': obj1, 'frag': 2},  # duplicate frag
+            {'obj': obj1, 'frag': 3},
+            {'obj': obj1, 'frag': 3},  # duplicate frag
+            {'obj': obj1, 'frag': 4},
+            {'obj': obj1, 'frag': 4},  # duplicate frag
+            {'obj': obj1, 'frag': 10},
+            {'obj': obj1, 'frag': 11},
+            {'obj': obj1, 'frag': 12},
+            {'obj': obj1, 'frag': 13},
+        ] * self.policy.ec_duplication_factor
+        node_frags.append({'obj': obj1, 'frag': 5})  # first handoff
+
+        fake_response = self._fake_ec_node_response(node_frags)
+
+        req = swob.Request.blank('/v1/a/c/o')
+        with capture_http_requests(fake_response) as log:
+            resp = req.get_response(self.app)
+
+        self.assertEqual(resp.status_int, 200)
+        self.assertEqual(resp.headers['etag'], obj1['etag'])
+        self.assertEqual(md5(resp.body).hexdigest(), obj1['etag'])
+
+        # expect a request to all primaries plus one handoff
+        self.assertEqual(self.replicas() + 1, len(log))
+        collected_indexes = defaultdict(list)
+        for conn in log:
+            fi = conn.resp.headers.get('X-Object-Sysmeta-Ec-Frag-Index')
+            if fi is not None:
+                collected_indexes[fi].append(conn)
+        self.assertEqual(len(collected_indexes), self.policy.ec_ndata)
+
+    def test_GET_with_duplicate_but_insufficient_frag_indexes(self):
+        obj1 = self._make_ec_object_stub()
+        # proxy should ignore duplicated frag indexes and continue search for
+        # a set of unique indexes, but fails to find one
+        node_frags = [
+            {'obj': obj1, 'frag': 0},
+            {'obj': obj1, 'frag': 0},  # duplicate frag
+            {'obj': obj1, 'frag': 1},
+            {'obj': obj1, 'frag': 1},  # duplicate frag
+            {'obj': obj1, 'frag': 2},
+            {'obj': obj1, 'frag': 2},  # duplicate frag
+            {'obj': obj1, 'frag': 3},
+            {'obj': obj1, 'frag': 3},  # duplicate frag
+            {'obj': obj1, 'frag': 4},
+            {'obj': obj1, 'frag': 4},  # duplicate frag
+            {'obj': obj1, 'frag': 10},
+            {'obj': obj1, 'frag': 11},
+            {'obj': obj1, 'frag': 12},
+            {'obj': obj1, 'frag': 13},
+        ]
+
+        # ... and the rests are 404s which is limited by request_count
+        # (2 * replicas in default) rather than max_extra_requests limitation
+        # because the retries will be in ResumingGetter if the responses
+        # are 404s
+        node_frags += [[]] * (self.replicas() * 2 - len(node_frags))
+        fake_response = self._fake_ec_node_response(node_frags)
+
+        req = swob.Request.blank('/v1/a/c/o')
+        with capture_http_requests(fake_response) as log:
+            resp = req.get_response(self.app)
+
+        self.assertEqual(resp.status_int, 404)
+
+        # expect a request to all nodes
+        self.assertEqual(2 * self.replicas(), len(log))
+        collected_indexes = defaultdict(list)
+        for conn in log:
+            fi = conn.resp.headers.get('X-Object-Sysmeta-Ec-Frag-Index')
+            if fi is not None:
+                collected_indexes[fi].append(conn)
+        self.assertEqual(len(collected_indexes), self.policy.ec_ndata - 1)
+
+
 @patch_policies(with_ec_default=True)
-class TestECObjController(BaseObjectControllerMixin, unittest.TestCase):
+class TestECObjController(ECObjectControllerMixin, unittest.TestCase):
     container_info = {
         'status': 200,
         'read_acl': None,
@@ -1484,11 +1774,13 @@ class TestECObjController(BaseObjectControllerMixin, unittest.TestCase):
 
     def test_GET_simple(self):
         req = swift.common.swob.Request.blank('/v1/a/c/o')
-        get_resp = [200] * self.policy.ec_ndata
-        with set_http_connect(*get_resp):
+        get_statuses = [200] * self.policy.ec_ndata
+        get_hdrs = [{'Connection': 'close'}] * self.policy.ec_ndata
+        with set_http_connect(*get_statuses, headers=get_hdrs):
             resp = req.get_response(self.app)
         self.assertEqual(resp.status_int, 200)
         self.assertIn('Accept-Ranges', resp.headers)
+        self.assertNotIn('Connection', resp.headers)
 
     def _test_if_match(self, method):
         num_responses = self.policy.ec_ndata if method == 'GET' else 1
@@ -2184,18 +2476,6 @@ class TestECObjController(BaseObjectControllerMixin, unittest.TestCase):
             resp = req.get_response(self.app)
         self.assertEqual(resp.status_int, 201)
 
-    def _make_ec_archive_bodies(self, test_body, policy=None):
-        policy = policy or self.policy
-        return encode_frag_archive_bodies(policy, test_body)
-
-    def _make_ec_object_stub(self, test_body=None, policy=None,
-                             timestamp=None):
-        policy = policy or self.policy
-        return make_ec_object_stub(test_body, policy, timestamp)
-
-    def _fake_ec_node_response(self, node_frags):
-        return fake_ec_node_response(node_frags, self.policy)
-
     def test_GET_with_frags_swapped_around(self):
         segment_size = self.policy.ec_segment_size
         test_data = ('test' * segment_size)[:-657]
@@ -2300,8 +2580,8 @@ class TestECObjController(BaseObjectControllerMixin, unittest.TestCase):
                          len(collected_responses[obj1['etag']]))
 
     def test_GET_with_single_missed_overwrite_does_not_need_handoff(self):
-        obj1 = self._make_ec_object_stub()
-        obj2 = self._make_ec_object_stub()
+        obj1 = self._make_ec_object_stub(pattern='obj1')
+        obj2 = self._make_ec_object_stub(pattern='obj2')
 
         node_frags = [
             {'obj': obj2, 'frag': 0},
@@ -2350,8 +2630,8 @@ class TestECObjController(BaseObjectControllerMixin, unittest.TestCase):
                                      len(frags), etag))
 
     def test_GET_with_many_missed_overwrite_will_need_handoff(self):
-        obj1 = self._make_ec_object_stub()
-        obj2 = self._make_ec_object_stub()
+        obj1 = self._make_ec_object_stub(pattern='obj1')
+        obj2 = self._make_ec_object_stub(pattern='obj2')
 
         node_frags = [
             {'obj': obj2, 'frag': 0},
@@ -2401,8 +2681,8 @@ class TestECObjController(BaseObjectControllerMixin, unittest.TestCase):
                                      len(frags), etag))
 
     def test_GET_with_missing_and_mixed_frags_will_dig_deep_but_succeed(self):
-        obj1 = self._make_ec_object_stub(timestamp=self.ts())
-        obj2 = self._make_ec_object_stub(timestamp=self.ts())
+        obj1 = self._make_ec_object_stub(pattern='obj1', timestamp=self.ts())
+        obj2 = self._make_ec_object_stub(pattern='obj2', timestamp=self.ts())
 
         node_frags = [
             {'obj': obj1, 'frag': 0},
@@ -2464,8 +2744,8 @@ class TestECObjController(BaseObjectControllerMixin, unittest.TestCase):
                                      len(frags), etag))
 
     def test_GET_with_missing_and_mixed_frags_will_dig_deep_but_stop(self):
-        obj1 = self._make_ec_object_stub()
-        obj2 = self._make_ec_object_stub()
+        obj1 = self._make_ec_object_stub(pattern='obj1')
+        obj2 = self._make_ec_object_stub(pattern='obj2')
 
         node_frags = [
             {'obj': obj1, 'frag': 0},
@@ -2525,47 +2805,6 @@ class TestECObjController(BaseObjectControllerMixin, unittest.TestCase):
                                  'collected %s frags for etag %s' % (
                                      len(frags), etag))
 
-    def test_GET_with_duplicate_but_sufficient_frag_indexes(self):
-        obj1 = self._make_ec_object_stub()
-        # proxy should ignore duplicated frag indexes and continue search for
-        # a set of unique indexes, finding last one on a handoff
-        node_frags = [
-            {'obj': obj1, 'frag': 0},
-            {'obj': obj1, 'frag': 0},  # duplicate frag
-            {'obj': obj1, 'frag': 1},
-            {'obj': obj1, 'frag': 1},  # duplicate frag
-            {'obj': obj1, 'frag': 2},
-            {'obj': obj1, 'frag': 2},  # duplicate frag
-            {'obj': obj1, 'frag': 3},
-            {'obj': obj1, 'frag': 3},  # duplicate frag
-            {'obj': obj1, 'frag': 4},
-            {'obj': obj1, 'frag': 4},  # duplicate frag
-            {'obj': obj1, 'frag': 10},
-            {'obj': obj1, 'frag': 11},
-            {'obj': obj1, 'frag': 12},
-            {'obj': obj1, 'frag': 13},
-            {'obj': obj1, 'frag': 5},  # handoff
-        ]
-
-        fake_response = self._fake_ec_node_response(node_frags)
-
-        req = swob.Request.blank('/v1/a/c/o')
-        with capture_http_requests(fake_response) as log:
-            resp = req.get_response(self.app)
-
-        self.assertEqual(resp.status_int, 200)
-        self.assertEqual(resp.headers['etag'], obj1['etag'])
-        self.assertEqual(md5(resp.body).hexdigest(), obj1['etag'])
-
-        # expect a request to all primaries plus one handoff
-        self.assertEqual(self.replicas() + 1, len(log))
-        collected_indexes = defaultdict(list)
-        for conn in log:
-            fi = conn.resp.headers.get('X-Object-Sysmeta-Ec-Frag-Index')
-            if fi is not None:
-                collected_indexes[fi].append(conn)
-        self.assertEqual(len(collected_indexes), self.policy.ec_ndata)
-
     def test_GET_with_duplicate_and_hidden_frag_indexes(self):
         obj1 = self._make_ec_object_stub()
         # proxy should ignore duplicated frag indexes and continue search for
@@ -2609,51 +2848,9 @@ class TestECObjController(BaseObjectControllerMixin, unittest.TestCase):
                 collected_indexes[fi].append(conn)
         self.assertEqual(len(collected_indexes), self.policy.ec_ndata)
 
-    def test_GET_with_duplicate_but_insufficient_frag(self):
-        obj1 = self._make_ec_object_stub()
-        # proxy should ignore duplicated frag indexes and continue search for
-        # a set of unique indexes, but fails to find one
-        node_frags = [
-            {'obj': obj1, 'frag': 0},
-            {'obj': obj1, 'frag': 0},  # duplicate frag
-            {'obj': obj1, 'frag': 1},
-            {'obj': obj1, 'frag': 1},  # duplicate frag
-            {'obj': obj1, 'frag': 2},
-            {'obj': obj1, 'frag': 2},  # duplicate frag
-            {'obj': obj1, 'frag': 3},
-            {'obj': obj1, 'frag': 3},  # duplicate frag
-            {'obj': obj1, 'frag': 4},
-            {'obj': obj1, 'frag': 4},  # duplicate frag
-            {'obj': obj1, 'frag': 10},
-            {'obj': obj1, 'frag': 11},
-            {'obj': obj1, 'frag': 12},
-            {'obj': obj1, 'frag': 13},
-        ] + [[]] * 14  # 404 from handoffs
-
-        fake_response = self._fake_ec_node_response(node_frags)
-
-        req = swob.Request.blank('/v1/a/c/o')
-        with capture_http_requests(fake_response) as log:
-            resp = req.get_response(self.app)
-
-        self.assertEqual(resp.status_int, 404)
-
-        # expect a request to all nodes
-        self.assertEqual(2 * self.replicas(), len(log))
-        collected_indexes = defaultdict(list)
-        collected_etags = set()
-        for conn in log:
-            etag = conn.resp.headers['X-Object-Sysmeta-Ec-Etag']
-            collected_etags.add(etag)  # will be None from handoffs
-            fi = conn.resp.headers.get('X-Object-Sysmeta-Ec-Frag-Index')
-            if fi is not None:
-                collected_indexes[fi].append(conn)
-        self.assertEqual(len(collected_indexes), self.policy.ec_ndata - 1)
-        self.assertEqual({obj1['etag'], None}, collected_etags)
-
     def test_GET_with_missing_and_mixed_frags_may_503(self):
-        obj1 = self._make_ec_object_stub()
-        obj2 = self._make_ec_object_stub()
+        obj1 = self._make_ec_object_stub(pattern='obj1')
+        obj2 = self._make_ec_object_stub(pattern='obj2')
         # we get a 503 when all the handoffs return 200
         node_frags = [[]] * self.replicas()  # primaries have no frags
         node_frags = node_frags + [  # handoffs all have frags
@@ -2692,10 +2889,10 @@ class TestECObjController(BaseObjectControllerMixin, unittest.TestCase):
         # all nodes have a frag but there is no one set that reaches quorum,
         # which means there is no backend 404 response, but proxy should still
         # return 404 rather than 503
-        obj1 = self._make_ec_object_stub()
-        obj2 = self._make_ec_object_stub()
-        obj3 = self._make_ec_object_stub()
-        obj4 = self._make_ec_object_stub()
+        obj1 = self._make_ec_object_stub(pattern='obj1')
+        obj2 = self._make_ec_object_stub(pattern='obj2')
+        obj3 = self._make_ec_object_stub(pattern='obj3')
+        obj4 = self._make_ec_object_stub(pattern='obj4')
 
         node_frags = [
             {'obj': obj1, 'frag': 0},
@@ -2866,8 +3063,8 @@ class TestECObjController(BaseObjectControllerMixin, unittest.TestCase):
         self.assertEqual(28, len(log))
 
     def test_GET_with_missing_durable_files_and_mixed_etags(self):
-        obj1 = self._make_ec_object_stub()
-        obj2 = self._make_ec_object_stub()
+        obj1 = self._make_ec_object_stub(pattern='obj1')
+        obj2 = self._make_ec_object_stub(pattern='obj2')
 
         # non-quorate durables for another object won't stop us finding the
         # quorate object
@@ -2956,8 +3153,10 @@ class TestECObjController(BaseObjectControllerMixin, unittest.TestCase):
         # At that point (or before) the proxy knows that a durable set of
         # frags for obj2 exists so will fetch them, requiring another 10
         # directed requests.
-        obj2 = self._make_ec_object_stub(timestamp=self._ts_iter.next())
-        obj1 = self._make_ec_object_stub(timestamp=self._ts_iter.next())
+        obj2 = self._make_ec_object_stub(pattern='obj2',
+                                         timestamp=self._ts_iter.next())
+        obj1 = self._make_ec_object_stub(pattern='obj1',
+                                         timestamp=self._ts_iter.next())
 
         node_frags = [
             [{'obj': obj1, 'frag': 0, 'durable': False}],  # obj2 missing
@@ -3006,9 +3205,12 @@ class TestECObjController(BaseObjectControllerMixin, unittest.TestCase):
         # GETs to see all the obj3 frags plus 1 more to GET a durable frag.
         # The proxy may also do one more GET if the obj2 frag is found.
         # i.e. 10 + 1 durable for obj3, 2 for obj1 and 1 more if obj2 found
-        obj2 = self._make_ec_object_stub(timestamp=self._ts_iter.next())
-        obj3 = self._make_ec_object_stub(timestamp=self._ts_iter.next())
-        obj1 = self._make_ec_object_stub(timestamp=self._ts_iter.next())
+        obj2 = self._make_ec_object_stub(pattern='obj2',
+                                         timestamp=self._ts_iter.next())
+        obj3 = self._make_ec_object_stub(pattern='obj3',
+                                         timestamp=self._ts_iter.next())
+        obj1 = self._make_ec_object_stub(pattern='obj1',
+                                         timestamp=self._ts_iter.next())
 
         node_frags = [
             [{'obj': obj1, 'frag': 0, 'durable': False},  # obj1 frag
@@ -3046,8 +3248,10 @@ class TestECObjController(BaseObjectControllerMixin, unittest.TestCase):
         # scenario: non-durable frags of newer obj1 obscure all frags
         # of older obj2, so first 28 requests result in a non-durable set.
         # There are only 10 frags for obj2 and one is not durable.
-        obj2 = self._make_ec_object_stub(timestamp=self._ts_iter.next())
-        obj1 = self._make_ec_object_stub(timestamp=self._ts_iter.next())
+        obj2 = self._make_ec_object_stub(pattern='obj2',
+                                         timestamp=self._ts_iter.next())
+        obj1 = self._make_ec_object_stub(pattern='obj1',
+                                         timestamp=self._ts_iter.next())
 
         node_frags = [
             [{'obj': obj1, 'frag': 0, 'durable': False}],  # obj2 missing
@@ -3096,8 +3300,8 @@ class TestECObjController(BaseObjectControllerMixin, unittest.TestCase):
         # fragments for different content at the same timestamp then the
         # object controller should handle it gracefully
         ts = self.ts()  # force equal timestamps for two objects
-        obj1 = self._make_ec_object_stub(timestamp=ts, test_body='obj1')
-        obj2 = self._make_ec_object_stub(timestamp=ts, test_body='obj2')
+        obj1 = self._make_ec_object_stub(timestamp=ts, pattern='obj1')
+        obj2 = self._make_ec_object_stub(timestamp=ts, pattern='obj2')
         self.assertNotEqual(obj1['etag'], obj2['etag'])  # sanity
 
         node_frags = [
@@ -3729,7 +3933,7 @@ class TestECFunctions(unittest.TestCase):
                  StoragePolicy(1, name='unu')],
                 fake_ring_args=[{'replicas': 28}, {}])
 class TestECDuplicationObjController(
-        BaseObjectControllerMixin, unittest.TestCase):
+        ECObjectControllerMixin, unittest.TestCase):
     container_info = {
         'status': 200,
         'read_acl': None,
@@ -3740,18 +3944,6 @@ class TestECDuplicationObjController(
     }
 
     controller_cls = obj.ECObjectController
-
-    def _make_ec_object_stub(self, test_body=None, policy=None,
-                             timestamp=None):
-        policy = policy or self.policy
-        return make_ec_object_stub(test_body, policy, timestamp)
-
-    def _make_ec_archive_bodies(self, test_body, policy=None):
-        policy = policy or self.policy
-        return encode_frag_archive_bodies(policy, test_body)
-
-    def _fake_ec_node_response(self, node_frags):
-        return fake_ec_node_response(node_frags, self.policy)
 
     def _test_GET_with_duplication_factor(self, node_frags, obj):
         # This is basic tests in the healthy backends status
@@ -3844,8 +4036,8 @@ class TestECDuplicationObjController(
         self._test_GET_with_duplication_factor(node_frags, obj)
 
     def test_GET_with_missing_and_mixed_frags_will_dig_deep_but_stop(self):
-        obj1 = self._make_ec_object_stub()
-        obj2 = self._make_ec_object_stub()
+        obj1 = self._make_ec_object_stub(pattern='obj1')
+        obj2 = self._make_ec_object_stub(pattern='obj2')
 
         # both of obj1 and obj2 has only 9 frags which is not able to decode
         node_frags = [
@@ -3890,7 +4082,8 @@ class TestECDuplicationObjController(
         # default node_iter will exhaust to the last of handoffs
         self.assertEqual(len(log), self.replicas() * 2)
         # we have obj1, obj2, and 404 NotFound in collected_responses
-        self.assertEqual(len(collected_responses), 3)
+        self.assertEqual(sorted([obj1['etag'], obj2['etag'], None]),
+                         sorted(collected_responses.keys()))
 
         # ... regardless we should never need to fetch more than ec_ndata
         # frags for any given etag
@@ -3899,52 +4092,9 @@ class TestECDuplicationObjController(
                                  'collected %s frags for etag %s' % (
                                      len(frags), etag))
 
-    def test_GET_with_duplicate_but_insufficient_frag(self):
-        obj1 = self._make_ec_object_stub()
-        # proxy should ignore duplicated frag indexes and continue search for
-        # a set of unique indexes, but fails to find one
-        node_frags = [
-            {'obj': obj1, 'frag': 0},
-            {'obj': obj1, 'frag': 0},  # duplicate frag
-            {'obj': obj1, 'frag': 1},
-            {'obj': obj1, 'frag': 1},  # duplicate frag
-            {'obj': obj1, 'frag': 2},
-            {'obj': obj1, 'frag': 2},  # duplicate frag
-            {'obj': obj1, 'frag': 3},
-            {'obj': obj1, 'frag': 3},  # duplicate frag
-            {'obj': obj1, 'frag': 4},
-            {'obj': obj1, 'frag': 4},  # duplicate frag
-            {'obj': obj1, 'frag': 10},
-            {'obj': obj1, 'frag': 11},
-            {'obj': obj1, 'frag': 12},
-            {'obj': obj1, 'frag': 13},
-        ]
-
-        # ... and the rests are 404s which is limited by request_count
-        # (2 * replicas in default) rather than max_extra_requests limitation
-        # because the retries will be in ResumingGetter if the responses
-        # are 404s
-        node_frags += [[]] * (self.replicas() * 2 - len(node_frags))
-        fake_response = self._fake_ec_node_response(node_frags)
-
-        req = swob.Request.blank('/v1/a/c/o')
-        with capture_http_requests(fake_response) as log:
-            resp = req.get_response(self.app)
-
-        self.assertEqual(resp.status_int, 404)
-
-        # expect a request to all nodes
-        self.assertEqual(2 * self.replicas(), len(log))
-        collected_indexes = defaultdict(list)
-        for conn in log:
-            fi = conn.resp.headers.get('X-Object-Sysmeta-Ec-Frag-Index')
-            if fi is not None:
-                collected_indexes[fi].append(conn)
-        self.assertEqual(len(collected_indexes), self.policy.ec_ndata - 1)
-
     def test_GET_with_many_missed_overwrite_will_need_handoff(self):
-        obj1 = self._make_ec_object_stub()
-        obj2 = self._make_ec_object_stub()
+        obj1 = self._make_ec_object_stub(pattern='obj1')
+        obj2 = self._make_ec_object_stub(pattern='obj2')
         # primaries
         node_frags = [
             {'obj': obj2, 'frag': 0},
@@ -3999,57 +4149,11 @@ class TestECDuplicationObjController(
                                  'collected %s frags for etag %s' % (
                                  len(frags), etag))
 
-    def test_GET_with_duplicate_but_sufficient_frag_indexes(self):
-        obj1 = self._make_ec_object_stub()
-        # proxy should ignore duplicated frag indexes and continue search for
-        # a set of unique indexes, finding last one on a handoff
-        node_frags = [
-            {'obj': obj1, 'frag': 0},
-            {'obj': obj1, 'frag': 0},  # duplicate frag
-            {'obj': obj1, 'frag': 1},
-            {'obj': obj1, 'frag': 1},  # duplicate frag
-            {'obj': obj1, 'frag': 2},
-            {'obj': obj1, 'frag': 2},  # duplicate frag
-            {'obj': obj1, 'frag': 3},
-            {'obj': obj1, 'frag': 3},  # duplicate frag
-            {'obj': obj1, 'frag': 4},
-            {'obj': obj1, 'frag': 4},  # duplicate frag
-            {'obj': obj1, 'frag': 10},
-            {'obj': obj1, 'frag': 11},
-            {'obj': obj1, 'frag': 12},
-            {'obj': obj1, 'frag': 13},
-        ]
-
-        # proxy will access randomly to a node in the second set
-        # so to ensure the GET fragment meets what it needs.
-        node_frags += [{'obj': obj1, 'frag': 5}]
-        # rests are 404s
-        node_frags += [[]] * (self.replicas() - len(node_frags))
-
-        fake_response = self._fake_ec_node_response(node_frags)
-
-        req = swob.Request.blank('/v1/a/c/o')
-        with capture_http_requests(fake_response) as log:
-            resp = req.get_response(self.app)
-
-        self.assertEqual(resp.status_int, 200)
-        self.assertEqual(resp.headers['etag'], obj1['etag'])
-        self.assertEqual(md5(resp.body).hexdigest(), obj1['etag'])
-
-        # expect a request to all primaries plus one handoff
-        self.assertGreaterEqual(
-            len(log), self.policy.ec_n_unique_fragments + 1)
-        self.assertLessEqual(len(log), self.replicas())
-        collected_indexes = defaultdict(list)
-        for conn in log:
-            fi = conn.resp.headers.get('X-Object-Sysmeta-Ec-Frag-Index')
-            if fi is not None:
-                collected_indexes[fi].append(conn)
-        self.assertEqual(len(collected_indexes), self.policy.ec_ndata)
-
     def test_GET_with_missing_and_mixed_frags_will_dig_deep_but_succeed(self):
-        obj1 = self._make_ec_object_stub(timestamp=self.ts())
-        obj2 = self._make_ec_object_stub(timestamp=self.ts())
+        obj1 = self._make_ec_object_stub(pattern='obj1',
+                                         timestamp=self.ts())
+        obj2 = self._make_ec_object_stub(pattern='obj2',
+                                         timestamp=self.ts())
 
         # 28 nodes are here
         node_frags = [
@@ -4120,13 +4224,17 @@ class TestECDuplicationObjController(
         # all nodes have a frag but there is no one set that reaches quorum,
         # which means there is no backend 404 response, but proxy should still
         # return 404 rather than 503
-        obj1 = self._make_ec_object_stub()
-        obj2 = self._make_ec_object_stub()
-        obj3 = self._make_ec_object_stub()
-        obj4 = self._make_ec_object_stub()
-        obj5 = self._make_ec_object_stub()
-        obj6 = self._make_ec_object_stub()
-        obj7 = self._make_ec_object_stub()
+        stub_objects = [
+            self._make_ec_object_stub(pattern='obj1'),
+            self._make_ec_object_stub(pattern='obj2'),
+            self._make_ec_object_stub(pattern='obj3'),
+            self._make_ec_object_stub(pattern='obj4'),
+            self._make_ec_object_stub(pattern='obj5'),
+            self._make_ec_object_stub(pattern='obj6'),
+            self._make_ec_object_stub(pattern='obj7'),
+        ]
+        etags = collections.Counter(stub['etag'] for stub in stub_objects)
+        self.assertEqual(len(etags), 7, etags)  # sanity
 
         # primaries and handoffs for required nodes
         # this is 10-4 * 2 case so that 56 requests (2 * replicas) required
@@ -4136,7 +4244,7 @@ class TestECDuplicationObjController(
         # fill them out to the primary and handoff nodes
         node_frags = []
         for frag in range(8):
-            for stub_obj in (obj1, obj2, obj3, obj4, obj5, obj6, obj7):
+            for stub_obj in stub_objects:
                 if len(node_frags) >= required_nodes:
                     # we already have enough responses
                     break
@@ -4200,10 +4308,10 @@ class TestECDuplicationObjController(
         self.assertEqual(self.replicas() * 2, len(log))
 
     def test_GET_with_missing_and_mixed_frags_may_503(self):
-        obj1 = self._make_ec_object_stub()
-        obj2 = self._make_ec_object_stub()
-        obj3 = self._make_ec_object_stub()
-        obj4 = self._make_ec_object_stub()
+        obj1 = self._make_ec_object_stub(pattern='obj1')
+        obj2 = self._make_ec_object_stub(pattern='obj2')
+        obj3 = self._make_ec_object_stub(pattern='obj3')
+        obj4 = self._make_ec_object_stub(pattern='obj4')
         # we get a 503 when all the handoffs return 200
         node_frags = [[]] * self.replicas()  # primaries have no frags
         # plus, 4 different objects and 7 indexes will b 28 node responses
@@ -4259,8 +4367,8 @@ class TestECDuplicationObjController(
         # the difference from parent class is only handoff stub length
 
         ts = self.ts()  # force equal timestamps for two objects
-        obj1 = self._make_ec_object_stub(timestamp=ts, test_body='obj1')
-        obj2 = self._make_ec_object_stub(timestamp=ts, test_body='obj2')
+        obj1 = self._make_ec_object_stub(timestamp=ts, pattern='obj1')
+        obj2 = self._make_ec_object_stub(timestamp=ts, pattern='obj2')
         self.assertNotEqual(obj1['etag'], obj2['etag'])  # sanity
 
         node_frags = [

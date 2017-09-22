@@ -14,7 +14,6 @@
 # limitations under the License.
 
 from swift import gettext_ as _
-import time
 
 from six.moves.urllib.parse import unquote
 from swift.common.utils import public, csv_append, Timestamp
@@ -101,6 +100,9 @@ class ContainerController(Controller):
         concurrency = self.app.container_ring.replica_count \
             if self.app.concurrent_gets else 1
         node_iter = self.app.iter_nodes(self.app.container_ring, part)
+        params = req.params
+        params['format'] = 'json'
+        req.params = params
         resp = self.GETorHEAD_base(
             req, _('Container'), node_iter, part,
             req.swift_entity_path, concurrency)
@@ -178,11 +180,11 @@ class ContainerController(Controller):
         headers = self._backend_requests(req, len(containers),
                                          account_partition, accounts,
                                          policy_index)
-        clear_info_cache(self.app, req.environ,
-                         self.account_name, self.container_name)
         resp = self.make_requests(
             req, self.app.container_ring,
             container_partition, 'PUT', req.swift_entity_path, headers)
+        clear_info_cache(self.app, req.environ,
+                         self.account_name, self.container_name)
         return resp
 
     @public
@@ -234,7 +236,7 @@ class ContainerController(Controller):
 
     def _backend_requests(self, req, n_outgoing, account_partition, accounts,
                           policy_index=None):
-        additional = {'X-Timestamp': Timestamp(time.time()).internal}
+        additional = {'X-Timestamp': Timestamp.now().internal}
         if policy_index is None:
             additional['X-Backend-Storage-Policy-Default'] = \
                 int(POLICIES.default)

@@ -16,13 +16,16 @@
 import unittest
 
 from test.unit.proxy import test_server
-from test.unit.proxy.test_server import teardown
 
 from swift.obj import mem_server
 
 
-def setup():
+def setUpModule():
     test_server.do_setup(mem_server)
+
+
+def tearDownModule():
+    test_server.tearDownModule()
 
 
 class TestController(test_server.TestController):
@@ -33,7 +36,8 @@ class TestProxyServer(test_server.TestProxyServer):
     pass
 
 
-class TestObjectController(test_server.TestObjectController):
+class TestReplicatedObjectController(
+        test_server.TestReplicatedObjectController):
     def test_PUT_no_etag_fallocate(self):
         # mem server doesn't call fallocate(), believe it or not
         pass
@@ -42,6 +46,8 @@ class TestObjectController(test_server.TestObjectController):
     def test_policy_IO(self):
         pass
 
+
+class TestECObjectController(test_server.TestECObjectController):
     def test_PUT_ec(self):
         pass
 
@@ -69,8 +75,4 @@ class TestAccountControllerFakeGetResponse(
 
 
 if __name__ == '__main__':
-    setup()
-    try:
-        unittest.main()
-    finally:
-        teardown()
+    unittest.main()

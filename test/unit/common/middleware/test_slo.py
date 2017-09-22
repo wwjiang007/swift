@@ -513,8 +513,10 @@ class TestSloPutManifest(SloTestCase):
             body=test_json_data)
         self.assertNotIn('X-Static-Large-Object', req.headers)
         self.slo(req.environ, fake_start_response)
-        self.assertTrue('X-Static-Large-Object' in req.headers)
-        self.assertTrue(req.environ['PATH_INFO'], '/cont/object\xe2\x99\xa1')
+        self.assertIn('X-Static-Large-Object', req.headers)
+        self.assertEqual(req.environ['PATH_INFO'], '/v1/AUTH_test/c/man')
+        self.assertIn(('HEAD', '/v1/AUTH_test/cont/object\xe2\x99\xa1'),
+                      self.app.calls)
 
     def test_handle_multipart_put_no_xml(self):
         req = Request.blank(
@@ -2034,10 +2036,10 @@ class TestSloGetManifest(SloTestCase):
 
         headers = [c[2] for c in self.app.calls_with_headers]
         self.assertEqual(headers[0].get('Range'), 'bytes=5-29')
-        self.assertEqual(headers[1].get('Range'), None)
-        self.assertEqual(headers[2].get('Range'), None)
-        self.assertEqual(headers[3].get('Range'), None)
-        self.assertEqual(headers[4].get('Range'), None)
+        self.assertIsNone(headers[1].get('Range'))
+        self.assertIsNone(headers[2].get('Range'))
+        self.assertIsNone(headers[3].get('Range'))
+        self.assertIsNone(headers[4].get('Range'))
 
     def test_range_get_manifest_first_byte(self):
         req = Request.blank(

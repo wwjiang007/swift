@@ -30,6 +30,7 @@ from numbers import Number
 from tempfile import NamedTemporaryFile
 import time
 import eventlet
+from eventlet import greenpool, debug as eventlet_debug
 from eventlet.green import socket
 from tempfile import mkdtemp
 from shutil import rmtree
@@ -121,7 +122,7 @@ def patch_policies(thing_or_policies=None, legacy_only=False,
 class PatchPolicies(object):
     """
     Why not mock.patch?  In my case, when used as a decorator on the class it
-    seemed to patch setUp at the wrong time (i.e. in setup the global wasn't
+    seemed to patch setUp at the wrong time (i.e. in setUp the global wasn't
     patched yet)
     """
 
@@ -168,42 +169,38 @@ class PatchPolicies(object):
         """
 
         orig_setUp = cls.setUp
-        orig_tearDown = cls.tearDown
+
+        def unpatch_cleanup(cls_self):
+            if cls_self._policies_patched:
+                self.__exit__()
+                cls_self._policies_patched = False
 
         def setUp(cls_self):
-            self._orig_POLICIES = storage_policy._POLICIES
             if not getattr(cls_self, '_policies_patched', False):
-                storage_policy._POLICIES = self.policies
-                self._setup_rings()
+                self.__enter__()
                 cls_self._policies_patched = True
-
+                cls_self.addCleanup(unpatch_cleanup, cls_self)
             orig_setUp(cls_self)
 
-        def tearDown(cls_self):
-            orig_tearDown(cls_self)
-            storage_policy._POLICIES = self._orig_POLICIES
-
         cls.setUp = setUp
-        cls.tearDown = tearDown
 
         return cls
 
     def _patch_method(self, f):
         @functools.wraps(f)
         def mywrapper(*args, **kwargs):
-            self._orig_POLICIES = storage_policy._POLICIES
-            try:
-                storage_policy._POLICIES = self.policies
-                self._setup_rings()
+            with self:
                 return f(*args, **kwargs)
-            finally:
-                storage_policy._POLICIES = self._orig_POLICIES
         return mywrapper
 
     def __enter__(self):
         self._orig_POLICIES = storage_policy._POLICIES
         storage_policy._POLICIES = self.policies
-        self._setup_rings()
+        try:
+            self._setup_rings()
+        except:  # noqa
+            self.__exit__()
+            raise
 
     def __exit__(self, *args):
         storage_policy._POLICIES = self._orig_POLICIES
@@ -221,6 +218,14 @@ class FakeRing(Ring):
         # this is set higher, or R^2 for R replicas
         self.set_replicas(replicas)
         self._reload()
+
+    def has_changed(self):
+        """
+        The real implementation uses getmtime on the serialized_path attribute,
+        which doesn't exist on our fake and relies on the implementation of
+        _reload which we override.  So ... just NOOPE.
+        """
+        return False
 
     def _reload(self):
         self._rtime = time.time()
@@ -304,8 +309,7 @@ class FabricatedRing(Ring):
         self.nodes = nodes
         self.port = port
         self.replicas = replicas
-        self.part_power = part_power
-        self._part_shift = 32 - self.part_power
+        self._part_shift = 32 - part_power
         self._reload()
 
     def _reload(self, *args, **kwargs):
@@ -695,49 +699,38 @@ if utils.config_true_value(
     fake_syslog_handler()
 
 
-class MockTrue(object):
+@contextmanager
+def quiet_eventlet_exceptions():
+    orig_state = greenpool.DEBUG
+    eventlet_debug.hub_exceptions(False)
+    try:
+        yield
+    finally:
+        eventlet_debug.hub_exceptions(orig_state)
+
+
+@contextmanager
+def mock_check_drive(isdir=False, ismount=False):
     """
-    Instances of MockTrue evaluate like True
-    Any attr accessed on an instance of MockTrue will return a MockTrue
-    instance. Any method called on an instance of MockTrue will return
-    a MockTrue instance.
+    All device/drive/mount checking should be done through the constraints
+    module if we keep the mocking consistly w/i that module we can keep our
+    test robust to further rework on that interface.
 
-    >>> thing = MockTrue()
-    >>> thing
-    True
-    >>> thing == True # True == True
-    True
-    >>> thing == False # True == False
-    False
-    >>> thing != True # True != True
-    False
-    >>> thing != False # True != False
-    True
-    >>> thing.attribute
-    True
-    >>> thing.method()
-    True
-    >>> thing.attribute.method()
-    True
-    >>> thing.method().attribute
-    True
+    Replace the constraint modules underlying os calls with mocks.
 
+    :param isdir: return value of constraints isdir calls, default False
+    :param ismount: return value of constraints ismount calls, default False
+    :returns: a dict of constraint module mocks
     """
-
-    def __getattribute__(self, *args, **kwargs):
-        return self
-
-    def __call__(self, *args, **kwargs):
-        return self
-
-    def __repr__(*args, **kwargs):
-        return repr(True)
-
-    def __eq__(self, other):
-        return other is True
-
-    def __ne__(self, other):
-        return other is not True
+    mock_base = 'swift.common.constraints.'
+    with mocklib.patch(mock_base + 'isdir') as mock_isdir, \
+            mocklib.patch(mock_base + 'utils.ismount') as mock_ismount:
+        mock_isdir.return_value = isdir
+        mock_ismount.return_value = ismount
+        yield {
+            'isdir': mock_isdir,
+            'ismount': mock_ismount,
+        }
 
 
 @contextmanager
@@ -1012,6 +1005,7 @@ def fake_http_connect(*code_iter, **kwargs):
     body_iter = kwargs.get('body_iter', None)
     if body_iter:
         body_iter = iter(body_iter)
+    unexpected_requests = []
 
     def connect(*args, **ckwargs):
         if kwargs.get('slow_connect', False):
@@ -1021,7 +1015,15 @@ def fake_http_connect(*code_iter, **kwargs):
                 kwargs['give_content_type'](args[6]['Content-Type'])
             else:
                 kwargs['give_content_type']('')
-        i, status = next(conn_id_and_code_iter)
+        try:
+            i, status = next(conn_id_and_code_iter)
+        except StopIteration:
+            # the code under test may swallow the StopIteration, so by logging
+            # unexpected requests here we allow the test framework to check for
+            # them after the connect function has been used.
+            unexpected_requests.append((args, kwargs))
+            raise
+
         if 'give_connect' in kwargs:
             give_conn_fn = kwargs['give_connect']
             argspec = inspect.getargspec(give_conn_fn)
@@ -1044,6 +1046,7 @@ def fake_http_connect(*code_iter, **kwargs):
                         connection_id=i, give_send=kwargs.get('give_send'),
                         give_expect=kwargs.get('give_expect'))
 
+    connect.unexpected_requests = unexpected_requests
     connect.code_iter = code_iter
 
     return connect
@@ -1073,10 +1076,14 @@ def mocked_http_conn(*args, **kwargs):
         left_over_status = list(fake_conn.code_iter)
         if left_over_status:
             raise AssertionError('left over status %r' % left_over_status)
+        if fake_conn.unexpected_requests:
+            raise AssertionError('unexpected requests %r' %
+                                 fake_conn.unexpected_requests)
 
 
-def make_timestamp_iter():
-    return iter(Timestamp(t) for t in itertools.count(int(time.time())))
+def make_timestamp_iter(offset=0):
+    return iter(Timestamp(t)
+                for t in itertools.count(int(time.time()) + offset))
 
 
 class Timeout(object):
@@ -1163,7 +1170,7 @@ def make_ec_object_stub(test_body, policy, timestamp):
     segment_size = policy.ec_segment_size
     test_body = test_body or (
         'test' * segment_size)[:-random.randint(1, 1000)]
-    timestamp = timestamp or utils.Timestamp(time.time())
+    timestamp = timestamp or utils.Timestamp.now()
     etag = md5(test_body).hexdigest()
     ec_archive_bodies = encode_frag_archive_bodies(policy, test_body)
 

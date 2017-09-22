@@ -29,7 +29,6 @@ rewritten and the request is passed further down the WSGI chain.
 
 from six.moves import range
 
-import socket
 from swift import gettext_ as _
 
 try:
@@ -41,20 +40,23 @@ except ImportError:
 else:  # executed if the try block finishes with no errors
     MODULE_DEPENDENCY_MET = True
 
+from swift.common.middleware import RewriteContext
 from swift.common.swob import Request, HTTPBadRequest
-from swift.common.utils import cache_from_env, get_logger, list_from_csv, \
-    register_swift_info
+from swift.common.utils import cache_from_env, get_logger, is_valid_ip, \
+    list_from_csv, parse_socket_string, register_swift_info
 
 
-def lookup_cname(domain):  # pragma: no cover
+def lookup_cname(domain, resolver):  # pragma: no cover
     """
     Given a domain, returns its DNS CNAME mapping and DNS ttl.
 
     :param domain: domain to query on
+    :param resolver: dns.resolver.Resolver() instance used for executing DNS
+                     queries
     :returns: (ttl, result)
     """
     try:
-        answer = dns.resolver.query(domain, 'CNAME').rrset
+        answer = resolver.query(domain, 'CNAME').rrset
         ttl = answer.ttl
         result = answer.items[0].to_text()
         result = result.rstrip('.')
@@ -68,16 +70,8 @@ def lookup_cname(domain):  # pragma: no cover
         return 0, None
 
 
-def is_ip(domain):
-    try:
-        socket.inet_pton(socket.AF_INET, domain)
-        return True
-    except socket.error:
-        try:
-            socket.inet_pton(socket.AF_INET6, domain)
-            return True
-        except socket.error:
-            return False
+class _CnameLookupContext(RewriteContext):
+    base_re = r'^(https?://)%s(/.*)?$'
 
 
 class CNAMELookupMiddleware(object):
@@ -103,6 +97,25 @@ class CNAMELookupMiddleware(object):
         self.storage_domain += [s for s in list_from_csv(storage_domain)
                                 if s.startswith('.')]
         self.lookup_depth = int(conf.get('lookup_depth', '1'))
+        nameservers = list_from_csv(conf.get('nameservers'))
+        try:
+            for i, server in enumerate(nameservers):
+                ip_or_host, maybe_port = nameservers[i] = \
+                    parse_socket_string(server, None)
+                if not is_valid_ip(ip_or_host):
+                    raise ValueError
+                if maybe_port is not None:
+                    int(maybe_port)
+        except ValueError:
+            raise ValueError('Invalid cname_lookup/nameservers configuration '
+                             'found. All nameservers must be valid IPv4 or '
+                             'IPv6, followed by an optional :<integer> port.')
+        self.resolver = dns.resolver.Resolver()
+        if nameservers:
+            self.resolver.nameservers = [ip for (ip, port) in nameservers]
+            self.resolver.nameserver_ports = {
+                ip: int(port) for (ip, port) in nameservers
+                if port is not None}
         self.memcache = None
         self.logger = get_logger(conf, log_route='cname-lookup')
 
@@ -117,13 +130,13 @@ class CNAMELookupMiddleware(object):
         if not self.storage_domain:
             return self.app(env, start_response)
         if 'HTTP_HOST' in env:
-            given_domain = env['HTTP_HOST']
+            requested_host = given_domain = env['HTTP_HOST']
         else:
-            given_domain = env['SERVER_NAME']
+            requested_host = given_domain = env['SERVER_NAME']
         port = ''
         if ':' in given_domain:
             given_domain, port = given_domain.rsplit(':', 1)
-        if is_ip(given_domain):
+        if is_valid_ip(given_domain):
             return self.app(env, start_response)
         a_domain = given_domain
         if not self._domain_endswith_in_storage_domain(a_domain):
@@ -136,7 +149,7 @@ class CNAMELookupMiddleware(object):
                     memcache_key = ''.join(['cname-', a_domain])
                     found_domain = self.memcache.get(memcache_key)
                 if found_domain is None:
-                    ttl, found_domain = lookup_cname(a_domain)
+                    ttl, found_domain = lookup_cname(a_domain, self.resolver)
                     if self.memcache and ttl > 0:
                         memcache_key = ''.join(['cname-', given_domain])
                         self.memcache.set(memcache_key, found_domain,
@@ -175,6 +188,11 @@ class CNAMELookupMiddleware(object):
                 resp = HTTPBadRequest(request=Request(env), body=msg,
                                       content_type='text/plain')
                 return resp(env, start_response)
+            else:
+                context = _CnameLookupContext(self.app, requested_host,
+                                              env['HTTP_HOST'])
+                return context.handle_request(env, start_response)
+
         return self.app(env, start_response)
 
 

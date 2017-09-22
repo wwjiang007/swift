@@ -214,9 +214,6 @@ This list is in addition to X-Object-Meta-* headers and cannot include Content-T
 The default is 'Content-Disposition, Content-Encoding, X-Delete-At, X-Object-Manifest, X-Static-Large-Object'.
 .IP "\fBauto_create_account_prefix\fR"
 The default is '.'.
-.IP "\fBthreads_per_disk\fR"
-A value of 0 means "don't use thread pools". A reasonable starting point is
-4. The default is 0.
 .IP "\fBreplication_server\fR"
 Configure parameter for creating specific server
 To handle all verbs, including replication verbs, do not specify
@@ -500,8 +497,10 @@ Minimum time for a pass to take. The default is 300 seconds.
 Number of reaper workers to spawn. The default is 1.
 .IP \fBnode_timeout\fR
 Request timeout to external services. The default is 10 seconds.
+.IP \fBobjects_per_second\fR
+Maximum objects updated per second. Should be tuned according to individual system specs. 0 is unlimited. The default is 50.
 .IP \fBslowdown\fR
-Slowdown will sleep that amount between objects. The default is 0.01 seconds.
+Slowdown will sleep that amount between objects. The default is 0.01 seconds. Deprecated in favor of objects_per_second.
 .IP "\fBrecon_cache_path\fR"
 The recon_cache_path simply sets the directory where stats for a few items will be stored.
 Depending on the method of deployment you may need to create this directory manually
@@ -585,9 +584,9 @@ Ignored if IOPRIO_CLASS_IDLE is set.
 .LP
 More in depth documentation about the swift-object-server and
 also OpenStack Swift as a whole can be found at
-.BI http://docs.openstack.org/developer/swift/admin_guide.html
+.BI https://docs.openstack.org/swift/latest/admin_guide.html
 and
-.BI http://docs.openstack.org/developer/swift
+.BI https://docs.openstack.org/swift/latest/
 
 
 .SH "SEE ALSO"

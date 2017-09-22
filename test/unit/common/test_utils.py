@@ -21,7 +21,9 @@ import ctypes
 import contextlib
 import errno
 import eventlet
+import eventlet.debug
 import eventlet.event
+import eventlet.patcher
 import functools
 import grp
 import logging
@@ -31,6 +33,7 @@ import mock
 import random
 import re
 import socket
+import string
 import sys
 import json
 import math
@@ -53,6 +56,7 @@ from functools import partial
 from tempfile import TemporaryFile, NamedTemporaryFile, mkdtemp
 from netifaces import AF_INET6
 from mock import MagicMock, patch
+from nose import SkipTest
 from six.moves.configparser import NoSectionError, NoOptionError
 from uuid import uuid4
 
@@ -60,9 +64,11 @@ from swift.common.exceptions import Timeout, MessageTimeout, \
     ConnectionTimeout, LockTimeout, ReplicationLockTimeout, \
     MimeInvalid
 from swift.common import utils
-from swift.common.utils import is_valid_ip, is_valid_ipv4, is_valid_ipv6
+from swift.common.utils import is_valid_ip, is_valid_ipv4, is_valid_ipv6, \
+    set_swift_dir
 from swift.common.container_sync_realms import ContainerSyncRealms
 from swift.common.header_key_dict import HeaderKeyDict
+from swift.common.storage_policy import POLICIES, reload_storage_policies
 from swift.common.swob import Request, Response
 from test.unit import FakeLogger, requires_o_tmpfile_support
 
@@ -177,7 +183,7 @@ class TestTimestamp(unittest.TestCase):
         self.assertRaises(ValueError, utils.Timestamp, time.time(), offset=-1)
 
     def test_invalid_string_conversion(self):
-        t = utils.Timestamp(time.time())
+        t = utils.Timestamp.now()
         self.assertRaises(TypeError, str, t)
 
     def test_offset_limit(self):
@@ -1360,21 +1366,53 @@ class TestUtils(unittest.TestCase):
         testcache_file = os.path.join(testdir_base, 'cache.recon')
         logger = utils.get_logger(None, 'server', log_route='server')
         try:
-            submit_dict = {'key1': {'value1': 1, 'value2': 2}}
+            submit_dict = {'key0': 99,
+                           'key1': {'value1': 1, 'value2': 2}}
             utils.dump_recon_cache(submit_dict, testcache_file, logger)
-            fd = open(testcache_file)
-            file_dict = json.loads(fd.readline())
-            fd.close()
+            with open(testcache_file) as fd:
+                file_dict = json.loads(fd.readline())
             self.assertEqual(submit_dict, file_dict)
             # Use a nested entry
-            submit_dict = {'key1': {'key2': {'value1': 1, 'value2': 2}}}
-            result_dict = {'key1': {'key2': {'value1': 1, 'value2': 2},
-                           'value1': 1, 'value2': 2}}
+            submit_dict = {'key0': 101,
+                           'key1': {'key2': {'value1': 1, 'value2': 2}}}
+            expect_dict = {'key0': 101,
+                           'key1': {'key2': {'value1': 1, 'value2': 2},
+                                    'value1': 1, 'value2': 2}}
             utils.dump_recon_cache(submit_dict, testcache_file, logger)
-            fd = open(testcache_file)
-            file_dict = json.loads(fd.readline())
-            fd.close()
-            self.assertEqual(result_dict, file_dict)
+            with open(testcache_file) as fd:
+                file_dict = json.loads(fd.readline())
+            self.assertEqual(expect_dict, file_dict)
+            # cached entries are sticky
+            submit_dict = {}
+            utils.dump_recon_cache(submit_dict, testcache_file, logger)
+            with open(testcache_file) as fd:
+                file_dict = json.loads(fd.readline())
+            self.assertEqual(expect_dict, file_dict)
+            # nested dicts can be erased...
+            submit_dict = {'key1': {'key2': {}}}
+            expect_dict = {'key0': 101,
+                           'key1': {'value1': 1, 'value2': 2}}
+            utils.dump_recon_cache(submit_dict, testcache_file, logger)
+            with open(testcache_file) as fd:
+                file_dict = json.loads(fd.readline())
+            self.assertEqual(expect_dict, file_dict)
+            # ... and erasure is idempotent
+            utils.dump_recon_cache(submit_dict, testcache_file, logger)
+            with open(testcache_file) as fd:
+                file_dict = json.loads(fd.readline())
+            self.assertEqual(expect_dict, file_dict)
+            # top level dicts can be erased...
+            submit_dict = {'key1': {}}
+            expect_dict = {'key0': 101}
+            utils.dump_recon_cache(submit_dict, testcache_file, logger)
+            with open(testcache_file) as fd:
+                file_dict = json.loads(fd.readline())
+            self.assertEqual(expect_dict, file_dict)
+            # ... and erasure is idempotent
+            utils.dump_recon_cache(submit_dict, testcache_file, logger)
+            with open(testcache_file) as fd:
+                file_dict = json.loads(fd.readline())
+            self.assertEqual(expect_dict, file_dict)
         finally:
             rmtree(testdir_base)
 
@@ -1453,7 +1491,7 @@ class TestUtils(unittest.TestCase):
                          'test1\ntest3\ntest4\ntest6\n')
 
     def test_get_logger_sysloghandler_plumbing(self):
-        orig_sysloghandler = utils.SysLogHandler
+        orig_sysloghandler = utils.ThreadSafeSysLogHandler
         syslog_handler_args = []
 
         def syslog_handler_catcher(*args, **kwargs):
@@ -1464,7 +1502,7 @@ class TestUtils(unittest.TestCase):
         syslog_handler_catcher.LOG_LOCAL3 = orig_sysloghandler.LOG_LOCAL3
 
         try:
-            utils.SysLogHandler = syslog_handler_catcher
+            utils.ThreadSafeSysLogHandler = syslog_handler_catcher
             utils.get_logger({
                 'log_facility': 'LOG_LOCAL3',
             }, 'server', log_route='server')
@@ -1514,7 +1552,7 @@ class TestUtils(unittest.TestCase):
                       'facility': orig_sysloghandler.LOG_LOCAL0})],
                 syslog_handler_args)
         finally:
-            utils.SysLogHandler = orig_sysloghandler
+            utils.ThreadSafeSysLogHandler = orig_sysloghandler
 
     @reset_logger_state
     def test_clean_logger_exception(self):
@@ -1551,7 +1589,7 @@ class TestUtils(unittest.TestCase):
                 log_exception(OSError(en, 'my %s error message' % en))
                 log_msg = strip_value(sio)
                 self.assertNotIn('Traceback', log_msg)
-                self.assertTrue('my %s error message' % en in log_msg)
+                self.assertIn('my %s error message' % en, log_msg)
             # unfiltered
             log_exception(OSError())
             self.assertTrue('Traceback' in strip_value(sio))
@@ -1562,23 +1600,23 @@ class TestUtils(unittest.TestCase):
             log_msg = strip_value(sio)
             self.assertNotIn('Traceback', log_msg)
             self.assertNotIn('errno.ECONNREFUSED message test', log_msg)
-            self.assertTrue('Connection refused' in log_msg)
+            self.assertIn('Connection refused', log_msg)
             log_exception(socket.error(errno.EHOSTUNREACH,
                                        'my error message'))
             log_msg = strip_value(sio)
             self.assertNotIn('Traceback', log_msg)
             self.assertNotIn('my error message', log_msg)
-            self.assertTrue('Host unreachable' in log_msg)
+            self.assertIn('Host unreachable', log_msg)
             log_exception(socket.error(errno.ETIMEDOUT, 'my error message'))
             log_msg = strip_value(sio)
             self.assertNotIn('Traceback', log_msg)
             self.assertNotIn('my error message', log_msg)
-            self.assertTrue('Connection timeout' in log_msg)
+            self.assertIn('Connection timeout', log_msg)
             # unfiltered
             log_exception(socket.error(0, 'my error message'))
             log_msg = strip_value(sio)
-            self.assertTrue('Traceback' in log_msg)
-            self.assertTrue('my error message' in log_msg)
+            self.assertIn('Traceback', log_msg)
+            self.assertIn('my error message', log_msg)
 
             # test eventlet.Timeout
             connection_timeout = ConnectionTimeout(42, 'my error message')
@@ -1683,19 +1721,19 @@ class TestUtils(unittest.TestCase):
             self.assertFalse(logger.txn_id)
             logger.error('my error message')
             log_msg = strip_value(sio)
-            self.assertTrue('my error message' in log_msg)
+            self.assertIn('my error message', log_msg)
             self.assertNotIn('txn', log_msg)
             logger.txn_id = '12345'
             logger.error('test')
             log_msg = strip_value(sio)
-            self.assertTrue('txn' in log_msg)
-            self.assertTrue('12345' in log_msg)
+            self.assertIn('txn', log_msg)
+            self.assertIn('12345', log_msg)
             # test txn in info message
             self.assertEqual(logger.txn_id, '12345')
             logger.info('test')
             log_msg = strip_value(sio)
-            self.assertTrue('txn' in log_msg)
-            self.assertTrue('12345' in log_msg)
+            self.assertIn('txn', log_msg)
+            self.assertIn('12345', log_msg)
             # test txn already in message
             self.assertEqual(logger.txn_id, '12345')
             logger.warning('test 12345 test')
@@ -1703,19 +1741,19 @@ class TestUtils(unittest.TestCase):
             # Test multi line collapsing
             logger.error('my\nerror\nmessage')
             log_msg = strip_value(sio)
-            self.assertTrue('my#012error#012message' in log_msg)
+            self.assertIn('my#012error#012message', log_msg)
 
             # test client_ip
             self.assertFalse(logger.client_ip)
             logger.error('my error message')
             log_msg = strip_value(sio)
-            self.assertTrue('my error message' in log_msg)
+            self.assertIn('my error message', log_msg)
             self.assertNotIn('client_ip', log_msg)
             logger.client_ip = '1.2.3.4'
             logger.error('test')
             log_msg = strip_value(sio)
-            self.assertTrue('client_ip' in log_msg)
-            self.assertTrue('1.2.3.4' in log_msg)
+            self.assertIn('client_ip', log_msg)
+            self.assertIn('1.2.3.4', log_msg)
             # test no client_ip on info message
             self.assertEqual(logger.client_ip, '1.2.3.4')
             logger.info('test')
@@ -2427,11 +2465,11 @@ log_name = %(yarr)s'''
             file_name = os.path.join(t, 'blah.pid')
             # assert no raise
             self.assertEqual(os.path.exists(file_name), False)
-            self.assertEqual(utils.remove_file(file_name), None)
+            self.assertIsNone(utils.remove_file(file_name))
             with open(file_name, 'w') as f:
                 f.write('1')
             self.assertTrue(os.path.exists(file_name))
-            self.assertEqual(utils.remove_file(file_name), None)
+            self.assertIsNone(utils.remove_file(file_name))
             self.assertFalse(os.path.exists(file_name))
 
     def test_human_readable(self):
@@ -2976,7 +3014,7 @@ cluster_dfw1 = http://dfw1.host/v1/
 
     def test_get_trans_id_time(self):
         ts = utils.get_trans_id_time('tx8c8bc884cdaf499bb29429aa9c46946e')
-        self.assertEqual(ts, None)
+        self.assertIsNone(ts)
         ts = utils.get_trans_id_time('tx1df4ff4f55ea45f7b2ec2-0051720c06')
         self.assertEqual(ts, 1366428678)
         self.assertEqual(
@@ -2989,11 +3027,11 @@ cluster_dfw1 = http://dfw1.host/v1/
             time.asctime(time.gmtime(ts)) + ' UTC',
             'Sat Apr 20 03:31:18 2013 UTC')
         ts = utils.get_trans_id_time('')
-        self.assertEqual(ts, None)
+        self.assertIsNone(ts)
         ts = utils.get_trans_id_time('garbage')
-        self.assertEqual(ts, None)
+        self.assertIsNone(ts)
         ts = utils.get_trans_id_time('tx1df4ff4f55ea45f7b2ec2-almostright')
-        self.assertEqual(ts, None)
+        self.assertIsNone(ts)
 
     def test_config_fallocate_value(self):
         fallocate_value, is_percent = utils.config_fallocate_value('10%')
@@ -3299,6 +3337,16 @@ cluster_dfw1 = http://dfw1.host/v1/
         finally:
             shutil.rmtree(tmpdir)
 
+    def test_ismount_successes_stubfile(self):
+        tmpdir = mkdtemp()
+        fname = os.path.join(tmpdir, ".ismount")
+        try:
+            with open(fname, "w") as stubfile:
+                stubfile.write("")
+            self.assertTrue(utils.ismount(tmpdir))
+        finally:
+            shutil.rmtree(tmpdir)
+
     def test_parse_content_type(self):
         self.assertEqual(utils.parse_content_type('text/plain'),
                          ('text/plain', []))
@@ -3372,6 +3420,27 @@ cluster_dfw1 = http://dfw1.host/v1/
                 'text/plain; swift_bytes=123; someother=thing'}
         for before, after in subtests.items():
             self.assertEqual(utils.clean_content_type(before), after)
+
+    def test_get_valid_utf8_str(self):
+        def do_test(input_value, expected):
+            actual = utils.get_valid_utf8_str(input_value)
+            self.assertEqual(expected, actual)
+            self.assertIsInstance(actual, six.binary_type)
+            actual.decode('utf-8')
+
+        do_test(b'abc', b'abc')
+        do_test(u'abc', b'abc')
+        do_test(u'\uc77c\uc601', b'\xec\x9d\xbc\xec\x98\x81')
+        do_test(b'\xec\x9d\xbc\xec\x98\x81', b'\xec\x9d\xbc\xec\x98\x81')
+
+        # test some invalid UTF-8
+        do_test(b'\xec\x9d\xbc\xec\x98', b'\xec\x9d\xbc\xef\xbf\xbd')
+
+        # check surrogate pairs, too
+        do_test(u'\U0001f0a1', b'\xf0\x9f\x82\xa1'),
+        do_test(u'\uD83C\uDCA1', b'\xf0\x9f\x82\xa1'),
+        do_test(b'\xf0\x9f\x82\xa1', b'\xf0\x9f\x82\xa1'),
+        do_test(b'\xed\xa0\xbc\xed\xb2\xa1', b'\xf0\x9f\x82\xa1'),
 
     def test_quote(self):
         res = utils.quote('/v1/a/c3/subdirx/')
@@ -3591,6 +3660,12 @@ cluster_dfw1 = http://dfw1.host/v1/
         def _fake_syscall(*args):
             called['syscall'] = args
 
+        # Test if current architecture supports changing of priority
+        try:
+            utils.NR_ioprio_set()
+        except OSError as e:
+            raise SkipTest(e)
+
         with patch('swift.common.utils._libc_setpriority',
                    _fake_setpriority), \
                 patch('swift.common.utils._posix_syscall', _fake_syscall):
@@ -3780,6 +3855,28 @@ cluster_dfw1 = http://dfw1.host/v1/
         if failures:
             self.fail('Invalid results from pure function:\n%s' %
                       '\n'.join(failures))
+
+    def test_replace_partition_in_path(self):
+        # Check for new part = part * 2
+        old = '/s/n/d/o/700/c77/af088baea4806dcaba30bf07d9e64c77/f'
+        new = '/s/n/d/o/1400/c77/af088baea4806dcaba30bf07d9e64c77/f'
+        # Expected outcome
+        self.assertEqual(utils.replace_partition_in_path(old, 11), new)
+
+        # Make sure there is no change if the part power didn't change
+        self.assertEqual(utils.replace_partition_in_path(old, 10), old)
+        self.assertEqual(utils.replace_partition_in_path(new, 11), new)
+
+        # Check for new part = part * 2 + 1
+        old = '/s/n/d/o/693/c77/ad708baea4806dcaba30bf07d9e64c77/f'
+        new = '/s/n/d/o/1387/c77/ad708baea4806dcaba30bf07d9e64c77/f'
+
+        # Expected outcome
+        self.assertEqual(utils.replace_partition_in_path(old, 11), new)
+
+        # Make sure there is no change if the part power didn't change
+        self.assertEqual(utils.replace_partition_in_path(old, 10), old)
+        self.assertEqual(utils.replace_partition_in_path(new, 11), new)
 
 
 class ResellerConfReader(unittest.TestCase):
@@ -4090,12 +4187,12 @@ class TestSwiftInfo(unittest.TestCase):
 
         self.assertNotIn('admin', info)
 
-        self.assertTrue('swift' in info)
-        self.assertTrue('foo' in info['swift'])
+        self.assertIn('swift', info)
+        self.assertIn('foo', info['swift'])
         self.assertEqual(utils._swift_info['swift']['foo'], 'bar')
 
-        self.assertTrue('cap1' in info)
-        self.assertTrue('cap1_foo' in info['cap1'])
+        self.assertIn('cap1', info)
+        self.assertIn('cap1_foo', info['cap1'])
         self.assertEqual(utils._swift_info['cap1']['cap1_foo'], 'cap1_bar')
 
     def test_get_swift_info_with_disallowed_sections(self):
@@ -4109,14 +4206,14 @@ class TestSwiftInfo(unittest.TestCase):
 
         self.assertNotIn('admin', info)
 
-        self.assertTrue('swift' in info)
-        self.assertTrue('foo' in info['swift'])
+        self.assertIn('swift', info)
+        self.assertIn('foo', info['swift'])
         self.assertEqual(info['swift']['foo'], 'bar')
 
         self.assertNotIn('cap1', info)
 
-        self.assertTrue('cap2' in info)
-        self.assertTrue('cap2_foo' in info['cap2'])
+        self.assertIn('cap2', info)
+        self.assertIn('cap2_foo', info['cap2'])
         self.assertEqual(info['cap2']['cap2_foo'], 'cap2_bar')
 
         self.assertNotIn('cap3', info)
@@ -4127,19 +4224,19 @@ class TestSwiftInfo(unittest.TestCase):
         utils.register_swift_info('cap1', admin=True, ac1_foo='ac1_bar')
         utils.register_swift_info('cap1', admin=True, ac1_lorem='ac1_ipsum')
 
-        self.assertTrue('swift' in utils._swift_admin_info)
-        self.assertTrue('admin_foo' in utils._swift_admin_info['swift'])
+        self.assertIn('swift', utils._swift_admin_info)
+        self.assertIn('admin_foo', utils._swift_admin_info['swift'])
         self.assertEqual(
             utils._swift_admin_info['swift']['admin_foo'], 'admin_bar')
-        self.assertTrue('admin_lorem' in utils._swift_admin_info['swift'])
+        self.assertIn('admin_lorem', utils._swift_admin_info['swift'])
         self.assertEqual(
             utils._swift_admin_info['swift']['admin_lorem'], 'admin_ipsum')
 
-        self.assertTrue('cap1' in utils._swift_admin_info)
-        self.assertTrue('ac1_foo' in utils._swift_admin_info['cap1'])
+        self.assertIn('cap1', utils._swift_admin_info)
+        self.assertIn('ac1_foo', utils._swift_admin_info['cap1'])
         self.assertEqual(
             utils._swift_admin_info['cap1']['ac1_foo'], 'ac1_bar')
-        self.assertTrue('ac1_lorem' in utils._swift_admin_info['cap1'])
+        self.assertIn('ac1_lorem', utils._swift_admin_info['cap1'])
         self.assertEqual(
             utils._swift_admin_info['cap1']['ac1_lorem'], 'ac1_ipsum')
 
@@ -4153,17 +4250,17 @@ class TestSwiftInfo(unittest.TestCase):
 
         info = utils.get_swift_info(admin=True)
 
-        self.assertTrue('admin' in info)
-        self.assertTrue('admin_cap1' in info['admin'])
-        self.assertTrue('ac1_foo' in info['admin']['admin_cap1'])
+        self.assertIn('admin', info)
+        self.assertIn('admin_cap1', info['admin'])
+        self.assertIn('ac1_foo', info['admin']['admin_cap1'])
         self.assertEqual(info['admin']['admin_cap1']['ac1_foo'], 'ac1_bar')
 
-        self.assertTrue('swift' in info)
-        self.assertTrue('foo' in info['swift'])
+        self.assertIn('swift', info)
+        self.assertIn('foo', info['swift'])
         self.assertEqual(utils._swift_info['swift']['foo'], 'bar')
 
-        self.assertTrue('cap1' in info)
-        self.assertTrue('cap1_foo' in info['cap1'])
+        self.assertIn('cap1', info)
+        self.assertIn('cap1_foo', info['cap1'])
         self.assertEqual(utils._swift_info['cap1']['cap1_foo'], 'cap1_bar')
 
     def test_get_swift_admin_info_with_disallowed_sections(self):
@@ -4176,23 +4273,23 @@ class TestSwiftInfo(unittest.TestCase):
         info = utils.get_swift_info(
             admin=True, disallowed_sections=['cap1', 'cap3'])
 
-        self.assertTrue('admin' in info)
-        self.assertTrue('admin_cap1' in info['admin'])
-        self.assertTrue('ac1_foo' in info['admin']['admin_cap1'])
+        self.assertIn('admin', info)
+        self.assertIn('admin_cap1', info['admin'])
+        self.assertIn('ac1_foo', info['admin']['admin_cap1'])
         self.assertEqual(info['admin']['admin_cap1']['ac1_foo'], 'ac1_bar')
-        self.assertTrue('disallowed_sections' in info['admin'])
-        self.assertTrue('cap1' in info['admin']['disallowed_sections'])
+        self.assertIn('disallowed_sections', info['admin'])
+        self.assertIn('cap1', info['admin']['disallowed_sections'])
         self.assertNotIn('cap2', info['admin']['disallowed_sections'])
-        self.assertTrue('cap3' in info['admin']['disallowed_sections'])
+        self.assertIn('cap3', info['admin']['disallowed_sections'])
 
-        self.assertTrue('swift' in info)
-        self.assertTrue('foo' in info['swift'])
+        self.assertIn('swift', info)
+        self.assertIn('foo', info['swift'])
         self.assertEqual(info['swift']['foo'], 'bar')
 
         self.assertNotIn('cap1', info)
 
-        self.assertTrue('cap2' in info)
-        self.assertTrue('cap2_foo' in info['cap2'])
+        self.assertIn('cap2', info)
+        self.assertIn('cap2_foo', info['cap2'])
         self.assertEqual(info['cap2']['cap2_foo'], 'cap2_bar')
 
         self.assertNotIn('cap3', info)
@@ -5108,17 +5205,6 @@ class TestStatsdLoggingDelegation(unittest.TestCase):
                         self.logger.update_stats, 'another.counter', 3,
                         sample_rate=0.9912)
 
-    def test_get_valid_utf8_str(self):
-        unicode_sample = u'\uc77c\uc601'
-        valid_utf8_str = unicode_sample.encode('utf-8')
-        invalid_utf8_str = unicode_sample.encode('utf-8')[::-1]
-        self.assertEqual(valid_utf8_str,
-                         utils.get_valid_utf8_str(valid_utf8_str))
-        self.assertEqual(valid_utf8_str,
-                         utils.get_valid_utf8_str(unicode_sample))
-        self.assertEqual(b'\xef\xbf\xbd\xef\xbf\xbd\xec\xbc\x9d\xef\xbf\xbd',
-                         utils.get_valid_utf8_str(invalid_utf8_str))
-
     @reset_logger_state
     def test_thread_locals(self):
         logger = utils.get_logger(None)
@@ -5421,7 +5507,7 @@ class TestGreenAsyncPile(unittest.TestCase):
             pass
         pile = utils.GreenAsyncPile(3)
         pile.spawn(run_test)
-        self.assertEqual(next(pile), None)
+        self.assertIsNone(next(pile))
         self.assertRaises(StopIteration, lambda: next(pile))
 
     def test_waitall_timeout_timesout(self):
@@ -6136,6 +6222,211 @@ class TestHashForFileFunction(unittest.TestCase):
         if failures:
             self.fail('Some data did not compute expected hash:\n' +
                       '\n'.join(failures))
+
+
+class TestSetSwiftDir(unittest.TestCase):
+    def setUp(self):
+        self.swift_dir = tempfile.mkdtemp()
+        self.swift_conf = os.path.join(self.swift_dir, 'swift.conf')
+        self.policy_name = ''.join(random.sample(string.letters, 20))
+        with open(self.swift_conf, "wb") as sc:
+            sc.write('''
+[swift-hash]
+swift_hash_path_suffix = changeme
+
+[storage-policy:0]
+name = default
+default = yes
+
+[storage-policy:1]
+name = %s
+''' % self.policy_name)
+
+    def tearDown(self):
+        shutil.rmtree(self.swift_dir, ignore_errors=True)
+
+    def test_set_swift_dir(self):
+        set_swift_dir(None)
+        reload_storage_policies()
+        self.assertIsNone(POLICIES.get_by_name(self.policy_name))
+
+        set_swift_dir(self.swift_dir)
+        reload_storage_policies()
+        self.assertIsNotNone(POLICIES.get_by_name(self.policy_name))
+
+
+class TestPipeMutex(unittest.TestCase):
+    def setUp(self):
+        self.mutex = utils.PipeMutex()
+
+    def tearDown(self):
+        self.mutex.close()
+
+    def test_nonblocking(self):
+        evt_lock1 = eventlet.event.Event()
+        evt_lock2 = eventlet.event.Event()
+        evt_unlock = eventlet.event.Event()
+
+        def get_the_lock():
+            self.mutex.acquire()
+            evt_lock1.send('got the lock')
+            evt_lock2.wait()
+            self.mutex.release()
+            evt_unlock.send('released the lock')
+
+        eventlet.spawn(get_the_lock)
+        evt_lock1.wait()  # Now, the other greenthread has the lock.
+
+        self.assertFalse(self.mutex.acquire(blocking=False))
+        evt_lock2.send('please release the lock')
+        evt_unlock.wait()  # The other greenthread has released the lock.
+        self.assertTrue(self.mutex.acquire(blocking=False))
+
+    def test_recursive(self):
+        self.assertTrue(self.mutex.acquire(blocking=False))
+        self.assertTrue(self.mutex.acquire(blocking=False))
+
+        def try_acquire_lock():
+            return self.mutex.acquire(blocking=False)
+
+        self.assertFalse(eventlet.spawn(try_acquire_lock).wait())
+        self.mutex.release()
+        self.assertFalse(eventlet.spawn(try_acquire_lock).wait())
+        self.mutex.release()
+        self.assertTrue(eventlet.spawn(try_acquire_lock).wait())
+
+    def test_release_without_acquire(self):
+        self.assertRaises(RuntimeError, self.mutex.release)
+
+    def test_too_many_releases(self):
+        self.mutex.acquire()
+        self.mutex.release()
+        self.assertRaises(RuntimeError, self.mutex.release)
+
+    def test_wrong_releaser(self):
+        self.mutex.acquire()
+        self.assertRaises(RuntimeError,
+                          eventlet.spawn(self.mutex.release).wait)
+
+    def test_blocking(self):
+        evt = eventlet.event.Event()
+
+        sequence = []
+
+        def coro1():
+            eventlet.sleep(0)  # let coro2 go
+
+            self.mutex.acquire()
+            sequence.append('coro1 acquire')
+            evt.send('go')
+            self.mutex.release()
+            sequence.append('coro1 release')
+
+        def coro2():
+            evt.wait()  # wait for coro1 to start us
+            self.mutex.acquire()
+            sequence.append('coro2 acquire')
+            self.mutex.release()
+            sequence.append('coro2 release')
+
+        c1 = eventlet.spawn(coro1)
+        c2 = eventlet.spawn(coro2)
+
+        c1.wait()
+        c2.wait()
+
+        self.assertEqual(sequence, [
+            'coro1 acquire',
+            'coro1 release',
+            'coro2 acquire',
+            'coro2 release'])
+
+    def test_blocking_tpool(self):
+        # Note: this test's success isn't a guarantee that the mutex is
+        # working. However, this test's failure means that the mutex is
+        # definitely broken.
+        sequence = []
+
+        def do_stuff():
+            n = 10
+            while n > 0:
+                self.mutex.acquire()
+                sequence.append("<")
+                eventlet.sleep(0.0001)
+                sequence.append(">")
+                self.mutex.release()
+                n -= 1
+
+        greenthread1 = eventlet.spawn(do_stuff)
+        greenthread2 = eventlet.spawn(do_stuff)
+
+        real_thread1 = eventlet.patcher.original('threading').Thread(
+            target=do_stuff)
+        real_thread1.start()
+
+        real_thread2 = eventlet.patcher.original('threading').Thread(
+            target=do_stuff)
+        real_thread2.start()
+
+        greenthread1.wait()
+        greenthread2.wait()
+        real_thread1.join()
+        real_thread2.join()
+
+        self.assertEqual(''.join(sequence), "<>" * 40)
+
+    def test_blocking_preserves_ownership(self):
+        pthread1_event = eventlet.patcher.original('threading').Event()
+        pthread2_event1 = eventlet.patcher.original('threading').Event()
+        pthread2_event2 = eventlet.patcher.original('threading').Event()
+        thread_id = []
+        owner = []
+
+        def pthread1():
+            thread_id.append(id(eventlet.greenthread.getcurrent()))
+            self.mutex.acquire()
+            owner.append(self.mutex.owner)
+            pthread2_event1.set()
+
+            orig_os_write = utils.os.write
+
+            def patched_os_write(*a, **kw):
+                try:
+                    return orig_os_write(*a, **kw)
+                finally:
+                    pthread1_event.wait()
+
+            with mock.patch.object(utils.os, 'write', patched_os_write):
+                self.mutex.release()
+            pthread2_event2.set()
+
+        def pthread2():
+            pthread2_event1.wait()  # ensure pthread1 acquires lock first
+            thread_id.append(id(eventlet.greenthread.getcurrent()))
+            self.mutex.acquire()
+            pthread1_event.set()
+            pthread2_event2.wait()
+            owner.append(self.mutex.owner)
+            self.mutex.release()
+
+        real_thread1 = eventlet.patcher.original('threading').Thread(
+            target=pthread1)
+        real_thread1.start()
+
+        real_thread2 = eventlet.patcher.original('threading').Thread(
+            target=pthread2)
+        real_thread2.start()
+
+        real_thread1.join()
+        real_thread2.join()
+        self.assertEqual(thread_id, owner)
+        self.assertIsNone(self.mutex.owner)
+
+    @classmethod
+    def tearDownClass(cls):
+        # PipeMutex turns this off when you instantiate one
+        eventlet.debug.hub_prevent_multiple_readers(True)
+
 
 if __name__ == '__main__':
     unittest.main()

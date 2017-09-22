@@ -18,11 +18,13 @@
 from __future__ import print_function
 
 from eventlet.green import socket
+from six import string_types
 from six.moves.urllib.parse import urlparse
 
-from swift.common.utils import SWIFT_CONF_FILE, md5_hash_for_file
+from swift.common.utils import (
+    SWIFT_CONF_FILE, md5_hash_for_file, set_swift_dir)
 from swift.common.ring import Ring
-from swift.common.storage_policy import POLICIES
+from swift.common.storage_policy import POLICIES, reload_storage_policies
 import eventlet
 import json
 import optparse
@@ -75,7 +77,7 @@ class Scout(object):
 
     def scout_host(self, base_url, recon_type):
         """
-        Perform the actual HTTP request to obtain swift recon telemtry.
+        Perform the actual HTTP request to obtain swift recon telemetry.
 
         :param base_url: the base url of the host you wish to check. str of the
                         format 'http://127.0.0.1:6200/recon/'
@@ -227,7 +229,7 @@ class SwiftRecon(object):
         if self.server_type == 'object':
             for ring_name in os.listdir(swift_dir):
                 if ring_name.startswith('object') and \
-                        ring_name.endswith('ring.gz'):
+                        ring_name.endswith('.ring.gz'):
                     ring_names.add(ring_name)
         else:
             ring_name = '%s.ring.gz' % self.server_type
@@ -865,14 +867,16 @@ class SwiftRecon(object):
                     host = urlparse(url).netloc.split(':')[0]
                     print('%.02f%%  %s' % (used, '%-15s %s' % (host, device)))
 
-    def time_check(self, hosts):
+    def time_check(self, hosts, jitter=0.0):
         """
         Check a time synchronization of hosts with current time
 
         :param hosts: set of hosts to check. in the format of:
             set([('127.0.0.1', 6020), ('127.0.0.2', 6030)])
+        :param jitter: Maximal allowed time jitter
         """
 
+        jitter = abs(jitter)
         matches = 0
         errors = 0
         recon = Scout("time", self.verbose, self.suppress_errors,
@@ -883,13 +887,13 @@ class SwiftRecon(object):
             if status != 200:
                 errors = errors + 1
                 continue
-            if (ts_remote < ts_start or ts_remote > ts_end):
+            if (ts_remote + jitter < ts_start or ts_remote - jitter > ts_end):
                 diff = abs(ts_end - ts_remote)
                 ts_end_f = self._ptime(ts_end)
                 ts_remote_f = self._ptime(ts_remote)
 
                 print("!! %s current time is %s, but remote is %s, "
-                      "differs by %.2f sec" % (
+                      "differs by %.4f sec" % (
                           url,
                           ts_end_f,
                           ts_remote_f,
@@ -903,7 +907,7 @@ class SwiftRecon(object):
         print("=" * 79)
 
     def _get_ring_names(self, policy=None):
-        '''
+        """
         Retrieve name of ring files.
 
         If no policy is passed and the server type is object,
@@ -912,11 +916,13 @@ class SwiftRecon(object):
         :param policy: name or index of storage policy, only applicable
          with server_type==object.
          :returns: list of ring names.
-        '''
+        """
         if self.server_type == 'object':
             ring_names = [p.ring_name for p in POLICIES if (
                 p.name == policy or not policy or (
-                    policy.isdigit() and int(policy) == int(p)))]
+                    policy.isdigit() and int(policy) == int(p) or
+                    (isinstance(policy, string_types)
+                     and policy in p.aliases)))]
         else:
             ring_names = [self.server_type]
 
@@ -974,6 +980,8 @@ class SwiftRecon(object):
                         help="Get drive audit error stats")
         args.add_option('--time', '-T', action="store_true",
                         help="Check time synchronization")
+        args.add_option('--jitter', type="float", default=0.0,
+                        help="Maximal allowed time jitter")
         args.add_option('--top', type='int', metavar='COUNT', default=0,
                         help='Also show the top COUNT entries in rank order.')
         args.add_option('--lowest', type='int', metavar='COUNT', default=0,
@@ -1013,6 +1021,9 @@ class SwiftRecon(object):
             server_types = ['object']
 
         swift_dir = options.swiftdir
+        if set_swift_dir(swift_dir):
+            reload_storage_policies()
+
         self.verbose = options.verbose
         self.suppress_errors = options.suppress
         self.timeout = options.timeout
@@ -1051,7 +1062,7 @@ class SwiftRecon(object):
                 self.socket_usage(hosts)
                 self.server_type_check(hosts)
                 self.driveaudit_check(hosts)
-                self.time_check(hosts)
+                self.time_check(hosts, options.jitter)
             else:
                 if options.async:
                     if self.server_type == 'object':
@@ -1100,7 +1111,7 @@ class SwiftRecon(object):
                 if options.driveaudit:
                     self.driveaudit_check(hosts)
                 if options.time:
-                    self.time_check(hosts)
+                    self.time_check(hosts, options.jitter)
 
 
 def main():

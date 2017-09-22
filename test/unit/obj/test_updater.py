@@ -23,11 +23,13 @@ from contextlib import closing
 from gzip import GzipFile
 from tempfile import mkdtemp
 from shutil import rmtree
+from test import listen_zero
 from test.unit import FakeLogger, make_timestamp_iter
+from test.unit import debug_logger, patch_policies, mocked_http_conn
 from time import time
 from distutils.dir_util import mkpath
 
-from eventlet import spawn, Timeout, listen
+from eventlet import spawn, Timeout
 
 from swift.obj import updater as object_updater
 from swift.obj.diskfile import (ASYNCDIR_BASE, get_async_dir, DiskFileManager,
@@ -37,7 +39,6 @@ from swift.common import utils
 from swift.common.header_key_dict import HeaderKeyDict
 from swift.common.utils import hash_path, normalize_timestamp, mkdirs, \
     write_pickle
-from test.unit import debug_logger, patch_policies, mocked_http_conn
 from swift.common.storage_policy import StoragePolicy, POLICIES
 
 
@@ -91,6 +92,49 @@ class TestObjectUpdater(unittest.TestCase):
         self.assertEqual(ou.concurrency, 2)
         self.assertEqual(ou.node_timeout, 5.5)
         self.assertTrue(ou.get_container_ring() is not None)
+
+    def test_conf_params(self):
+        # defaults
+        daemon = object_updater.ObjectUpdater({}, logger=self.logger)
+        self.assertEqual(daemon.devices, '/srv/node')
+        self.assertEqual(daemon.mount_check, True)
+        self.assertEqual(daemon.swift_dir, '/etc/swift')
+        self.assertEqual(daemon.interval, 300)
+        self.assertEqual(daemon.concurrency, 1)
+        self.assertEqual(daemon.max_objects_per_second, 50.0)
+
+        # non-defaults
+        conf = {
+            'devices': '/some/where/else',
+            'mount_check': 'huh?',
+            'swift_dir': '/not/here',
+            'interval': '600',
+            'concurrency': '2',
+            'objects_per_second': '10.5',
+        }
+        daemon = object_updater.ObjectUpdater(conf, logger=self.logger)
+        self.assertEqual(daemon.devices, '/some/where/else')
+        self.assertEqual(daemon.mount_check, False)
+        self.assertEqual(daemon.swift_dir, '/not/here')
+        self.assertEqual(daemon.interval, 600)
+        self.assertEqual(daemon.concurrency, 2)
+        self.assertEqual(daemon.max_objects_per_second, 10.5)
+
+        # check deprecated option
+        daemon = object_updater.ObjectUpdater({'slowdown': '0.04'},
+                                              logger=self.logger)
+        self.assertEqual(daemon.max_objects_per_second, 20.0)
+
+        def check_bad(conf):
+            with self.assertRaises(ValueError):
+                object_updater.ObjectUpdater(conf, logger=self.logger)
+
+        check_bad({'interval': 'foo'})
+        check_bad({'interval': '300.0'})
+        check_bad({'concurrency': 'bar'})
+        check_bad({'concurrency': '1.0'})
+        check_bad({'slowdown': 'baz'})
+        check_bad({'objects_per_second': 'quux'})
 
     @mock.patch('os.listdir')
     def test_listdir_with_exception(self, mock_listdir):
@@ -303,7 +347,7 @@ class TestObjectUpdater(unittest.TestCase):
                          {'failures': 1, 'unlinks': 1})
         self.assertIsNone(pickle.load(open(op_path)).get('successes'))
 
-        bindsock = listen(('127.0.0.1', 0))
+        bindsock = listen_zero()
 
         def accepter(sock, return_code):
             try:

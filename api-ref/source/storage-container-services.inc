@@ -8,7 +8,7 @@ Lists objects in a container. Creates, shows details for, and
 deletes containers. Creates, updates, shows, and deletes container
 metadata. For more information and concepts about
 containers see `Object Storage API overview
-<http://docs.openstack.org/developer/swift/api/object_api_v1_overview.html>`_.
+<https://docs.openstack.org/swift/latest/api/object_api_v1_overview.html>`_.
 
 
 Show container details and list objects
@@ -89,13 +89,13 @@ Response Parameters
    - X-Timestamp: X-Timestamp
    - X-Trans-Id: X-Trans-Id
    - X-Openstack-Request-Id: X-Openstack-Request-Id
-   - Content_Type: Content-Type_listing_resp
+   - Content-Type: Content-Type_listing_resp
    - Date: Date
    - hash: hash
    - last_modified: last_modified
    - content_type: content_type
-   - bytes: bytes
-   - name: name
+   - bytes: bytes_in_container_get
+   - name: name_in_container_get
 
 
 Response Example format=json
@@ -186,8 +186,9 @@ Example requests and responses:
      X-Openstack-Request-Id: tx06021f10fc8642b2901e7-0052d58f37
      Date: Tue, 14 Jan 2014 19:25:43 GMT
 
-Error response codes:201,204,
+Normal response codes: 201, 202
 
+Error response codes: 400, 404, 507
 
 Request
 -------

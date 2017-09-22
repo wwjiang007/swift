@@ -79,8 +79,9 @@ def update_headers(response, headers):
     for name, value in headers:
         if name == 'etag':
             response.headers[name] = value.replace('"', '')
-        elif name not in ('date', 'content-length', 'content-type',
-                          'connection', 'x-put-timestamp', 'x-delete-after'):
+        elif name.lower() not in (
+                'date', 'content-length', 'content-type',
+                'connection', 'x-put-timestamp', 'x-delete-after'):
             response.headers[name] = value
 
 
@@ -143,6 +144,18 @@ def headers_to_account_info(headers, status_int=HTTP_OK):
         'container_count': headers.get('x-account-container-count'),
         'total_object_count': headers.get('x-account-object-count'),
         'bytes': headers.get('x-account-bytes-used'),
+        'storage_policies': {policy.idx: {
+            'container_count': int(headers.get(
+                'x-account-storage-policy-{}-container-count'.format(
+                    policy.name), 0)),
+            'object_count': int(headers.get(
+                'x-account-storage-policy-{}-object-count'.format(
+                    policy.name), 0)),
+            'bytes': int(headers.get(
+                'x-account-storage-policy-{}-bytes-used'.format(
+                    policy.name), 0))}
+            for policy in POLICIES
+        },
         'meta': meta,
         'sysmeta': sysmeta,
     }
@@ -182,7 +195,7 @@ def headers_to_object_info(headers, status_int=HTTP_OK):
     """
     headers, meta, sysmeta = _prep_headers_to_info(headers, 'object')
     transient_sysmeta = {}
-    for key, val in headers.iteritems():
+    for key, val in six.iteritems(headers):
         if is_object_transient_sysmeta(key):
             key = strip_object_transient_sysmeta_prefix(key.lower())
             transient_sysmeta[key] = val
@@ -505,9 +518,10 @@ def set_object_info_cache(app, env, account, container, obj, resp):
     per-request cache only.
 
     :param  app: the application object
+    :param env: the environment used by the current request
     :param  account: the unquoted account name
     :param  container: the unquoted container name
-    :param  object: the unquoted object name
+    :param  obj: the unquoted object name
     :param  resp: a GET or HEAD response received from an object server, or
               None if info cache should be cleared
     :returns: the object info
@@ -773,14 +787,16 @@ class ResumingGetter(object):
                            this request. This will change the Range header
                            so that the next req will start where it left off.
 
-        :raises ValueError: if invalid range header
         :raises HTTPRequestedRangeNotSatisfiable: if begin + num_bytes
                                                   > end of range + 1
         :raises RangeAlreadyComplete: if begin + num_bytes == end of range + 1
         """
-        if 'Range' in self.backend_headers:
-            req_range = Range(self.backend_headers['Range'])
+        try:
+            req_range = Range(self.backend_headers.get('Range'))
+        except ValueError:
+            req_range = None
 
+        if req_range:
             begin, end = req_range.ranges[0]
             if begin is None:
                 # this is a -50 range req (last 50 bytes of file)
@@ -803,6 +819,9 @@ class ResumingGetter(object):
             self.backend_headers['Range'] = str(req_range)
         else:
             self.backend_headers['Range'] = 'bytes=%d-' % num_bytes
+
+        # Reset so if we need to do this more than once, we don't double-up
+        self.bytes_used_from_backend = 0
 
     def pop_range(self):
         """
@@ -1304,9 +1323,11 @@ class NodeIter(object):
     :param partition: ring partition to yield nodes for
     :param node_iter: optional iterable of nodes to try. Useful if you
         want to filter or reorder the nodes.
+    :param policy: an instance of :class:`BaseStoragePolicy`. This should be
+        None for an account or container ring.
     """
 
-    def __init__(self, app, ring, partition, node_iter=None):
+    def __init__(self, app, ring, partition, node_iter=None, policy=None):
         self.app = app
         self.ring = ring
         self.partition = partition
@@ -1322,7 +1343,8 @@ class NodeIter(object):
         # Use of list() here forcibly yanks the first N nodes (the primary
         # nodes) from node_iter, so the rest of its values are handoffs.
         self.primary_nodes = self.app.sort_nodes(
-            list(itertools.islice(node_iter, num_primary_nodes)))
+            list(itertools.islice(node_iter, num_primary_nodes)),
+            policy=policy)
         self.handoff_iter = node_iter
         self._node_provider = None
 
@@ -1467,7 +1489,7 @@ class Controller(object):
         headers = HeaderKeyDict(additional) if additional else HeaderKeyDict()
         if transfer:
             self.transfer_headers(orig_req.headers, headers)
-        headers.setdefault('x-timestamp', Timestamp(time.time()).internal)
+        headers.setdefault('x-timestamp', Timestamp.now().internal)
         if orig_req:
             referer = orig_req.as_referer()
         else:
@@ -1591,7 +1613,8 @@ class Controller(object):
                     {'method': method, 'path': path})
 
     def make_requests(self, req, ring, part, method, path, headers,
-                      query_string='', overrides=None):
+                      query_string='', overrides=None, node_count=None,
+                      node_iterator=None):
         """
         Sends an HTTP request to multiple nodes and aggregates the results.
         It attempts the primary nodes concurrently, then iterates over the
@@ -1608,11 +1631,16 @@ class Controller(object):
         :param query_string: optional query string to send to the backend
         :param overrides: optional return status override map used to override
                           the returned status of a request.
+        :param node_count: optional number of nodes to send request to.
+        :param node_iterator: optional node iterator.
         :returns: a swob.Response object
         """
-        start_nodes = ring.get_part_nodes(part)
-        nodes = GreenthreadSafeIterator(self.app.iter_nodes(ring, part))
-        pile = GreenAsyncPile(len(start_nodes))
+        nodes = GreenthreadSafeIterator(
+            node_iterator or self.app.iter_nodes(ring, part)
+        )
+        node_number = node_count or len(ring.get_part_nodes(part))
+        pile = GreenAsyncPile(node_number)
+
         for head in headers:
             pile.spawn(self._make_request, nodes, part, method, path,
                        head, query_string, self.app.logger.thread_locals)
@@ -1623,7 +1651,7 @@ class Controller(object):
                 continue
             response.append(resp)
             statuses.append(resp[0])
-            if self.have_quorum(statuses, len(start_nodes)):
+            if self.have_quorum(statuses, node_number):
                 break
         # give any pending requests *some* chance to finish
         finished_quickly = pile.waitall(self.app.post_quorum_timeout)
@@ -1632,7 +1660,7 @@ class Controller(object):
                 continue
             response.append(resp)
             statuses.append(resp[0])
-        while len(response) < len(start_nodes):
+        while len(response) < node_number:
             response.append((HTTP_SERVICE_UNAVAILABLE, '', '', ''))
         statuses, reasons, resp_headers, bodies = zip(*response)
         return self.best_response(req, statuses, reasons, bodies,
@@ -1769,7 +1797,7 @@ class Controller(object):
         """
         partition, nodes = self.app.account_ring.get_nodes(account)
         path = '/%s' % account
-        headers = {'X-Timestamp': Timestamp(time.time()).internal,
+        headers = {'X-Timestamp': Timestamp.now().internal,
                    'X-Trans-Id': self.trans_id,
                    'X-Openstack-Request-Id': self.trans_id,
                    'Connection': 'close'}

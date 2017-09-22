@@ -32,7 +32,7 @@ from six.moves import reload_module
 from swift.container.backend import DATADIR
 from swift.common import db_replicator
 from swift.common.utils import (normalize_timestamp, hash_path,
-                                storage_directory)
+                                storage_directory, Timestamp)
 from swift.common.exceptions import DriveNotMounted
 from swift.common.swob import HTTPException
 
@@ -193,6 +193,7 @@ class FakeBroker(object):
 
     def __init__(self, *args, **kwargs):
         self.locked = False
+        self.metadata = {}
         return None
 
     @contextmanager
@@ -314,7 +315,7 @@ class TestDBReplicator(unittest.TestCase):
         def other_req(method, path, body, headers):
             raise Exception('blah')
         conn.request = other_req
-        self.assertEqual(conn.replicate(1, 2, 3), None)
+        self.assertIsNone(conn.replicate(1, 2, 3))
 
     def test_rsync_file(self):
         replicator = TestReplicator({})
@@ -584,12 +585,61 @@ class TestDBReplicator(unittest.TestCase):
         self.assertFalse(
             replicator._usync_db(0, FakeBroker(), fake_http, '12345', '67890'))
 
-    def test_stats(self):
-        # I'm not sure how to test that this logs the right thing,
-        # but we can at least make sure it gets covered.
-        replicator = TestReplicator({})
+    @mock.patch('swift.common.db_replicator.dump_recon_cache')
+    @mock.patch('swift.common.db_replicator.time.time', return_value=1234.5678)
+    def test_stats(self, mock_time, mock_recon_cache):
+        logger = unit.debug_logger('test-replicator')
+        replicator = TestReplicator({}, logger=logger)
         replicator._zero_stats()
+        self.assertEqual(replicator.stats['start'], mock_time.return_value)
         replicator._report_stats()
+        self.assertEqual(logger.get_lines_for_level('info'), [
+            'Attempted to replicate 0 dbs in 0.00000 seconds (0.00000/s)',
+            'Removed 0 dbs',
+            '0 successes, 0 failures',
+            'diff:0 diff_capped:0 empty:0 hashmatch:0 no_change:0 '
+            'remote_merge:0 rsync:0 ts_repl:0',
+        ])
+        self.assertEqual(1, len(mock_recon_cache.mock_calls))
+        self.assertEqual(mock_recon_cache.mock_calls[0][1][0], {
+            'replication_time': 0.0,
+            'replication_last': mock_time.return_value,
+            'replication_stats': replicator.stats,
+        })
+
+        mock_recon_cache.reset_mock()
+        logger.clear()
+        replicator.stats.update({
+            'attempted': 30,
+            'success': 25,
+            'remove': 9,
+            'failure': 1,
+
+            'diff': 5,
+            'diff_capped': 4,
+            'empty': 7,
+            'hashmatch': 8,
+            'no_change': 6,
+            'remote_merge': 2,
+            'rsync': 3,
+            'ts_repl': 10,
+        })
+        mock_time.return_value += 246.813576
+        replicator._report_stats()
+        self.maxDiff = None
+        self.assertEqual(logger.get_lines_for_level('info'), [
+            'Attempted to replicate 30 dbs in 246.81358 seconds (0.12155/s)',
+            'Removed 9 dbs',
+            '25 successes, 1 failures',
+            'diff:5 diff_capped:4 empty:7 hashmatch:8 no_change:6 '
+            'remote_merge:2 rsync:3 ts_repl:10',
+        ])
+        self.assertEqual(1, len(mock_recon_cache.mock_calls))
+        self.assertEqual(mock_recon_cache.mock_calls[0][1][0], {
+            'replication_time': 246.813576,
+            'replication_last': mock_time.return_value,
+            'replication_stats': replicator.stats,
+        })
 
     def test_replicate_object(self):
         db_replicator.ring = FakeRingWithNodes()
@@ -642,6 +692,50 @@ class TestDBReplicator(unittest.TestCase):
         replicator.delete_db = self.stub_delete_db
         replicator._replicate_object('0', '/path/to/file', 'node_id')
         self.assertEqual(['/path/to/file'], self.delete_db_calls)
+
+    def test_replicate_object_with_exception(self):
+        replicator = TestReplicator({})
+        replicator.ring = FakeRingWithNodes().Ring('path')
+        replicator.brokerclass = FakeAccountBroker
+        replicator.delete_db = self.stub_delete_db
+        replicator._repl_to_node = mock.Mock(side_effect=Exception())
+        replicator._replicate_object('0', '/path/to/file',
+                                     replicator.ring.devs[0]['id'])
+        self.assertEqual(2, replicator._repl_to_node.call_count)
+        # with one DriveNotMounted exception called on +1 more replica
+        replicator._repl_to_node = mock.Mock(side_effect=[DriveNotMounted()])
+        replicator._replicate_object('0', '/path/to/file',
+                                     replicator.ring.devs[0]['id'])
+        self.assertEqual(3, replicator._repl_to_node.call_count)
+        # called on +1 more replica and self when *first* handoff
+        replicator._repl_to_node = mock.Mock(side_effect=[DriveNotMounted()])
+        replicator._replicate_object('0', '/path/to/file',
+                                     replicator.ring.devs[3]['id'])
+        self.assertEqual(4, replicator._repl_to_node.call_count)
+        # even if it's the last handoff it works to keep 3 replicas
+        # 2 primaries + 1 handoff
+        replicator._repl_to_node = mock.Mock(side_effect=[DriveNotMounted()])
+        replicator._replicate_object('0', '/path/to/file',
+                                     replicator.ring.devs[-1]['id'])
+        self.assertEqual(4, replicator._repl_to_node.call_count)
+        # with two DriveNotMounted exceptions called on +2 more replica keeping
+        # durability
+        replicator._repl_to_node = mock.Mock(
+            side_effect=[DriveNotMounted()] * 2)
+        replicator._replicate_object('0', '/path/to/file',
+                                     replicator.ring.devs[0]['id'])
+        self.assertEqual(4, replicator._repl_to_node.call_count)
+
+    def test_replicate_object_with_exception_run_out_of_nodes(self):
+        replicator = TestReplicator({})
+        replicator.ring = FakeRingWithNodes().Ring('path')
+        replicator.brokerclass = FakeAccountBroker
+        replicator.delete_db = self.stub_delete_db
+        # all other devices are not mounted
+        replicator._repl_to_node = mock.Mock(side_effect=DriveNotMounted())
+        replicator._replicate_object('0', '/path/to/file',
+                                     replicator.ring.devs[0]['id'])
+        self.assertEqual(5, replicator._repl_to_node.call_count)
 
     def test_replicate_account_out_of_place(self):
         replicator = TestReplicator({}, logger=unit.FakeLogger())
@@ -1309,8 +1403,8 @@ class TestReplToNode(unittest.TestCase):
         self.fake_info = {'id': 'a', 'point': -1, 'max_row': 20, 'hash': 'b',
                           'created_at': 100, 'put_timestamp': 0,
                           'delete_timestamp': 0, 'count': 0,
-                          'metadata': {
-                              'Test': ('Value', normalize_timestamp(1))}}
+                          'metadata': json.dumps({
+                              'Test': ('Value', normalize_timestamp(1))})}
         self.replicator.logger = mock.Mock()
         self.replicator._rsync_db = mock.Mock(return_value=True)
         self.replicator._usync_db = mock.Mock(return_value=True)
@@ -1354,6 +1448,18 @@ class TestReplToNode(unittest.TestCase):
         self.assertEqual(self.replicator._rsync_db.call_count, 0)
         self.assertEqual(self.replicator._usync_db.call_count, 0)
 
+    def test_repl_to_node_metadata_update(self):
+        now = Timestamp(time.time()).internal
+        rmetadata = {"X-Container-Sysmeta-Test": ("XYZ", now)}
+        rinfo = {"id": 3, "point": -1, "max_row": 20, "hash": "b",
+                 "metadata": json.dumps(rmetadata)}
+        self.http = ReplHttp(json.dumps(rinfo))
+        self.broker.get_sync()
+        self.assertEqual(self.replicator._repl_to_node(
+            self.fake_node, self.broker, '0', self.fake_info), True)
+        metadata = self.broker.metadata
+        self.assertEqual({}, metadata)
+
     def test_repl_to_node_not_found(self):
         self.http = ReplHttp('{"id": 3, "point": -1}', set_status=404)
         self.assertEqual(self.replicator._repl_to_node(
@@ -1375,8 +1481,8 @@ class TestReplToNode(unittest.TestCase):
     def test_repl_to_node_300_status(self):
         self.http = ReplHttp('{"id": 3, "point": -1}', set_status=300)
 
-        self.assertEqual(self.replicator._repl_to_node(
-            self.fake_node, FakeBroker(), '0', self.fake_info), None)
+        self.assertIsNone(self.replicator._repl_to_node(
+            self.fake_node, FakeBroker(), '0', self.fake_info))
 
     def test_repl_to_node_not_response(self):
         self.http = mock.Mock(replicate=mock.Mock(return_value=None))
@@ -1569,6 +1675,76 @@ class TestReplicatorSync(unittest.TestCase):
         # but empty part dir is cleaned up!
         parts = os.listdir(part_root)
         self.assertEqual(0, len(parts))
+
+    def test_rsync_then_merge(self):
+        # setup current db (and broker)
+        broker = self._get_broker('a', 'c', node_index=0)
+        part, node = self._get_broker_part_node(broker)
+        part = str(part)
+        put_timestamp = normalize_timestamp(time.time())
+        broker.initialize(put_timestamp)
+        put_metadata = {'example-meta': ['bah', put_timestamp]}
+        broker.update_metadata(put_metadata)
+
+        # sanity (re-open, and the db keeps the metadata)
+        broker = self._get_broker('a', 'c', node_index=0)
+        self.assertEqual(put_metadata, broker.metadata)
+
+        # create rsynced db in tmp dir
+        obj_hash = hash_path('a', 'c')
+        rsynced_db_broker = self.backend(
+            os.path.join(self.root, node['device'], 'tmp', obj_hash + '.db'),
+            account='a', container='b')
+        rsynced_db_broker.initialize(put_timestamp)
+
+        # do rysnc_then_merge
+        rpc = db_replicator.ReplicatorRpc(
+            self.root, self.datadir, self.backend, False)
+        response = rpc.dispatch((node['device'], part, obj_hash),
+                                ['rsync_then_merge', obj_hash + '.db', 'arg2'])
+        # sanity
+        self.assertEqual('204 No Content', response.status)
+        self.assertEqual(204, response.status_int)
+
+        # re-open the db
+        broker = self._get_broker('a', 'c', node_index=0)
+        # keep the metadata in existing db
+        self.assertEqual(put_metadata, broker.metadata)
+
+    def test_replicator_sync(self):
+        # setup current db (and broker)
+        broker = self._get_broker('a', 'c', node_index=0)
+        part, node = self._get_broker_part_node(broker)
+        part = str(part)
+        put_timestamp = normalize_timestamp(time.time())
+        broker.initialize(put_timestamp)
+        put_metadata = {'example-meta': ['bah', put_timestamp]}
+        sync_local_metadata = {
+            "meta1": ["data1", put_timestamp],
+            "meta2": ["data2", put_timestamp]}
+        broker.update_metadata(put_metadata)
+
+        # sanity (re-open, and the db keeps the metadata)
+        broker = self._get_broker('a', 'c', node_index=0)
+        self.assertEqual(put_metadata, broker.metadata)
+
+        # do rysnc_then_merge
+        rpc = db_replicator.ReplicatorRpc(
+            self.root, self.datadir, ExampleBroker, False)
+        response = rpc.sync(
+            broker, (broker.get_sync('id_') + 1, 12345, 'id_',
+                     put_timestamp, put_timestamp, '0',
+                     json.dumps(sync_local_metadata)))
+        # sanity
+        self.assertEqual('200 OK', response.status)
+        self.assertEqual(200, response.status_int)
+
+        # re-open the db
+        broker = self._get_broker('a', 'c', node_index=0)
+        # keep the both metadata in existing db and local db
+        expected = put_metadata.copy()
+        expected.update(sync_local_metadata)
+        self.assertEqual(expected, broker.metadata)
 
 
 if __name__ == '__main__':

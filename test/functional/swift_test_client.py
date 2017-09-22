@@ -366,26 +366,39 @@ class Base(object):
         if optional_fields is None:
             optional_fields = ()
 
+        def is_int_header(header):
+            if header.startswith('x-account-storage-policy-') and \
+                    header.endswith(('-bytes-used', '-object-count')):
+                return True
+            return header in (
+                'content-length',
+                'x-account-container-count',
+                'x-account-object-count',
+                'x-account-bytes-used',
+                'x-container-object-count',
+                'x-container-bytes-used',
+            )
+
         headers = dict(self.conn.response.getheaders())
         ret = {}
 
-        for field in required_fields:
-            if field[1] not in headers:
+        for return_key, header in required_fields:
+            if header not in headers:
                 raise ValueError("%s was not found in response header" %
-                                 (field[1]))
+                                 (header,))
 
-            try:
-                ret[field[0]] = int(headers[field[1]])
-            except ValueError:
-                ret[field[0]] = headers[field[1]]
+            if is_int_header(header):
+                ret[return_key] = int(headers[header])
+            else:
+                ret[return_key] = headers[header]
 
-        for field in optional_fields:
-            if field[1] not in headers:
+        for return_key, header in optional_fields:
+            if header not in headers:
                 continue
-            try:
-                ret[field[0]] = int(headers[field[1]])
-            except ValueError:
-                ret[field[0]] = headers[field[1]]
+            if is_int_header(header):
+                ret[return_key] = int(headers[header])
+            else:
+                ret[return_key] = headers[header]
 
         return ret
 
@@ -723,8 +736,11 @@ class File(Base):
         if 'Destination' in headers:
             headers['Destination'] = urllib.parse.quote(headers['Destination'])
 
-        return self.conn.make_request('COPY', self.path, hdrs=headers,
-                                      parms=parms) == 201
+        if self.conn.make_request('COPY', self.path, hdrs=headers,
+                                  cfg=cfg, parms=parms) != 201:
+            raise ResponseError(self.conn.response, 'COPY',
+                                self.conn.make_path(self.path))
+        return True
 
     def copy_account(self, dest_account, dest_cont, dest_file,
                      hdrs=None, parms=None, cfg=None):
@@ -749,8 +765,11 @@ class File(Base):
         if 'Destination' in headers:
             headers['Destination'] = urllib.parse.quote(headers['Destination'])
 
-        return self.conn.make_request('COPY', self.path, hdrs=headers,
-                                      parms=parms) == 201
+        if self.conn.make_request('COPY', self.path, hdrs=headers,
+                                  cfg=cfg, parms=parms) != 201:
+            raise ResponseError(self.conn.response, 'COPY',
+                                self.conn.make_path(self.path))
+        return True
 
     def delete(self, hdrs=None, parms=None, cfg=None):
         if hdrs is None:

@@ -94,7 +94,7 @@ bind_port = 8080
 [pipeline:main]
 # This sample pipeline uses tempauth and is used for SAIO dev work and
 # testing. See below for a pipeline using keystone.
-pipeline = catch_errors gatekeeper healthcheck proxy-logging cache container_sync bulk tempurl ratelimit tempauth copy container-quotas account-quotas slo dlo versioned_writes proxy-logging proxy-server
+pipeline = catch_errors gatekeeper healthcheck proxy-logging cache listing_formats container_sync bulk tempurl ratelimit tempauth copy container-quotas account-quotas slo dlo versioned_writes proxy-logging proxy-server
 
 # The following pipeline shows keystone integration. Comment out the one
 # above and uncomment this one. Additional steps for integrating keystone are
@@ -167,13 +167,14 @@ use = egg:swift#proxy
 # Depth of the proxy put queue.
 # put_queue_depth = 10
 #
-# Storage nodes can be chosen at random (shuffle), by using timing
-# measurements (timing), or by using an explicit match (affinity).
-# Using timing measurements may allow for lower overall latency, while
-# using affinity allows for finer control. In both the timing and
-# affinity cases, equally-sorting nodes are still randomly chosen to
+# During GET and HEAD requests, storage nodes can be chosen at random
+# (shuffle), by using timing measurements (timing), or by using an explicit
+# region/zone match (affinity). Using timing measurements may allow for lower
+# overall latency, while using affinity allows for finer control. In both the
+# timing and affinity cases, equally-sorting nodes are still randomly chosen to
 # spread load.
 # The valid values for sorting_method are "affinity", "shuffle", or "timing".
+# This option may be overridden in a per-policy configuration section.
 # sorting_method = shuffle
 #
 # If the "timing" sorting_method is used, the timings will only be valid for
@@ -200,34 +201,54 @@ use = egg:swift#proxy
 # replicas for the ring being used for the request.
 # request_node_count = 2 * replicas
 #
-# Which backend servers to prefer on reads. Format is r<N> for region
-# N or r<N>z<M> for region N, zone M. The value after the equals is
-# the priority; lower numbers are higher priority.
+# Specifies which backend servers to prefer on reads. Format is a comma
+# separated list of affinity descriptors of the form <selection>=<priority>.
+# The <selection> may be r<N> for selecting nodes in region N or r<N>z<M> for
+# selecting nodes in region N, zone M. The <priority> value should be a whole
+# number that represents the priority to be given to the selection; lower
+# numbers are higher priority.
 #
 # Example: first read from region 1 zone 1, then region 1 zone 2, then
 # anything in region 2, then everything else:
 # read_affinity = r1z1=100, r1z2=200, r2=300
 # Default is empty, meaning no preference.
+# This option may be overridden in a per-policy configuration section.
 # read_affinity =
 #
-# Which backend servers to prefer on writes. Format is r<N> for region
-# N or r<N>z<M> for region N, zone M. If this is set, then when
-# handling an object PUT request, some number (see setting
-# write_affinity_node_count) of local backend servers will be tried
-# before any nonlocal ones.
+# Specifies which backend servers to prefer on object writes. Format is a comma
+# separated list of affinity descriptors of the form r<N> for region N or
+# r<N>z<M> for region N, zone M. If this is set, then when handling an object
+# PUT request, some number (see setting write_affinity_node_count) of local
+# backend servers will be tried before any nonlocal ones.
 #
 # Example: try to write to regions 1 and 2 before writing to any other
 # nodes:
 # write_affinity = r1, r2
 # Default is empty, meaning no preference.
+# This option may be overridden in a per-policy configuration section.
 # write_affinity =
 #
-# The number of local (as governed by the write_affinity setting)
-# nodes to attempt to contact first, before any non-local ones. You
-# can use '* replicas' at the end to have it use the number given
-# times the number of replicas for the ring being used for the
+# The number of local (as governed by the write_affinity setting) nodes to
+# attempt to contact first on writes, before any non-local ones. The value
+# should be an integer number, or use '* replicas' at the end to have it use
+# the number given times the number of replicas for the ring being used for the
 # request.
+# This option may be overridden in a per-policy configuration section.
 # write_affinity_node_count = 2 * replicas
+#
+# The number of local (as governed by the write_affinity setting) handoff nodes
+# to attempt to contact on deletion, in addition to primary nodes.
+#
+# Example: in geographically distributed deployment of 2 regions, If
+# replicas=3, sometimes there may be 1 primary node and 2 local handoff nodes
+# in one region holding the object after uploading but before object replicated
+# to the appropriate locations in other regions. In this case, include these
+# handoff nodes to send request when deleting object could help make correct
+# decision for the response. The default value 'auto' means Swift will
+# calculate the number automatically, the default value is
+# (replicas - len(local_primary_nodes)). This option may be overridden in a
+# per-policy configuration section.
+# write_affinity_handoff_delete_count = auto
 #
 # These are the headers whose values will only be shown to swift_owners. The
 # exact definition of a swift_owner is up to the auth system in use, but
@@ -245,6 +266,19 @@ use = egg:swift#proxy
 # Work only with ionice_class.
 # ionice_class =
 # ionice_priority =
+
+# Some proxy-server configuration options may be overridden on a per-policy
+# basis by including per-policy config section(s). The value of any option
+# specified a per-policy section will override any value given in the
+# proxy-server section for that policy only. Otherwise the value of these
+# options will be that specified in the proxy-server section.
+# The section name should refer to the policy index, not the policy name.
+# [proxy-server:policy:<policy index>]
+# sorting_method =
+# read_affinity =
+# write_affinity =
+# write_affinity_node_count =
+# write_affinity_handoff_delete_count =
 
 [filter:tempauth]
 use = egg:swift#tempauth
@@ -323,7 +357,7 @@ user_test5_tester5 = testing5 service
 # Following parameters are known to work with keystonemiddleware v2.3.0
 # (above v2.0.0), but checking the latest information in the wiki page[1]
 # is recommended.
-# 1. http://docs.openstack.org/developer/keystonemiddleware/middlewarearchitecture.html#configuration
+# 1. https://docs.openstack.org/keystonemiddleware/latest/middlewarearchitecture.html#configuration
 #
 # [filter:authtoken]
 # paste.filter_factory = keystonemiddleware.auth_token:filter_factory
@@ -546,6 +580,12 @@ use = egg:swift#cname_lookup
 # storage_domain = example.com
 #
 # lookup_depth = 1
+#
+# Specify the nameservers to use to do the CNAME resolution. If unset, the
+# system configuration is used. Multiple nameservers can be specified
+# separated by a comma. Default port 53 can be overriden. IPv6 is accepted.
+# Example: 127.0.0.1, 127.0.0.2, 127.0.0.3:5353, [::1], [::1]:5353
+# nameservers =
 
 # Note: Put staticweb just after your auth filter(s) in the pipeline
 [filter:staticweb]
@@ -820,8 +860,6 @@ use = egg:swift#copy
 # requests are transformed into COPY requests where source and destination are
 # the same. All client-visible behavior (save response time) should be
 # identical.
-# This option is deprecated and will be ignored in a future release.
-# object_post_as_copy = false
 
 # Note: To enable encryption, add the following 2 dependent pieces of crypto
 # middleware to the proxy-server pipeline. They should be to the right of all
@@ -849,6 +887,24 @@ encryption_root_secret = changeme
 # MUST NOT be set in proxy-server.conf.
 # keymaster_config_path =
 
+# To store the encryption root secret in a remote key management system (KMS)
+# such as Barbican, replace the keymaster middleware with the kms_keymaster
+# middleware in the proxy-server pipeline. They should be to the right of all
+# other middleware apart from the final proxy-logging middleware, and in the
+# order shown in this example:
+# <other middleware> kms_keymaster encryption proxy-logging proxy-server
+[filter:kms_keymaster]
+use = egg:swift#kms_keymaster
+
+# Sets the path from which the keymaster config options should be read. This
+# allows multiple processes which need to be encryption-aware (for example,
+# proxy-server and container-sync) to share the same config file, ensuring
+# that the encryption keys used are the same. The format expected is similar
+# to other config files, with a single [kms_keymaster] section. See the
+# keymaster.conf-sample file for details on the kms_keymaster configuration
+# options.
+# keymaster_config_path =
+
 [filter:encryption]
 use = egg:swift#encryption
 
@@ -857,3 +913,9 @@ use = egg:swift#encryption
 # disable_encryption to True. However, all encryption middleware should remain
 # in the pipeline in order for existing encrypted data to be read.
 # disable_encryption = False
+
+# listing_formats should be just right of the first proxy-logging middleware,
+# and left of most other middlewares. If it is not already present, it will
+# be automatically inserted for you.
+[filter:listing_formats]
+use = egg:swift#listing_formats

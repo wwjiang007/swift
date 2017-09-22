@@ -30,6 +30,8 @@ from unittest2 import SkipTest
 from swift.common.http import is_success, is_client_error
 from email.utils import parsedate
 
+import mock
+
 from test.functional import normalized_urls, load_constraint, cluster_info
 from test.functional import check_response, retry
 import test.functional as tf
@@ -1230,6 +1232,60 @@ class TestFileDevUTF8(Base2, TestFileDev):
 class TestFile(Base):
     env = TestFileEnv
 
+    def testGetResponseHeaders(self):
+        obj_data = 'test_body'
+
+        def do_test(put_hdrs, get_hdrs, expected_hdrs, unexpected_hdrs):
+            filename = Utils.create_name()
+            file_item = self.env.container.file(filename)
+            resp = file_item.write(
+                data=obj_data, hdrs=put_hdrs, return_resp=True)
+
+            # put then get an object
+            resp.read()
+            read_data = file_item.read(hdrs=get_hdrs)
+            self.assertEqual(obj_data, read_data)  # sanity check
+            resp_headers = file_item.conn.response.getheaders()
+
+            # check the *list* of all header (name, value) pairs rather than
+            # constructing a dict in case of repeated names in the list
+            errors = []
+            for k, v in resp_headers:
+                if k.lower() in unexpected_hdrs:
+                    errors.append('Found unexpected header %s: %s' % (k, v))
+            for k, v in expected_hdrs.items():
+                matches = [hdr for hdr in resp_headers if hdr[0] == k]
+                if not matches:
+                    errors.append('Missing expected header %s' % k)
+                for (got_k, got_v) in matches:
+                    if got_v != v:
+                        errors.append('Expected %s but got %s for %s' %
+                                      (v, got_v, k))
+            if errors:
+                self.fail(
+                    'Errors in response headers:\n  %s' % '\n  '.join(errors))
+
+        put_headers = {'X-Object-Meta-Fruit': 'Banana',
+                       'X-Delete-After': '10000',
+                       'Content-Type': 'application/test'}
+        expected_headers = {'content-length': str(len(obj_data)),
+                            'x-object-meta-fruit': 'Banana',
+                            'accept-ranges': 'bytes',
+                            'content-type': 'application/test',
+                            'etag': hashlib.md5(obj_data).hexdigest(),
+                            'last-modified': mock.ANY,
+                            'date': mock.ANY,
+                            'x-delete-at': mock.ANY,
+                            'x-trans-id': mock.ANY,
+                            'x-openstack-request-id': mock.ANY}
+        unexpected_headers = ['connection', 'x-delete-after']
+        do_test(put_headers, {}, expected_headers, unexpected_headers)
+
+        get_headers = {'Connection': 'keep-alive'}
+        expected_headers['connection'] = 'keep-alive'
+        unexpected_headers = ['x-delete-after']
+        do_test(put_headers, get_headers, expected_headers, unexpected_headers)
+
     def testCopy(self):
         # makes sure to test encoded characters
         source_filename = 'dealde%2Fl04 011e%204c8df/flash.png'
@@ -1478,31 +1534,33 @@ class TestFile(Base):
             # invalid source container
             source_cont = self.env.account.container(Utils.create_name())
             file_item = source_cont.file(source_filename)
-            self.assertFalse(file_item.copy(
-                '%s%s' % (prefix, self.env.container),
-                Utils.create_name()))
+            self.assertRaises(ResponseError, file_item.copy,
+                              '%s%s' % (prefix, self.env.container),
+                              Utils.create_name())
             self.assert_status(404)
 
-            self.assertFalse(file_item.copy('%s%s' % (prefix, dest_cont),
-                             Utils.create_name()))
+            self.assertRaises(ResponseError, file_item.copy,
+                              '%s%s' % (prefix, dest_cont),
+                              Utils.create_name())
             self.assert_status(404)
 
             # invalid source object
             file_item = self.env.container.file(Utils.create_name())
-            self.assertFalse(file_item.copy(
-                '%s%s' % (prefix, self.env.container),
-                Utils.create_name()))
+            self.assertRaises(ResponseError, file_item.copy,
+                              '%s%s' % (prefix, self.env.container),
+                              Utils.create_name())
             self.assert_status(404)
 
-            self.assertFalse(file_item.copy('%s%s' % (prefix, dest_cont),
-                                            Utils.create_name()))
+            self.assertRaises(ResponseError, file_item.copy,
+                              '%s%s' % (prefix, dest_cont),
+                              Utils.create_name())
             self.assert_status(404)
 
             # invalid destination container
             file_item = self.env.container.file(source_filename)
-            self.assertFalse(file_item.copy(
-                '%s%s' % (prefix, Utils.create_name()),
-                Utils.create_name()))
+            self.assertRaises(ResponseError, file_item.copy,
+                              '%s%s' % (prefix, Utils.create_name()),
+                              Utils.create_name())
 
     def testCopyAccount404s(self):
         acct = self.env.conn.account_name
@@ -1526,44 +1584,44 @@ class TestFile(Base):
                 # invalid source container
                 source_cont = self.env.account.container(Utils.create_name())
                 file_item = source_cont.file(source_filename)
-                self.assertFalse(file_item.copy_account(
-                    acct,
-                    '%s%s' % (prefix, self.env.container),
-                    Utils.create_name()))
+                self.assertRaises(ResponseError, file_item.copy_account,
+                                  acct,
+                                  '%s%s' % (prefix, self.env.container),
+                                  Utils.create_name())
                 # there is no such source container but user has
                 # permissions to do a GET (done internally via COPY) for
                 # objects in his own account.
                 self.assert_status(404)
 
-                self.assertFalse(file_item.copy_account(
-                    acct,
-                    '%s%s' % (prefix, cont),
-                    Utils.create_name()))
+                self.assertRaises(ResponseError, file_item.copy_account,
+                                  acct,
+                                  '%s%s' % (prefix, cont),
+                                  Utils.create_name())
                 self.assert_status(404)
 
                 # invalid source object
                 file_item = self.env.container.file(Utils.create_name())
-                self.assertFalse(file_item.copy_account(
-                    acct,
-                    '%s%s' % (prefix, self.env.container),
-                    Utils.create_name()))
+                self.assertRaises(ResponseError, file_item.copy_account,
+                                  acct,
+                                  '%s%s' % (prefix, self.env.container),
+                                  Utils.create_name())
                 # there is no such source container but user has
                 # permissions to do a GET (done internally via COPY) for
                 # objects in his own account.
                 self.assert_status(404)
 
-                self.assertFalse(file_item.copy_account(
-                    acct,
-                    '%s%s' % (prefix, cont),
-                    Utils.create_name()))
+                self.assertRaises(ResponseError, file_item.copy_account,
+                                  acct,
+                                  '%s%s' % (prefix, cont),
+                                  Utils.create_name())
                 self.assert_status(404)
 
                 # invalid destination container
                 file_item = self.env.container.file(source_filename)
-                self.assertFalse(file_item.copy_account(
-                    acct,
-                    '%s%s' % (prefix, Utils.create_name()),
-                    Utils.create_name()))
+                self.assertRaises(ResponseError, file_item.copy_account,
+                                  acct,
+                                  '%s%s' % (prefix, Utils.create_name()),
+                                  Utils.create_name())
                 if acct == acct2:
                     # there is no such destination container
                     # and foreign user can have no permission to write there
@@ -1577,9 +1635,9 @@ class TestFile(Base):
         file_item.write_random()
 
         file_item = self.env.container.file(source_filename)
-        self.assertFalse(file_item.copy(Utils.create_name(),
-                         Utils.create_name(),
-                         cfg={'no_destination': True}))
+        self.assertRaises(ResponseError, file_item.copy, Utils.create_name(),
+                          Utils.create_name(),
+                          cfg={'no_destination': True})
         self.assert_status(412)
 
     def testCopyDestinationSlashProblems(self):
@@ -1588,15 +1646,15 @@ class TestFile(Base):
         file_item.write_random()
 
         # no slash
-        self.assertFalse(file_item.copy(Utils.create_name(),
-                         Utils.create_name(),
-                         cfg={'destination': Utils.create_name()}))
+        self.assertRaises(ResponseError, file_item.copy, Utils.create_name(),
+                          Utils.create_name(),
+                          cfg={'destination': Utils.create_name()})
         self.assert_status(412)
 
         # too many slashes
-        self.assertFalse(file_item.copy(Utils.create_name(),
-                         Utils.create_name(),
-                         cfg={'destination': '//%s' % Utils.create_name()}))
+        self.assertRaises(ResponseError, file_item.copy, Utils.create_name(),
+                          Utils.create_name(),
+                          cfg={'destination': '//%s' % Utils.create_name()})
         self.assert_status(412)
 
     def testCopyFromHeader(self):
@@ -2473,6 +2531,7 @@ class TestFile(Base):
         self.assertEqual(1024, f_dict['bytes'])
         self.assertEqual('text/foobar', f_dict['content_type'])
         self.assertEqual(etag, f_dict['hash'])
+        put_last_modified = f_dict['last_modified']
 
         # now POST updated content-type to each file
         file_item = self.env.container.file(file_name)
@@ -2497,6 +2556,7 @@ class TestFile(Base):
             self.fail('Failed to find file %r in listing' % file_name)
         self.assertEqual(1024, f_dict['bytes'])
         self.assertEqual('image/foobarbaz', f_dict['content_type'])
+        self.assertLess(put_last_modified, f_dict['last_modified'])
         self.assertEqual(etag, f_dict['hash'])
 
 

@@ -36,15 +36,16 @@ from collections import defaultdict
 from contextlib import contextmanager
 from textwrap import dedent
 
-from eventlet import sleep, spawn, wsgi, listen, Timeout, tpool, greenthread
+from eventlet import sleep, spawn, wsgi, Timeout, tpool, greenthread
 from eventlet.green import httplib
 
 from nose import SkipTest
 
 from swift import __version__ as swift_version
 from swift.common.http import is_success
+from test import listen_zero
 from test.unit import FakeLogger, debug_logger, mocked_http_conn, \
-    make_timestamp_iter, DEFAULT_TEST_EC_TYPE
+    make_timestamp_iter, DEFAULT_TEST_EC_TYPE, mock_check_drive
 from test.unit import connect_tcp, readuntil2crlfs, patch_policies, \
     encode_frag_archive_bodies
 from swift.obj import server as object_server
@@ -98,6 +99,39 @@ def fake_spawn():
         finally:
             for gt in greenlets:
                 gt.wait()
+
+
+class TestTpoolSize(unittest.TestCase):
+    def test_default_config(self):
+        with mock.patch('eventlet.tpool.set_num_threads') as mock_snt:
+            object_server.ObjectController({})
+        self.assertEqual([], mock_snt.mock_calls)
+
+    def test_explicit_setting(self):
+        conf = {'eventlet_tpool_num_threads': '17'}
+        with mock.patch('eventlet.tpool.set_num_threads') as mock_snt:
+            object_server.ObjectController(conf)
+        self.assertEqual([mock.call(17)], mock_snt.mock_calls)
+
+    def test_servers_per_port_no_explicit_setting(self):
+        conf = {'servers_per_port': '3'}
+        with mock.patch('eventlet.tpool.set_num_threads') as mock_snt:
+            object_server.ObjectController(conf)
+        self.assertEqual([mock.call(1)], mock_snt.mock_calls)
+
+    def test_servers_per_port_with_explicit_setting(self):
+        conf = {'eventlet_tpool_num_threads': '17',
+                'servers_per_port': '3'}
+        with mock.patch('eventlet.tpool.set_num_threads') as mock_snt:
+            object_server.ObjectController(conf)
+        self.assertEqual([mock.call(17)], mock_snt.mock_calls)
+
+    def test_servers_per_port_empty(self):
+        # run_wsgi is robust to this, so we should be too
+        conf = {'servers_per_port': ''}
+        with mock.patch('eventlet.tpool.set_num_threads') as mock_snt:
+            object_server.ObjectController(conf)
+        self.assertEqual([], mock_snt.mock_calls)
 
 
 @patch_policies(test_policies)
@@ -2520,7 +2554,7 @@ class TestObjectController(unittest.TestCase):
         self.assertEqual(resp.status_int, 404)
 
     def test_PUT_ssync_multi_frag(self):
-        timestamp = utils.Timestamp(time()).internal
+        timestamp = utils.Timestamp.now().internal
 
         def put_with_index(expected_rsp, frag_index, node_index=None):
             data_file_tail = '#%d#d.data' % frag_index
@@ -2728,6 +2762,68 @@ class TestObjectController(unittest.TestCase):
         self.assertEqual(resp.headers['Server'],
                          (server_handler.server_type + '/' + swift_version))
 
+    def test_insufficient_storage_mount_check_true(self):
+        conf = {'devices': self.testdir, 'mount_check': 'true'}
+        object_controller = object_server.ObjectController(conf)
+        for policy in POLICIES:
+            mgr = object_controller._diskfile_router[policy]
+            self.assertTrue(mgr.mount_check)
+        for method in object_controller.allowed_methods:
+            if method in ('OPTIONS', 'SSYNC'):
+                continue
+            path = '/sda1/p/'
+            if method == 'REPLICATE':
+                path += 'suff'
+            else:
+                path += 'a/c/o'
+            req = Request.blank(path, method=method,
+                                headers={'x-timestamp': '1',
+                                         'content-type': 'app/test',
+                                         'content-length': 0})
+            with mock_check_drive() as mocks:
+                try:
+                    resp = req.get_response(object_controller)
+                    self.assertEqual(resp.status_int, 507)
+                    mocks['ismount'].return_value = True
+                    resp = req.get_response(object_controller)
+                    self.assertNotEqual(resp.status_int, 507)
+                    # feel free to rip out this last assertion...
+                    expected = 2 if method in ('PUT', 'REPLICATE') else 4
+                    self.assertEqual(resp.status_int // 100, expected)
+                except AssertionError as e:
+                    self.fail('%s for %s' % (e, method))
+
+    def test_insufficient_storage_mount_check_false(self):
+        conf = {'devices': self.testdir, 'mount_check': 'false'}
+        object_controller = object_server.ObjectController(conf)
+        for policy in POLICIES:
+            mgr = object_controller._diskfile_router[policy]
+            self.assertFalse(mgr.mount_check)
+        for method in object_controller.allowed_methods:
+            if method in ('OPTIONS', 'SSYNC'):
+                continue
+            path = '/sda1/p/'
+            if method == 'REPLICATE':
+                path += 'suff'
+            else:
+                path += 'a/c/o'
+            req = Request.blank(path, method=method,
+                                headers={'x-timestamp': '1',
+                                         'content-type': 'app/test',
+                                         'content-length': 0})
+            with mock_check_drive() as mocks:
+                try:
+                    resp = req.get_response(object_controller)
+                    self.assertEqual(resp.status_int, 507)
+                    mocks['isdir'].return_value = True
+                    resp = req.get_response(object_controller)
+                    self.assertNotEqual(resp.status_int, 507)
+                    # feel free to rip out this last assertion...
+                    expected = 2 if method in ('PUT', 'REPLICATE') else 4
+                    self.assertEqual(resp.status_int // 100, expected)
+                except AssertionError as e:
+                    self.fail('%s for %s' % (e, method))
+
     def test_GET(self):
         # Test swift.obj.server.ObjectController.GET
         req = Request.blank('/sda1/p/a/c', environ={'REQUEST_METHOD': 'GET'})
@@ -2892,7 +2988,7 @@ class TestObjectController(unittest.TestCase):
 
     def test_GET_if_match_etag_is_at(self):
         headers = {
-            'X-Timestamp': utils.Timestamp(time()).internal,
+            'X-Timestamp': utils.Timestamp.now().internal,
             'Content-Type': 'application/octet-stream',
             'X-Object-Meta-Xtag': 'madeup',
             'X-Object-Sysmeta-Xtag': 'alternate madeup',
@@ -3985,7 +4081,7 @@ class TestObjectController(unittest.TestCase):
         def mock_diskfile_delete(self, timestamp):
             raise DiskFileNoSpace()
 
-        t_put = utils.Timestamp(time())
+        t_put = utils.Timestamp.now()
         req = Request.blank('/sda1/p/a/c/o',
                             environ={'REQUEST_METHOD': 'PUT'},
                             headers={'X-Timestamp': t_put.internal,
@@ -3996,7 +4092,7 @@ class TestObjectController(unittest.TestCase):
 
         with mock.patch('swift.obj.diskfile.BaseDiskFile.delete',
                         mock_diskfile_delete):
-            t_delete = utils.Timestamp(time())
+            t_delete = utils.Timestamp.now()
             req = Request.blank('/sda1/p/a/c/o',
                                 environ={'REQUEST_METHOD': 'DELETE'},
                                 headers={'X-Timestamp': t_delete.internal})
@@ -4153,7 +4249,7 @@ class TestObjectController(unittest.TestCase):
         req = Request.blank('/sda1/p/a/c/o', method='GET')
         resp = req.get_response(self.object_controller)
         self.assertEqual(resp.status_int, 404)
-        self.assertEqual(resp.headers['X-Timestamp'], None)
+        self.assertIsNone(resp.headers['X-Timestamp'])
         self.assertEqual(resp.headers['X-Backend-Timestamp'], offset_delete)
         # and one more delete with a newer timestamp
         delete_timestamp = next(self.ts).internal
@@ -4184,7 +4280,7 @@ class TestObjectController(unittest.TestCase):
         req = Request.blank('/sda1/p/a/c/o', method='GET')
         resp = req.get_response(self.object_controller)
         self.assertEqual(resp.status_int, 404)
-        self.assertEqual(resp.headers['X-Timestamp'], None)
+        self.assertIsNone(resp.headers['X-Timestamp'])
         self.assertEqual(resp.headers['X-Backend-Timestamp'], delete_timestamp)
 
     def test_call_bad_request(self):
@@ -4365,7 +4461,7 @@ class TestObjectController(unittest.TestCase):
         self.assertEqual(outbuf.getvalue()[:4], '405 ')
 
     def test_chunked_put(self):
-        listener = listen(('localhost', 0))
+        listener = listen_zero()
         port = listener.getsockname()[1]
         killer = spawn(wsgi.server, listener, self.object_controller,
                        NullLogger())
@@ -4394,7 +4490,7 @@ class TestObjectController(unittest.TestCase):
         killer.kill()
 
     def test_chunked_content_length_mismatch_zero(self):
-        listener = listen(('localhost', 0))
+        listener = listen_zero()
         port = listener.getsockname()[1]
         killer = spawn(wsgi.server, listener, self.object_controller,
                        NullLogger())
@@ -4797,6 +4893,9 @@ class TestObjectController(unittest.TestCase):
         def capture_updates(ip, port, method, path, headers, *args, **kwargs):
             container_updates.append((ip, port, method, path, headers))
 
+        # put everything in the future; otherwise setting X-Delete-At may fail
+        self.ts = make_timestamp_iter(10)
+
         put_timestamp = next(self.ts).internal
         delete_at_timestamp = utils.normalize_delete_at_timestamp(
             next(self.ts).normal)
@@ -4824,6 +4923,7 @@ class TestObjectController(unittest.TestCase):
                 500, 500, give_connect=capture_updates) as fake_conn:
             with fake_spawn():
                 resp = req.get_response(self.object_controller)
+            self.assertEqual(201, resp.status_int, resp.body)
         self.assertRaises(StopIteration, fake_conn.code_iter.next)
         self.assertEqual(resp.status_int, 201)
         self.assertEqual(2, len(container_updates))
@@ -5168,7 +5268,9 @@ class TestObjectController(unittest.TestCase):
         diskfile_mgr.pickle_async_update = fake_pickle_async_update
         with mocked_http_conn(500) as fake_conn, fake_spawn():
             resp = req.get_response(self.object_controller)
-            self.assertRaises(StopIteration, fake_conn.code_iter.next)
+        # fake_spawn() above waits on greenthreads to finish;
+        # don't start making assertions until then
+        self.assertRaises(StopIteration, fake_conn.code_iter.next)
         self.assertEqual(resp.status_int, 201)
         self.assertEqual(len(given_args), 7)
         (objdevice, account, container, obj, data, timestamp,
@@ -5671,7 +5773,8 @@ class TestObjectController(unittest.TestCase):
                 given_args[5], 'sda1', policy])
 
     def test_GET_but_expired(self):
-        test_time = time() + 10000
+        now = time()
+        test_time = now + 10000
         delete_at_timestamp = int(test_time + 100)
         delete_at_container = str(
             delete_at_timestamp /
@@ -5694,50 +5797,57 @@ class TestObjectController(unittest.TestCase):
         resp = req.get_response(self.object_controller)
         self.assertEqual(resp.status_int, 200)
 
-        orig_time = object_server.time.time
-        try:
-            t = time()
-            object_server.time.time = lambda: t
-            delete_at_timestamp = int(t + 1)
-            delete_at_container = str(
-                delete_at_timestamp /
-                self.object_controller.expiring_objects_container_divisor *
-                self.object_controller.expiring_objects_container_divisor)
-            put_timestamp = normalize_timestamp(test_time - 1000)
-            req = Request.blank(
-                '/sda1/p/a/c/o',
-                environ={'REQUEST_METHOD': 'PUT'},
-                headers={'X-Timestamp': put_timestamp,
-                         'X-Delete-At': str(delete_at_timestamp),
-                         'X-Delete-At-Container': delete_at_container,
-                         'Content-Length': '4',
-                         'Content-Type': 'application/octet-stream'})
-            req.body = 'TEST'
+        delete_at_timestamp = int(now + 1)
+        delete_at_container = str(
+            delete_at_timestamp /
+            self.object_controller.expiring_objects_container_divisor *
+            self.object_controller.expiring_objects_container_divisor)
+        put_timestamp = normalize_timestamp(test_time - 1000)
+        req = Request.blank(
+            '/sda1/p/a/c/o',
+            environ={'REQUEST_METHOD': 'PUT'},
+            headers={'X-Timestamp': put_timestamp,
+                     'X-Delete-At': str(delete_at_timestamp),
+                     'X-Delete-At-Container': delete_at_container,
+                     'Content-Length': '4',
+                     'Content-Type': 'application/octet-stream'})
+        req.body = 'TEST'
+
+        # fix server time to now: delete-at is in future, verify GET is ok
+        with mock.patch('swift.obj.server.time.time', return_value=now):
             resp = req.get_response(self.object_controller)
             self.assertEqual(resp.status_int, 201)
+
             req = Request.blank(
                 '/sda1/p/a/c/o',
                 environ={'REQUEST_METHOD': 'GET'},
                 headers={'X-Timestamp': normalize_timestamp(test_time)})
             resp = req.get_response(self.object_controller)
             self.assertEqual(resp.status_int, 200)
-        finally:
-            object_server.time.time = orig_time
 
-        orig_time = object_server.time.time
-        try:
-            t = time() + 2
-            object_server.time.time = lambda: t
+        # fix server time to now + 2: delete-at is in past, verify GET fails...
+        with mock.patch('swift.obj.server.time.time', return_value=now + 2):
             req = Request.blank(
                 '/sda1/p/a/c/o',
                 environ={'REQUEST_METHOD': 'GET'},
-                headers={'X-Timestamp': normalize_timestamp(t)})
+                headers={'X-Timestamp': normalize_timestamp(now + 2)})
             resp = req.get_response(self.object_controller)
             self.assertEqual(resp.status_int, 404)
             self.assertEqual(resp.headers['X-Backend-Timestamp'],
                              utils.Timestamp(put_timestamp))
-        finally:
-            object_server.time.time = orig_time
+            # ...unless X-Backend-Replication is sent
+            expected = {
+                'GET': 'TEST',
+                'HEAD': '',
+            }
+            for meth, expected_body in expected.items():
+                req = Request.blank(
+                    '/sda1/p/a/c/o', method=meth,
+                    headers={'X-Timestamp': normalize_timestamp(now + 2),
+                             'X-Backend-Replication': 'True'})
+                resp = req.get_response(self.object_controller)
+                self.assertEqual(resp.status_int, 200)
+                self.assertEqual(expected_body, resp.body)
 
     def test_HEAD_but_expired(self):
         test_time = time() + 10000
@@ -5764,15 +5874,14 @@ class TestObjectController(unittest.TestCase):
         resp = req.get_response(self.object_controller)
         self.assertEqual(resp.status_int, 200)
 
-        orig_time = object_server.time.time
-        try:
-            t = time()
-            delete_at_timestamp = int(t + 1)
+        # fix server time to now: delete-at is in future, verify GET is ok
+        now = time()
+        with mock.patch('swift.obj.server.time.time', return_value=now):
+            delete_at_timestamp = int(now + 1)
             delete_at_container = str(
                 delete_at_timestamp /
                 self.object_controller.expiring_objects_container_divisor *
                 self.object_controller.expiring_objects_container_divisor)
-            object_server.time.time = lambda: t
             put_timestamp = normalize_timestamp(test_time - 1000)
             req = Request.blank(
                 '/sda1/p/a/c/o',
@@ -5791,23 +5900,16 @@ class TestObjectController(unittest.TestCase):
                 headers={'X-Timestamp': normalize_timestamp(test_time)})
             resp = req.get_response(self.object_controller)
             self.assertEqual(resp.status_int, 200)
-        finally:
-            object_server.time.time = orig_time
 
-        orig_time = object_server.time.time
-        try:
-            t = time() + 2
-            object_server.time.time = lambda: t
+        with mock.patch('swift.obj.server.time.time', return_value=now + 2):
             req = Request.blank(
                 '/sda1/p/a/c/o',
                 environ={'REQUEST_METHOD': 'HEAD'},
-                headers={'X-Timestamp': normalize_timestamp(time())})
+                headers={'X-Timestamp': normalize_timestamp(now + 2)})
             resp = req.get_response(self.object_controller)
             self.assertEqual(resp.status_int, 404)
             self.assertEqual(resp.headers['X-Backend-Timestamp'],
                              utils.Timestamp(put_timestamp))
-        finally:
-            object_server.time.time = orig_time
 
     def test_POST_but_expired(self):
         test_time = time() + 10000
@@ -5834,7 +5936,7 @@ class TestObjectController(unittest.TestCase):
         resp = req.get_response(self.object_controller)
         self.assertEqual(resp.status_int, 202)
 
-        delete_at_timestamp = int(time() + 1)
+        delete_at_timestamp = int(time() + 2)
         delete_at_container = str(
             delete_at_timestamp /
             self.object_controller.expiring_objects_container_divisor *
@@ -5852,7 +5954,7 @@ class TestObjectController(unittest.TestCase):
 
         orig_time = object_server.time.time
         try:
-            t = time() + 2
+            t = time() + 3
             object_server.time.time = lambda: t
             req = Request.blank(
                 '/sda1/p/a/c/o',
@@ -6184,22 +6286,6 @@ class TestObjectController(unittest.TestCase):
         finally:
             tpool.execute = was_tpool_exe
             diskfile.DiskFileManager._get_hashes = was_get_hashes
-
-    def test_REPLICATE_insufficient_storage(self):
-        conf = {'devices': self.testdir, 'mount_check': 'true'}
-        self.object_controller = object_server.ObjectController(
-            conf, logger=debug_logger())
-        self.object_controller.bytes_per_sync = 1
-
-        def fake_check_mount(*args, **kwargs):
-            return False
-
-        with mock.patch("swift.obj.diskfile.check_mount", fake_check_mount):
-            req = Request.blank('/sda1/p/suff',
-                                environ={'REQUEST_METHOD': 'REPLICATE'},
-                                headers={})
-            resp = req.get_response(self.object_controller)
-        self.assertEqual(resp.status_int, 507)
 
     def test_REPLICATE_reclaims_tombstones(self):
         conf = {'devices': self.testdir, 'mount_check': False,
@@ -6825,7 +6911,7 @@ class TestObjectController(unittest.TestCase):
 
         # phase1 - PUT request with object metadata in footer and
         # multiphase commit conversation
-        put_timestamp = utils.Timestamp(time()).internal
+        put_timestamp = utils.Timestamp.now().internal
         headers = {
             'Content-Type': 'text/plain',
             'X-Timestamp': put_timestamp,
@@ -6871,7 +6957,7 @@ class TestObjectServer(unittest.TestCase):
         self.logger = debug_logger('test-object-server')
         self.app = object_server.ObjectController(
             self.conf, logger=self.logger)
-        sock = listen(('127.0.0.1', 0))
+        sock = listen_zero()
         self.server = spawn(wsgi.server, sock, self.app, utils.NullLogger())
         self.port = sock.getsockname()[1]
 
@@ -6892,7 +6978,7 @@ class TestObjectServer(unittest.TestCase):
             'Expect': '100-continue',
             'Content-Length': len(test_body),
             'Content-Type': 'application/test',
-            'X-Timestamp': utils.Timestamp(time()).internal,
+            'X-Timestamp': utils.Timestamp.now().internal,
         }
         conn = bufferedhttp.http_connect('127.0.0.1', self.port, 'sda1', '0',
                                          'PUT', '/a/c/o', headers=headers)
@@ -6910,7 +6996,7 @@ class TestObjectServer(unittest.TestCase):
             'Expect': '100-continue',
             'Content-Length': len(test_body),
             'Content-Type': 'application/test',
-            'X-Timestamp': utils.Timestamp(time()).internal,
+            'X-Timestamp': utils.Timestamp.now().internal,
             'X-Backend-Obj-Metadata-Footer': 'yes',
             'X-Backend-Obj-Multipart-Mime-Boundary': 'boundary123',
         }
@@ -6924,7 +7010,7 @@ class TestObjectServer(unittest.TestCase):
 
     def test_expect_on_put_conflict(self):
         test_body = 'test'
-        put_timestamp = utils.Timestamp(time())
+        put_timestamp = utils.Timestamp.now()
         headers = {
             'Expect': '100-continue',
             'Content-Length': len(test_body),
@@ -6953,7 +7039,7 @@ class TestObjectServer(unittest.TestCase):
 
     def test_multiphase_put_no_mime_boundary(self):
         test_data = 'obj data'
-        put_timestamp = utils.Timestamp(time()).internal
+        put_timestamp = utils.Timestamp.now().internal
         headers = {
             'Content-Type': 'text/plain',
             'X-Timestamp': put_timestamp,
@@ -6970,7 +7056,7 @@ class TestObjectServer(unittest.TestCase):
         resp.close()
 
     def test_expect_on_multiphase_put_diconnect(self):
-        put_timestamp = utils.Timestamp(time()).internal
+        put_timestamp = utils.Timestamp.now().internal
         headers = {
             'Content-Type': 'text/plain',
             'X-Timestamp': put_timestamp,
@@ -7064,7 +7150,7 @@ class TestObjectServer(unittest.TestCase):
             'X-Backend-Obj-Multiphase-Commit': 'yes',
         }
         put_timestamp = utils.Timestamp(headers.setdefault(
-            'X-Timestamp', utils.Timestamp(time()).internal))
+            'X-Timestamp', utils.Timestamp.now().internal))
         container_update = \
             'swift.obj.server.ObjectController.container_update'
         with mock.patch(container_update) as _container_update:
@@ -7173,7 +7259,7 @@ class TestObjectServer(unittest.TestCase):
             "--boundary123",
         ))
 
-        put_timestamp = utils.Timestamp(time()).internal
+        put_timestamp = utils.Timestamp.now().internal
         headers = {
             'Content-Type': 'text/plain',
             'X-Timestamp': put_timestamp,
@@ -7255,6 +7341,19 @@ class TestObjectServer(unittest.TestCase):
         obj_datafile = found_files['.data'][0]
         self.assertEqual("%s#2#d.data" % put_timestamp.internal,
                          os.path.basename(obj_datafile))
+
+        with open(obj_datafile) as fd:
+            actual_meta = diskfile.read_metadata(fd)
+        expected_meta = {'Content-Length': '82',
+                         'name': '/a/c/o',
+                         'X-Object-Sysmeta-Ec-Frag-Index': '2',
+                         'X-Timestamp': put_timestamp.normal,
+                         'Content-Type': 'text/plain'}
+        for k, v in actual_meta.items():
+            self.assertIsInstance(k, six.binary_type)
+            self.assertIsInstance(v, six.binary_type)
+        self.assertIsNotNone(actual_meta.pop('ETag', None))
+        self.assertEqual(expected_meta, actual_meta)
         # but no other files
         self.assertFalse(found_files['.data'][1:])
         found_files.pop('.data')
@@ -7325,7 +7424,7 @@ class TestObjectServer(unittest.TestCase):
 
         # phase1 - PUT request with multiphase commit conversation
         # no object metadata in footer
-        put_timestamp = utils.Timestamp(time()).internal
+        put_timestamp = utils.Timestamp.now().internal
         headers = {
             'Content-Type': 'text/plain',
             'X-Timestamp': put_timestamp,
@@ -7547,7 +7646,7 @@ class TestZeroCopy(unittest.TestCase):
         self.df_mgr = diskfile.DiskFileManager(
             conf, self.object_controller.logger)
 
-        listener = listen(('localhost', 0))
+        listener = listen_zero()
         port = listener.getsockname()[1]
         self.wsgi_greenlet = spawn(
             wsgi.server, listener, self.object_controller, NullLogger())

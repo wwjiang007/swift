@@ -6,9 +6,7 @@ consistent object/blob store. You create, modify, and get objects and
 metadata by using the Object Storage API, which is implemented as a set
 of Representational State Transfer (REST) web services.
 
-For an introduction to OpenStack Object Storage, see `Object
-Storage <http://docs.openstack.org/admin-guide/objectstorage.html>`
-in the *OpenStack Administrator Guide*.
+For an introduction to OpenStack Object Storage, see the :doc:`/admin/index`.
 
 You use the HTTPS (SSL) protocol to interact with Object Storage, and
 you use standard HTTP calls to perform API operations. You can also use
@@ -171,14 +169,14 @@ The API Reference describes the operations that you can perform with the
 Object Storage API:
 
 -  `Storage
-   accounts <http://developer.openstack.org/api-ref/object-storage/index.html#accounts>`__:
+   accounts <https://developer.openstack.org/api-ref/object-storage/index.html#accounts>`__:
    Use to perform account-level tasks.
 
    Lists containers for a specified account. Creates, updates, and
    deletes account metadata. Shows account metadata.
 
 -  `Storage
-   containers <http://developer.openstack.org/api-ref/object-storage/index.html#containers>`__:
+   containers <https://developer.openstack.org/api-ref/object-storage/index.html#containers>`__:
    Use to perform container-level tasks.
 
    Lists objects in a specified container. Creates, shows details for,
@@ -186,7 +184,7 @@ Object Storage API:
    container metadata.
 
 -  `Storage
-   objects <http://developer.openstack.org/api-ref/object-storage/index.html#objects>`__:
+   objects <https://developer.openstack.org/api-ref/object-storage/index.html#objects>`__:
    Use to perform object-level tasks.
 
    Creates, replaces, shows details for, and deletes objects. Copies

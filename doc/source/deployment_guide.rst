@@ -411,11 +411,20 @@ Object Server Configuration
 An Example Object Server configuration can be found at
 etc/object-server.conf-sample in the source code repository.
 
-The following configuration options are available:
+The following configuration sections are available:
+
+* :ref:`[DEFAULT] <object-server-default-options>`
+* `[object-server]`_
+* `[object-replicator]`_
+* `[object-reconstructor]`_
+* `[object-updater]`_
+* `[object-auditor]`_
 
 .. _object-server-default-options:
 
+*********
 [DEFAULT]
+*********
 
 ================================ ==========  ============================================
 Option                           Default     Description
@@ -550,7 +559,9 @@ ionice_priority                  None        I/O scheduling priority of server
 
 .. _object-server-options:
 
+***************
 [object-server]
+***************
 
 =============================  ====================== ===============================================
 Option                         Default                Description
@@ -651,9 +662,24 @@ ionice_priority                None                   I/O scheduling priority of
                                                       priority of the process. Work only with
                                                       ionice_class.
                                                       Ignored if IOPRIO_CLASS_IDLE is set.
+eventlet_tpool_num_threads     auto                   The number of threads in eventlet's thread pool.
+                                                      Most IO will occur in the object server's main
+                                                      thread, but certain "heavy" IO operations will
+                                                      occur in separate IO threads, managed by
+                                                      eventlet.
+                                                      The default value is auto, whose actual value
+                                                      is dependent on the servers_per_port value.
+                                                      If servers_per_port is zero then it uses
+                                                      eventlet's default (currently 20 threads).
+                                                      If the servers_per_port is nonzero then it'll
+                                                      only use 1 thread per process.
+                                                      This value can be overridden with an integer
+                                                      value.
 =============================  ====================== ===============================================
 
+*******************
 [object-replicator]
+*******************
 
 ===========================  ========================  ================================
 Option                       Default                   Description
@@ -770,11 +796,104 @@ ionice_priority              None                      I/O scheduling priority o
                                                        is set.
 ===========================  ========================  ================================
 
-[object-updater]
+**********************
+[object-reconstructor]
+**********************
 
-==================  =================== ==========================================
+===========================  ========================  ================================
+Option                       Default                   Description
+---------------------------  ------------------------  --------------------------------
+log_name                     object-reconstructor      Label used when logging
+log_facility                 LOG_LOCAL0                Syslog log facility
+log_level                    INFO                      Logging level
+log_address                  /dev/log                  Logging directory
+daemonize                    yes                       Whether or not to run
+                                                       reconstruction as a daemon
+interval                     30                        Time in seconds to wait between
+                                                       reconstruction passes
+reconstructor_workers        0                         Maximum number of worker processes
+                                                       to spawn.  Each worker will handle
+                                                       a subset of devices.  Devices will
+                                                       be assigned evenly among the workers
+                                                       so that workers cycle at similar
+                                                       intervals (which can lead to fewer
+                                                       workers than requested).  You can not
+                                                       have more workers than devices.  If
+                                                       you have no devices only a single
+                                                       worker is spawned.
+concurrency                  1                         Number of reconstruction threads to
+                                                       spawn per reconstructor process.
+stats_interval               300                       Interval in seconds between
+                                                       logging reconstruction statistics
+handoffs_only                false                     The handoffs_only mode option is for
+                                                       special case emergency situations
+                                                       during rebalance such as disk full in
+                                                       the cluster.  This option SHOULD NOT
+                                                       BE CHANGED, except for extreme
+                                                       situations.  When handoffs_only mode
+                                                       is enabled the reconstructor will
+                                                       *only* revert fragments from handoff
+                                                       nodes to primary nodes and will not
+                                                       sync primary nodes with neighboring
+                                                       primary nodes.  This will force the
+                                                       reconstructor to sync and delete
+                                                       handoffs' fragments more quickly and
+                                                       minimize the time of the rebalance by
+                                                       limiting the number of rebuilds.  The
+                                                       handoffs_only option is only for
+                                                       temporary use and should be disabled
+                                                       as soon as the emergency situation
+                                                       has been resolved.
+node_timeout                 DEFAULT or 10             Request timeout to external
+                                                       services. The value used is the value
+                                                       set in this section, or the value set
+                                                       in the DEFAULT section, or 10.
+http_timeout                 60                        Max duration of an http request.
+                                                       This is for REPLICATE finalization
+                                                       calls and so should be longer
+                                                       than node_timeout.
+lockup_timeout               1800                      Attempts to kill all threads if
+                                                       no fragment has been reconstructed
+                                                       for lockup_timeout seconds.
+ring_check_interval          15                        Interval for checking new ring
+                                                       file
+recon_cache_path             /var/cache/swift          Path to recon cache
+nice_priority                None                      Scheduling priority of server
+                                                       processes. Niceness values
+                                                       range from -20 (most favorable
+                                                       to the process) to 19 (least
+                                                       favorable to the process).
+                                                       The default does not modify
+                                                       priority.
+ionice_class                 None                      I/O scheduling class of server
+                                                       processes. I/O niceness class
+                                                       values are IOPRIO_CLASS_RT (realtime),
+                                                       IOPRIO_CLASS_BE (best-effort),
+                                                       and IOPRIO_CLASS_IDLE (idle).
+                                                       The default does not modify
+                                                       class and priority.
+                                                       Linux supports io scheduling
+                                                       priorities and classes since
+                                                       2.6.13 with the CFQ io scheduler.
+                                                       Work only with ionice_priority.
+ionice_priority              None                      I/O scheduling priority of server
+                                                       processes. I/O niceness priority
+                                                       is a number which goes from
+                                                       0 to 7. The higher the value,
+                                                       the lower the I/O priority of
+                                                       the process.
+                                                       Work only with ionice_class.
+                                                       Ignored if IOPRIO_CLASS_IDLE
+                                                       is set.
+===========================  ========================  ================================
+
+****************
+[object-updater]
+****************
+
+=================== =================== ==========================================
 Option              Default             Description
-------------------  ------------------- ------------------------------------------
+------------------- ------------------- ------------------------------------------
 log_name            object-updater      Label used when logging
 log_facility        LOG_LOCAL0          Syslog log facility
 log_level           INFO                Logging level
@@ -785,7 +904,11 @@ node_timeout        DEFAULT or 10       Request timeout to external services. Th
                                         uses what's set here, or what's set in the
                                         DEFAULT section, or 10 (though other
                                         sections use 3 as the final default).
-slowdown            0.01                Time in seconds to wait between objects
+objects_per_second  50                  Maximum objects updated per second.
+                                        Should be tuned according to individual
+                                        system specs. 0 is unlimited.
+slowdown            0.01                Time in seconds to wait between objects.
+                                        Deprecated in favor of objects_per_second.
 recon_cache_path    /var/cache/swift    Path to recon cache
 nice_priority       None                Scheduling priority of server processes.
                                         Niceness values range from -20 (most
@@ -808,9 +931,11 @@ ionice_priority     None                I/O scheduling priority of server
                                         priority of the process. Work only with
                                         ionice_class.
                                         Ignored if IOPRIO_CLASS_IDLE is set.
-==================  =================== ==========================================
+=================== =================== ==========================================
 
+****************
 [object-auditor]
+****************
 
 =========================== =================== ==========================================
 Option                      Default             Description
@@ -869,9 +994,19 @@ Container Server Configuration
 An example Container Server configuration can be found at
 etc/container-server.conf-sample in the source code repository.
 
-The following configuration options are available:
+The following configuration sections are available:
 
+* :ref:`[DEFAULT] <container_server_default_options>`
+* `[container-server]`_
+* `[container-replicator]`_
+* `[container-updater]`_
+* `[container-auditor]`_
+
+.. _container_server_default_options:
+
+*********
 [DEFAULT]
+*********
 
 ===============================  ==========  ============================================
 Option                           Default     Description
@@ -962,7 +1097,9 @@ ionice_priority                  None        I/O scheduling priority of server p
                                              Ignored if IOPRIO_CLASS_IDLE is set.
 ===============================  ==========  ============================================
 
+******************
 [container-server]
+******************
 
 ==============================  ================  ========================================
 Option                          Default           Description
@@ -1016,7 +1153,9 @@ ionice_priority                 None              I/O scheduling priority of ser
                                                   Ignored if IOPRIO_CLASS_IDLE is set.
 ==============================  ================  ========================================
 
+**********************
 [container-replicator]
+**********************
 
 ==================  ===========================  =============================
 Option              Default                      Description
@@ -1107,7 +1246,9 @@ ionice_priority     None                         I/O scheduling priority of
                                                  is set.
 ==================  ===========================  =============================
 
+*******************
 [container-updater]
+*******************
 
 ========================  =================  ==================================
 Option                    Default            Description
@@ -1122,8 +1263,13 @@ node_timeout              3                  Request timeout to external
                                              services
 conn_timeout              0.5                Connection timeout to external
                                              services
+containers_per_second     50                 Maximum containers updated per second.
+                                             Should be tuned according to individual
+                                             system specs. 0 is unlimited.
+
 slowdown                  0.01               Time in seconds to wait between
-                                             containers
+                                             containers. Deprecated in favor of
+                                             containers_per_second.
 account_suppression_time  60                 Seconds to suppress updating an
                                              account that has generated an
                                              error (timeout, not yet found,
@@ -1154,7 +1300,9 @@ ionice_priority           None               I/O scheduling priority of server
                                              Ignored if IOPRIO_CLASS_IDLE is set.
 ========================  =================  ==================================
 
+*******************
 [container-auditor]
+*******************
 
 =====================  =================  =======================================
 Option                 Default            Description
@@ -1199,9 +1347,19 @@ Account Server Configuration
 An example Account Server configuration can be found at
 etc/account-server.conf-sample in the source code repository.
 
-The following configuration options are available:
+The following configuration sections are available:
 
+* :ref:`[DEFAULT] <account_server_default_options>`
+* `[account-server]`_
+* `[account-replicator]`_
+* `[account-auditor]`_
+* `[account-reaper]`_
+
+.. _account_server_default_options:
+
+*********
 [DEFAULT]
+*********
 
 ===============================  ==========  =============================================
 Option                           Default     Description
@@ -1292,7 +1450,9 @@ ionice_priority                  None        I/O scheduling priority of server p
                                              Ignored if IOPRIO_CLASS_IDLE is set.
 ===============================  ==========  =============================================
 
+****************
 [account-server]
+****************
 
 =============================  ==============  ==========================================
 Option                         Default         Description
@@ -1343,7 +1503,9 @@ ionice_priority                None            I/O scheduling priority of server
                                                Ignored if IOPRIO_CLASS_IDLE is set.
 =============================  ==============  ==========================================
 
+********************
 [account-replicator]
+********************
 
 ==================  =========================  ===============================
 Option              Default                    Description
@@ -1429,7 +1591,9 @@ ionice_priority     None                       I/O scheduling priority of server
                                                is set.
 ==================  =========================  ===============================
 
+*****************
 [account-auditor]
+*****************
 
 ====================  ================  =======================================
 Option                Default           Description
@@ -1467,7 +1631,9 @@ ionice_priority       None              I/O scheduling priority of server
                                         Ignored if IOPRIO_CLASS_IDLE is set.
 ====================  ================  =======================================
 
+****************
 [account-reaper]
+****************
 
 ==================  ===============  =========================================
 Option              Default          Description
@@ -1525,9 +1691,22 @@ Proxy Server Configuration
 An example Proxy Server configuration can be found at
 etc/proxy-server.conf-sample in the source code repository.
 
-The following configuration options are available:
+The following configuration sections are available:
 
+An example Account Server configuration can be found at
+etc/account-server.conf-sample in the source code repository.
+
+The following configuration sections are available:
+
+* :ref:`[DEFAULT] <proxy_server_default_options>`
+* `[proxy-server]`_
+* Individual sections for `Proxy middlewares`_
+
+.. _proxy_server_default_options:
+
+*********
 [DEFAULT]
+*********
 
 ====================================  ========================  ========================================
 Option                                Default                   Description
@@ -1652,229 +1831,310 @@ ionice_priority                       None                      I/O scheduling p
                                                                 Ignored if IOPRIO_CLASS_IDLE is set.
 ====================================  ========================  ========================================
 
+**************
 [proxy-server]
+**************
 
-============================  ===============  =====================================
-Option                        Default          Description
-----------------------------  ---------------  -------------------------------------
-use                                            Entry point for paste.deploy for
-                                               the proxy server.  For most
-                                               cases, this should be
-                                               `egg:swift#proxy`.
-set log_name                  proxy-server     Label used when logging
-set log_facility              LOG_LOCAL0       Syslog log facility
-set log_level                 INFO             Log level
-set log_headers               True             If True, log headers in each
-                                               request
-set log_handoffs              True             If True, the proxy will log
-                                               whenever it has to failover to a
-                                               handoff node
-recheck_account_existence     60               Cache timeout in seconds to
-                                               send memcached for account
-                                               existence
-recheck_container_existence   60               Cache timeout in seconds to
-                                               send memcached for container
-                                               existence
-object_chunk_size             65536            Chunk size to read from
-                                               object servers
-client_chunk_size             65536            Chunk size to read from
-                                               clients
-memcache_servers              127.0.0.1:11211  Comma separated list of
-                                               memcached servers
-                                               ip:port or [ipv6addr]:port
-memcache_max_connections      2                Max number of connections to
-                                               each memcached server per
-                                               worker
-node_timeout                  10               Request timeout to external
-                                               services
-recoverable_node_timeout      node_timeout     Request timeout to external
-                                               services for requests that, on
-                                               failure, can be recovered
-                                               from. For example, object GET.
-client_timeout                60               Timeout to read one chunk
-                                               from a client
-conn_timeout                  0.5              Connection timeout to
-                                               external services
-error_suppression_interval    60               Time in seconds that must
-                                               elapse since the last error
-                                               for a node to be considered
-                                               no longer error limited
-error_suppression_limit       10               Error count to consider a
-                                               node error limited
-allow_account_management      false            Whether account PUTs and DELETEs
-                                               are even callable
-object_post_as_copy           false            Deprecated.
-account_autocreate            false            If set to 'true' authorized
-                                               accounts that do not yet exist
-                                               within the Swift cluster will
-                                               be automatically created.
-max_containers_per_account    0                If set to a positive value,
-                                               trying to create a container
-                                               when the account already has at
-                                               least this maximum containers
-                                               will result in a 403 Forbidden.
-                                               Note: This is a soft limit,
-                                               meaning a user might exceed the
-                                               cap for
-                                               recheck_account_existence before
-                                               the 403s kick in.
-max_containers_whitelist                       This is a comma separated list
-                                               of account names that ignore
-                                               the max_containers_per_account
-                                               cap.
-rate_limit_after_segment      10               Rate limit the download of
-                                               large object segments after
-                                               this segment is downloaded.
-rate_limit_segments_per_sec   1                Rate limit large object
-                                               downloads at this rate.
-request_node_count            2 * replicas     Set to the number of nodes to
-                                               contact for a normal request.
-                                               You can use '* replicas' at the
-                                               end to have it use the number
-                                               given times the number of
-                                               replicas for the ring being used
-                                               for the request.
-swift_owner_headers           <see the sample  These are the headers whose
-                              conf file for    values will only be shown to
-                              the list of      swift_owners. The exact
-                              default          definition of a swift_owner is
-                              headers>         up to the auth system in use,
-                                               but usually indicates
-                                               administrative responsibilities.
-sorting_method                shuffle          Storage nodes can be chosen at
-                                               random (shuffle), by using timing
-                                               measurements (timing), or by using
-                                               an explicit match (affinity).
-                                               Using timing measurements may allow
-                                               for lower overall latency, while
-                                               using affinity allows for finer
-                                               control. In both the timing and
-                                               affinity cases, equally-sorting nodes
-                                               are still randomly chosen to spread
-                                               load.
-timing_expiry                 300              If the "timing" sorting_method is
-                                               used, the timings will only be valid
-                                               for the number of seconds configured
-                                               by timing_expiry.
-concurrent_gets               off              Use replica count number of
-                                               threads concurrently during a
-                                               GET/HEAD and return with the
-                                               first successful response. In
-                                               the EC case, this parameter only
-                                               effects an EC HEAD as an EC GET
-                                               behaves differently.
-concurrency_timeout           conn_timeout     This parameter controls how long
-                                               to wait before firing off the
-                                               next concurrent_get thread. A
-                                               value of 0 would we fully concurrent
-                                               any other number will stagger the
-                                               firing of the threads. This number
-                                               should be between 0 and node_timeout.
-                                               The default is conn_timeout (0.5).
-nice_priority                 None             Scheduling priority of server
-                                               processes.
-                                               Niceness values range from -20 (most
-                                               favorable to the process) to 19 (least
-                                               favorable to the process). The default
-                                               does not modify priority.
-ionice_class                  None             I/O scheduling class of server
-                                               processes. I/O niceness class values
-                                               are IOPRIO_CLASS_RT (realtime),
-                                               IOPRIO_CLASS_BE (best-effort),
-                                               and IOPRIO_CLASS_IDLE (idle).
-                                               The default does not modify class and
-                                               priority. Linux supports io scheduling
-                                               priorities and classes since 2.6.13
-                                               with the CFQ io scheduler.
-                                               Work only with ionice_priority.
-ionice_priority               None             I/O scheduling priority of server
-                                               processes. I/O niceness priority is
-                                               a number which goes from 0 to 7.
-                                               The higher the value, the lower the
-                                               I/O priority of the process. Work
-                                               only with ionice_class.
-                                               Ignored if IOPRIO_CLASS_IDLE is set.
-============================  ===============  =====================================
+======================================  ===============  =====================================
+Option                                  Default          Description
+--------------------------------------  ---------------  -------------------------------------
+use                                                      Entry point for paste.deploy for
+                                                         the proxy server.  For most
+                                                         cases, this should be
+                                                         `egg:swift#proxy`.
+set log_name                            proxy-server     Label used when logging
+set log_facility                        LOG_LOCAL0       Syslog log facility
+set log_level                           INFO             Log level
+set log_headers                         True             If True, log headers in each
+                                                         request
+set log_handoffs                        True             If True, the proxy will log
+                                                         whenever it has to failover to a
+                                                         handoff node
+recheck_account_existence               60               Cache timeout in seconds to
+                                                         send memcached for account
+                                                         existence
+recheck_container_existence             60               Cache timeout in seconds to
+                                                         send memcached for container
+                                                         existence
+object_chunk_size                       65536            Chunk size to read from
+                                                         object servers
+client_chunk_size                       65536            Chunk size to read from
+                                                         clients
+memcache_servers                        127.0.0.1:11211  Comma separated list of
+                                                         memcached servers
+                                                         ip:port or [ipv6addr]:port
+memcache_max_connections                2                Max number of connections to
+                                                         each memcached server per
+                                                         worker
+node_timeout                            10               Request timeout to external
+                                                         services
+recoverable_node_timeout                node_timeout     Request timeout to external
+                                                         services for requests that, on
+                                                         failure, can be recovered
+                                                         from. For example, object GET.
+client_timeout                          60               Timeout to read one chunk
+                                                         from a client
+conn_timeout                            0.5              Connection timeout to
+                                                         external services
+error_suppression_interval              60               Time in seconds that must
+                                                         elapse since the last error
+                                                         for a node to be considered
+                                                         no longer error limited
+error_suppression_limit                 10               Error count to consider a
+                                                         node error limited
+allow_account_management                false            Whether account PUTs and DELETEs
+                                                         are even callable
+account_autocreate                      false            If set to 'true' authorized
+                                                         accounts that do not yet exist
+                                                         within the Swift cluster will
+                                                         be automatically created.
+max_containers_per_account              0                If set to a positive value,
+                                                         trying to create a container
+                                                         when the account already has at
+                                                         least this maximum containers
+                                                         will result in a 403 Forbidden.
+                                                         Note: This is a soft limit,
+                                                         meaning a user might exceed the
+                                                         cap for
+                                                         recheck_account_existence before
+                                                         the 403s kick in.
+max_containers_whitelist                                 This is a comma separated list
+                                                         of account names that ignore
+                                                         the max_containers_per_account
+                                                         cap.
+rate_limit_after_segment                10               Rate limit the download of
+                                                         large object segments after
+                                                         this segment is downloaded.
+rate_limit_segments_per_sec             1                Rate limit large object
+                                                         downloads at this rate.
+request_node_count                      2 * replicas     Set to the number of nodes to
+                                                         contact for a normal request.
+                                                         You can use '* replicas' at the
+                                                         end to have it use the number
+                                                         given times the number of
+                                                         replicas for the ring being used
+                                                         for the request.
+swift_owner_headers                     <see the sample  These are the headers whose
+                                        conf file for    values will only be shown to
+                                        the list of      swift_owners. The exact
+                                        default          definition of a swift_owner is
+                                        headers>         up to the auth system in use,
+                                                         but usually indicates
+                                                         administrative responsibilities.
+sorting_method                          shuffle          Storage nodes can be chosen at
+                                                         random (shuffle), by using timing
+                                                         measurements (timing), or by using
+                                                         an explicit match (affinity).
+                                                         Using timing measurements may allow
+                                                         for lower overall latency, while
+                                                         using affinity allows for finer
+                                                         control. In both the timing and
+                                                         affinity cases, equally-sorting nodes
+                                                         are still randomly chosen to spread
+                                                         load. This option may be overridden
+                                                         in a per-policy configuration
+                                                         section.
+timing_expiry                           300              If the "timing" sorting_method is
+                                                         used, the timings will only be valid
+                                                         for the number of seconds configured
+                                                         by timing_expiry.
+concurrent_gets                         off              Use replica count number of
+                                                         threads concurrently during a
+                                                         GET/HEAD and return with the
+                                                         first successful response. In
+                                                         the EC case, this parameter only
+                                                         effects an EC HEAD as an EC GET
+                                                         behaves differently.
+concurrency_timeout                     conn_timeout     This parameter controls how long
+                                                         to wait before firing off the
+                                                         next concurrent_get thread. A
+                                                         value of 0 would we fully concurrent
+                                                         any other number will stagger the
+                                                         firing of the threads. This number
+                                                         should be between 0 and node_timeout.
+                                                         The default is conn_timeout (0.5).
+nice_priority                           None             Scheduling priority of server
+                                                         processes.
+                                                         Niceness values range from -20 (most
+                                                         favorable to the process) to 19 (least
+                                                         favorable to the process). The default
+                                                         does not modify priority.
+ionice_class                            None             I/O scheduling class of server
+                                                         processes. I/O niceness class values
+                                                         are IOPRIO_CLASS_RT (realtime),
+                                                         IOPRIO_CLASS_BE (best-effort),
+                                                         and IOPRIO_CLASS_IDLE (idle).
+                                                         The default does not modify class and
+                                                         priority. Linux supports io scheduling
+                                                         priorities and classes since 2.6.13
+                                                         with the CFQ io scheduler.
+                                                         Work only with ionice_priority.
+ionice_priority                         None             I/O scheduling priority of server
+                                                         processes. I/O niceness priority is
+                                                         a number which goes from 0 to 7.
+                                                         The higher the value, the lower the
+                                                         I/O priority of the process. Work
+                                                         only with ionice_class.
+                                                         Ignored if IOPRIO_CLASS_IDLE is set.
+read_affinity                           None             Specifies which backend servers to
+                                                         prefer on reads; used in conjunction
+                                                         with the sorting_method option being
+                                                         set to 'affinity'. Format is a comma
+                                                         separated list of affinity descriptors
+                                                         of the form <selection>=<priority>.
+                                                         The <selection> may be r<N> for
+                                                         selecting nodes in region N or
+                                                         r<N>z<M> for selecting nodes in
+                                                         region N, zone M. The <priority>
+                                                         value should be a whole number
+                                                         that represents the priority to
+                                                         be given to the selection; lower
+                                                         numbers are higher priority.
+                                                         Default is empty, meaning no
+                                                         preference. This option may be
+                                                         overridden in a per-policy
+                                                         configuration section.
+write_affinity                          None             Specifies which backend servers to
+                                                         prefer on writes. Format is a comma
+                                                         separated list of affinity
+                                                         descriptors of the form r<N> for
+                                                         region N or r<N>z<M> for region N,
+                                                         zone M. Default is empty, meaning no
+                                                         preference. This option may be
+                                                         overridden in a per-policy
+                                                         configuration section.
+write_affinity_node_count               2 * replicas     The number of local (as governed by
+                                                         the write_affinity setting) nodes to
+                                                         attempt to contact first on writes,
+                                                         before any non-local ones. The value
+                                                         should be an integer number, or use
+                                                         '* replicas' at the end to have it
+                                                         use the number given times the number
+                                                         of replicas for the ring being used
+                                                         for the request. This option may be
+                                                         overridden in a per-policy
+                                                         configuration section.
+write_affinity_handoff_delete_count     auto             The number of local (as governed by
+                                                         the write_affinity setting) handoff
+                                                         nodes to attempt to contact on
+                                                         deletion, in addition to primary
+                                                         nodes. Example: in geographically
+                                                         distributed deployment, If replicas=3,
+                                                         sometimes there may be 1 primary node
+                                                         and 2 local handoff nodes in one region
+                                                         holding the object after uploading but
+                                                         before object replicated to the
+                                                         appropriate locations in other regions.
+                                                         In this case, include these handoff
+                                                         nodes to send request when deleting
+                                                         object could help make correct decision
+                                                         for the response. The default value 'auto'
+                                                         means Swift will calculate the number
+                                                         automatically, the default value is
+                                                         (replicas - len(local_primary_nodes)).
+                                                         This option may be overridden in a
+                                                         per-policy configuration section.
+======================================  ===============  =====================================
 
-[tempauth]
+.. _proxy_server_per_policy_config:
 
-=====================  =============================== =======================
-Option                 Default                         Description
----------------------  ------------------------------- -----------------------
-use                                                    Entry point for
-                                                       paste.deploy to use for
-                                                       auth. To use tempauth
-                                                       set to:
-                                                       `egg:swift#tempauth`
-set log_name           tempauth                        Label used when logging
-set log_facility       LOG_LOCAL0                      Syslog log facility
-set log_level          INFO                            Log level
-set log_headers        True                            If True, log headers in
-                                                       each request
-reseller_prefix        AUTH                            The naming scope for the
-                                                       auth service. Swift
-                                                       storage accounts and
-                                                       auth tokens will begin
-                                                       with this prefix.
-auth_prefix            /auth/                          The HTTP request path
-                                                       prefix for the auth
-                                                       service. Swift itself
-                                                       reserves anything
-                                                       beginning with the
-                                                       letter `v`.
-token_life             86400                           The number of seconds a
-                                                       token is valid.
-storage_url_scheme     default                         Scheme to return with
-                                                       storage URLs: http,
-                                                       https, or default
-                                                       (chooses based on what
-                                                       the server is running
-                                                       as) This can be useful
-                                                       with an SSL load
-                                                       balancer in front of a
-                                                       non-SSL server.
-=====================  =============================== =======================
+************************
+Per policy configuration
+************************
 
-Additionally, you need to list all the accounts/users you want here. The format
-is::
+Some proxy-server configuration options may be overridden for individual
+:doc:`overview_policies` by including per-policy config section(s). These
+options are:
 
-    user_<account>_<user> = <key> [group] [group] [...] [storage_url]
+- ``sorting_method``
+- ``read_affinity``
+- ``write_affinity``
+- ``write_affinity_node_count``
+- ``write_affinity_handoff_delete_count``
 
-or if you want to be able to include underscores in the ``<account>`` or
-``<user>`` portions, you can base64 encode them (with *no* equal signs) in a
-line like this::
+The per-policy config section name must be of the form::
 
-    user64_<account_b64>_<user_b64> = <key> [group] [group] [...] [storage_url]
+    [proxy-server:policy:<policy index>]
 
-There are special groups of::
+.. note::
 
-    .reseller_admin = can do anything to any account for this auth
-    .admin = can do anything within the account
+    The per-policy config section name should refer to the policy index, not
+    the policy name.
 
-If neither of these groups are specified, the user can only access containers
-that have been explicitly allowed for them by a .admin or .reseller_admin.
+.. note::
 
-The trailing optional storage_url allows you to specify an alternate URL to
-hand back to the user upon authentication. If not specified, this defaults to::
+    The first part of proxy-server config section name must match the name of
+    the proxy-server config section. This is typically ``proxy-server`` as
+    shown above, but if different then the names of any per-policy config
+    sections must be changed accordingly.
 
-    $HOST/v1/<reseller_prefix>_<account>
+The value of an option specified in a per-policy section will override any
+value given in the proxy-server section for that policy only. Otherwise the
+value of these options will be that specified in the proxy-server section.
 
-Where $HOST will do its best to resolve to what the requester would need to use
-to reach this host, <reseller_prefix> is from this section, and <account> is
-from the user_<account>_<user> name. Note that $HOST cannot possibly handle
-when you have a load balancer in front of it that does https while TempAuth
-itself runs with http; in such a case, you'll have to specify the
-storage_url_scheme configuration value as an override.
+For example, the following section provides policy-specific options for a
+policy with index ``3``::
 
-Here are example entries, required for running the tests::
+    [proxy-server:policy:3]
+    sorting_method = affinity
+    read_affinity = r2=1
+    write_affinity = r2
+    write_affinity_node_count = 1 * replicas
+    write_affinity_handoff_delete_count = 2
 
-    user_admin_admin = admin .admin .reseller_admin
-    user_test_tester = testing .admin
-    user_test2_tester2 = testing2 .admin
-    user_test_tester3 = testing3
+.. note::
 
-    # account "test_y" and user "tester_y" (note the lack of padding = chars)
-    user64_dGVzdF95_dGVzdGVyX3k = testing4 .admin
+    It is recommended that per-policy config options are *not* included in the
+    ``[DEFAULT]`` section. If they are then the following behavior applies.
+
+    Per-policy config sections will inherit options in the ``[DEFAULT]``
+    section of the config file, and any such inheritance will take precedence
+    over inheriting options from the proxy-server config section.
+
+    Per-policy config section options will override options in the
+    ``[DEFAULT]`` section. Unlike the behavior described under `General Server
+    Configuration`_ for paste-deploy ``filter`` and ``app`` sections, the
+    ``set`` keyword is not required for options to override in per-policy
+    config sections.
+
+    For example, given the following settings in a config file::
+
+        [DEFAULT]
+        sorting_method = affinity
+        read_affinity = r0=100
+        write_affinity = r0
+
+        [app:proxy-server]
+        use = egg:swift#proxy
+        # use of set keyword here overrides [DEFAULT] option
+        set read_affinity = r1=100
+        # without set keyword, [DEFAULT] option overrides in a paste-deploy section
+        write_affinity = r1
+
+        [proxy-server:policy:0]
+        sorting_method = affinity
+        # set keyword not required here to override [DEFAULT] option
+        write_affinity = r1
+
+    would result in policy with index ``0`` having settings:
+
+    * ``read_affinity = r0=100`` (inherited from the ``[DEFAULT]`` section)
+    * ``write_affinity = r1`` (specified in the policy 0 section)
+
+    and any other policy would have the default settings of:
+
+    * ``read_affinity = r1=100`` (set in the proxy-server section)
+    * ``write_affinity = r0`` (inherited from the ``[DEFAULT]`` section)
+
+*****************
+Proxy Middlewares
+*****************
+
+Many features in Swift are implemented as middleware in the proxy-server
+pipeline. See :doc:`middleware` and the ``proxy-server.conf-sample`` file for
+more information. In particular, the use of some type of :doc:`authentication
+and authorization middleware <overview_auth>` is highly recommended.
+
 
 ------------------------
 Memcached Considerations

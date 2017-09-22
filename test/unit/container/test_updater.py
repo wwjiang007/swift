@@ -23,13 +23,15 @@ from shutil import rmtree
 from tempfile import mkdtemp
 from test.unit import FakeLogger
 
-from eventlet import spawn, Timeout, listen
+from eventlet import spawn, Timeout
 
 from swift.common import utils
 from swift.container import updater as container_updater
 from swift.container.backend import ContainerBroker, DATADIR
 from swift.common.ring import RingData
 from swift.common.utils import normalize_timestamp
+
+from test import listen_zero
 
 
 class TestContainerUpdater(unittest.TestCase):
@@ -82,6 +84,48 @@ class TestContainerUpdater(unittest.TestCase):
         self.assertEqual(cu.node_timeout, 5.5)
         self.assertEqual(cu.account_suppression_time, 0)
         self.assertTrue(cu.get_account_ring() is not None)
+
+    def test_conf_params(self):
+        # defaults
+        daemon = container_updater.ContainerUpdater({})
+        self.assertEqual(daemon.devices, '/srv/node')
+        self.assertEqual(daemon.mount_check, True)
+        self.assertEqual(daemon.swift_dir, '/etc/swift')
+        self.assertEqual(daemon.interval, 300)
+        self.assertEqual(daemon.concurrency, 4)
+        self.assertEqual(daemon.max_containers_per_second, 50.0)
+
+        # non-defaults
+        conf = {
+            'devices': '/some/where/else',
+            'mount_check': 'huh?',
+            'swift_dir': '/not/here',
+            'interval': '600',
+            'concurrency': '2',
+            'containers_per_second': '10.5',
+        }
+        daemon = container_updater.ContainerUpdater(conf)
+        self.assertEqual(daemon.devices, '/some/where/else')
+        self.assertEqual(daemon.mount_check, False)
+        self.assertEqual(daemon.swift_dir, '/not/here')
+        self.assertEqual(daemon.interval, 600)
+        self.assertEqual(daemon.concurrency, 2)
+        self.assertEqual(daemon.max_containers_per_second, 10.5)
+
+        # check deprecated option
+        daemon = container_updater.ContainerUpdater({'slowdown': '0.04'})
+        self.assertEqual(daemon.max_containers_per_second, 20.0)
+
+        def check_bad(conf):
+            with self.assertRaises(ValueError):
+                container_updater.ContainerUpdater(conf)
+
+        check_bad({'interval': 'foo'})
+        check_bad({'interval': '300.0'})
+        check_bad({'concurrency': 'bar'})
+        check_bad({'concurrency': '1.0'})
+        check_bad({'slowdown': 'baz'})
+        check_bad({'containers_per_second': 'quux'})
 
     @mock.patch.object(container_updater, 'ismount')
     @mock.patch.object(container_updater.ContainerUpdater, 'container_sweep')
@@ -164,7 +208,7 @@ class TestContainerUpdater(unittest.TestCase):
                 traceback.print_exc()
                 return err
             return None
-        bindsock = listen(('127.0.0.1', 0))
+        bindsock = listen_zero()
 
         def spawn_accepts():
             events = []
@@ -236,7 +280,7 @@ class TestContainerUpdater(unittest.TestCase):
                 return err
             return None
 
-        bindsock = listen(('127.0.0.1', 0))
+        bindsock = listen_zero()
 
         def spawn_accepts():
             events = []

@@ -17,7 +17,6 @@ import os
 import shutil
 import tempfile
 import unittest
-import time
 
 from swift.common import utils
 from swift.common.storage_policy import POLICIES
@@ -75,10 +74,10 @@ class BaseTest(unittest.TestCase):
                        account='a', container='c', obj='o', body='test',
                        extra_metadata=None, policy=None,
                        frag_index=None, timestamp=None, df_mgr=None,
-                       commit=True):
+                       commit=True, verify=True):
         policy = policy or POLICIES.legacy
         object_parts = account, container, obj
-        timestamp = Timestamp(time.time()) if timestamp is None else timestamp
+        timestamp = Timestamp.now() if timestamp is None else timestamp
         if df_mgr is None:
             df_mgr = self.daemon._df_router[policy]
         df = df_mgr.get_diskfile(
@@ -86,7 +85,7 @@ class BaseTest(unittest.TestCase):
             frag_index=frag_index)
         write_diskfile(df, timestamp, data=body, extra_metadata=extra_metadata,
                        commit=commit)
-        if commit:
+        if commit and verify:
             # when we write and commit stub data, sanity check it's readable
             # and not quarantined because of any validation check
             with df.open():

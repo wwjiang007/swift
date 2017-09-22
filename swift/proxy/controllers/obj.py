@@ -24,7 +24,6 @@
 #   These shenanigans are to ensure all related objects can be garbage
 # collected. We've seen objects hang around forever otherwise.
 
-import six
 from six.moves.urllib.parse import unquote
 
 import collections
@@ -65,7 +64,7 @@ from swift.common.http import (
 from swift.common.storage_policy import (POLICIES, REPL_POLICY, EC_POLICY,
                                          ECDriverError, PolicyError)
 from swift.proxy.controllers.base import Controller, delay_denial, \
-    cors_validation, ResumingGetter
+    cors_validation, ResumingGetter, update_headers
 from swift.common.swob import HTTPAccepted, HTTPBadRequest, HTTPNotFound, \
     HTTPPreconditionFailed, HTTPRequestEntityTooLarge, HTTPRequestTimeout, \
     HTTPServerError, HTTPServiceUnavailable, HTTPClientDisconnect, \
@@ -129,7 +128,8 @@ class BaseObjectController(Controller):
         self.container_name = unquote(container_name)
         self.object_name = unquote(object_name)
 
-    def iter_nodes_local_first(self, ring, partition):
+    def iter_nodes_local_first(self, ring, partition, policy=None,
+                               local_handoffs_first=False):
         """
         Yields nodes for a ring partition.
 
@@ -142,30 +142,49 @@ class BaseObjectController(Controller):
 
         :param ring: ring to get nodes from
         :param partition: ring partition to yield nodes for
+        :param policy: optional, an instance of
+            :class:`~swift.common.storage_policy.BaseStoragePolicy`
+        :param local_handoffs_first: optional, if True prefer primaries and
+            local handoff nodes first before looking elsewhere.
         """
-
-        is_local = self.app.write_affinity_is_local_fn
+        policy_options = self.app.get_policy_options(policy)
+        is_local = policy_options.write_affinity_is_local_fn
         if is_local is None:
-            return self.app.iter_nodes(ring, partition)
+            return self.app.iter_nodes(ring, partition, policy=policy)
 
         primary_nodes = ring.get_part_nodes(partition)
-        num_locals = self.app.write_affinity_node_count(len(primary_nodes))
+        handoff_nodes = ring.get_more_nodes(partition)
+        all_nodes = itertools.chain(primary_nodes, handoff_nodes)
 
-        all_nodes = itertools.chain(primary_nodes,
-                                    ring.get_more_nodes(partition))
-        first_n_local_nodes = list(itertools.islice(
-            six.moves.filter(is_local, all_nodes), num_locals))
+        if local_handoffs_first:
+            num_locals = policy_options.write_affinity_handoff_delete_count
+            if num_locals is None:
+                local_primaries = [node for node in primary_nodes
+                                   if is_local(node)]
+                num_locals = len(primary_nodes) - len(local_primaries)
 
-        # refresh it; it moved when we computed first_n_local_nodes
-        all_nodes = itertools.chain(primary_nodes,
-                                    ring.get_more_nodes(partition))
-        local_first_node_iter = itertools.chain(
-            first_n_local_nodes,
-            six.moves.filter(lambda node: node not in first_n_local_nodes,
-                             all_nodes))
+            first_local_handoffs = list(itertools.islice(
+                (node for node in handoff_nodes if is_local(node)), num_locals)
+            )
+            preferred_nodes = primary_nodes + first_local_handoffs
+        else:
+            num_locals = policy_options.write_affinity_node_count_fn(
+                len(primary_nodes)
+            )
+            preferred_nodes = list(itertools.islice(
+                (node for node in all_nodes if is_local(node)), num_locals)
+            )
+            # refresh it; it moved when we computed preferred_nodes
+            handoff_nodes = ring.get_more_nodes(partition)
+            all_nodes = itertools.chain(primary_nodes, handoff_nodes)
 
-        return self.app.iter_nodes(
-            ring, partition, node_iter=local_first_node_iter)
+        node_iter = itertools.chain(
+            preferred_nodes,
+            (node for node in all_nodes if node not in preferred_nodes)
+        )
+
+        return self.app.iter_nodes(ring, partition, node_iter=node_iter,
+                                   policy=policy)
 
     def GETorHEAD(self, req):
         """Handle HTTP GET or HEAD requests."""
@@ -184,7 +203,7 @@ class BaseObjectController(Controller):
                 return aresp
         partition = obj_ring.get_part(
             self.account_name, self.container_name, self.object_name)
-        node_iter = self.app.iter_nodes(obj_ring, partition)
+        node_iter = self.app.iter_nodes(obj_ring, partition, policy=policy)
 
         resp = self._get_or_head_response(req, node_iter, partition, policy)
 
@@ -235,10 +254,13 @@ class BaseObjectController(Controller):
                                        container_info['storage_policy'])
         obj_ring = self.app.get_object_ring(policy_index)
         req.headers['X-Backend-Storage-Policy-Index'] = policy_index
+        next_part_power = getattr(obj_ring, 'next_part_power', None)
+        if next_part_power:
+            req.headers['X-Backend-Next-Part-Power'] = next_part_power
         partition, nodes = obj_ring.get_nodes(
             self.account_name, self.container_name, self.object_name)
 
-        req.headers['X-Timestamp'] = Timestamp(time.time()).internal
+        req.headers['X-Timestamp'] = Timestamp.now().internal
 
         headers = self._backend_requests(
             req, len(nodes), container_partition, container_nodes,
@@ -445,7 +467,7 @@ class BaseObjectController(Controller):
                          'was %r' % req.headers['x-timestamp'])
             req.headers['X-Timestamp'] = req_timestamp.internal
         else:
-            req.headers['X-Timestamp'] = Timestamp(time.time()).internal
+            req.headers['X-Timestamp'] = Timestamp.now().internal
         return None
 
     def _check_failure_put_connections(self, putters, req, min_conns):
@@ -541,7 +563,7 @@ class BaseObjectController(Controller):
         """
         obj_ring = policy.object_ring
         node_iter = GreenthreadSafeIterator(
-            self.iter_nodes_local_first(obj_ring, partition))
+            self.iter_nodes_local_first(obj_ring, partition, policy=policy))
         pile = GreenPile(len(nodes))
 
         for nheaders in outgoing_headers:
@@ -590,10 +612,12 @@ class BaseObjectController(Controller):
         raise NotImplementedError()
 
     def _delete_object(self, req, obj_ring, partition, headers):
-        """
-        send object DELETE request to storage nodes. Subclasses of
-        the BaseObjectController can provide their own implementation
-        of this method.
+        """Delete object considering write-affinity.
+
+        When deleting object in write affinity deployment, also take configured
+        handoff nodes number into consideration, instead of just sending
+        requests to primary nodes. Otherwise (write-affinity is disabled),
+        go with the same way as before.
 
         :param req: the DELETE Request
         :param obj_ring: the object ring
@@ -601,11 +625,37 @@ class BaseObjectController(Controller):
         :param headers: system headers to storage nodes
         :return: Response object
         """
-        # When deleting objects treat a 404 status as 204.
+        policy_index = req.headers.get('X-Backend-Storage-Policy-Index')
+        policy = POLICIES.get_by_index(policy_index)
+
+        node_count = None
+        node_iterator = None
+
+        policy_options = self.app.get_policy_options(policy)
+        is_local = policy_options.write_affinity_is_local_fn
+        if is_local is not None:
+            primaries = obj_ring.get_part_nodes(partition)
+            node_count = len(primaries)
+
+            local_handoffs = policy_options.write_affinity_handoff_delete_count
+            if local_handoffs is None:
+                local_primaries = [node for node in primaries
+                                   if is_local(node)]
+                local_handoffs = len(primaries) - len(local_primaries)
+
+            node_count += local_handoffs
+
+            node_iterator = self.iter_nodes_local_first(
+                obj_ring, partition, policy=policy, local_handoffs_first=True
+            )
+
         status_overrides = {404: 204}
         resp = self.make_requests(req, obj_ring,
                                   partition, 'DELETE', req.swift_entity_path,
-                                  headers, overrides=status_overrides)
+                                  headers, overrides=status_overrides,
+                                  node_count=node_count,
+                                  node_iterator=node_iterator)
+
         return resp
 
     def _post_object(self, req, obj_ring, partition, headers):
@@ -643,6 +693,9 @@ class BaseObjectController(Controller):
 
         # pass the policy index to storage nodes via req header
         req.headers['X-Backend-Storage-Policy-Index'] = policy_index
+        next_part_power = getattr(obj_ring, 'next_part_power', None)
+        if next_part_power:
+            req.headers['X-Backend-Next-Part-Power'] = next_part_power
         req.acl = container_info['write_acl']
         req.environ['swift_sync_key'] = container_info['sync_key']
 
@@ -701,6 +754,9 @@ class BaseObjectController(Controller):
         obj_ring = self.app.get_object_ring(policy_index)
         # pass the policy index to storage nodes via req header
         req.headers['X-Backend-Storage-Policy-Index'] = policy_index
+        next_part_power = getattr(obj_ring, 'next_part_power', None)
+        if next_part_power:
+            req.headers['X-Backend-Next-Part-Power'] = next_part_power
         container_partition = container_info['partition']
         container_nodes = container_info['nodes']
         req.acl = container_info['write_acl']
@@ -724,10 +780,22 @@ class BaseObjectController(Controller):
                          'was %r' % req.headers['x-timestamp'])
             req.headers['X-Timestamp'] = req_timestamp.internal
         else:
-            req.headers['X-Timestamp'] = Timestamp(time.time()).internal
+            req.headers['X-Timestamp'] = Timestamp.now().internal
+
+        # Include local handoff nodes if write-affinity is enabled.
+        node_count = len(nodes)
+        policy = POLICIES.get_by_index(policy_index)
+        policy_options = self.app.get_policy_options(policy)
+        is_local = policy_options.write_affinity_is_local_fn
+        if is_local is not None:
+            local_handoffs = policy_options.write_affinity_handoff_delete_count
+            if local_handoffs is None:
+                local_primaries = [node for node in nodes if is_local(node)]
+                local_handoffs = len(nodes) - len(local_primaries)
+            node_count += local_handoffs
 
         headers = self._backend_requests(
-            req, len(nodes), container_partition, container_nodes)
+            req, node_count, container_partition, container_nodes)
         return self._delete_object(req, obj_ring, partition, headers)
 
 
@@ -951,7 +1019,7 @@ class ECAppIter(object):
         can also use it in the body.
 
         :returns: None
-        :raises: HTTPException on error
+        :raises HTTPException: on error
         """
         self.mime_boundary = resp.boundary
 
@@ -1469,7 +1537,7 @@ class Putter(object):
         :param informational: if True then try to get a 100-continue response,
                               otherwise try to get a final response.
         :returns: HTTPResponse
-        :raises: Timeout if the response took too long
+        :raises Timeout: if the response took too long
         """
         # don't do this update of self.resp if the Expect response during
         # connect() was actually a final response
@@ -1588,10 +1656,10 @@ class Putter(object):
 
         :returns: Putter instance
 
-        :raises: ConnectionTimeout if initial connection timed out
-        :raises: ResponseTimeout if header retrieval timed out
-        :raises: InsufficientStorage on 507 response from node
-        :raises: PutterConnectError on non-507 server error response from node
+        :raises ConnectionTimeout: if initial connection timed out
+        :raises ResponseTimeout: if header retrieval timed out
+        :raises InsufficientStorage: on 507 response from node
+        :raises PutterConnectError: on non-507 server error response from node
         """
         conn, expect_resp, final_resp, connect_duration = cls._make_connection(
             node, part, path, headers, conn_timeout, node_timeout)
@@ -1701,9 +1769,9 @@ class MIMEPutter(Putter):
 
         :param need_multiphase: if True then multiphase support is required of
                                 the object server
-        :raises: FooterNotSupported if need_metadata_footer is set but
+        :raises FooterNotSupported: if need_metadata_footer is set but
                  backend node can't process footers
-        :raises: MultiphasePUTNotSupported if need_multiphase is set but
+        :raises MultiphasePUTNotSupported: if need_multiphase is set but
                  backend node can't handle multiphase PUT
         """
         mime_boundary = "%.64x" % random.randint(0, 16 ** 64)
@@ -2272,9 +2340,9 @@ class ECObjectController(BaseObjectController):
                 self.app.logger)
             resp = Response(
                 request=req,
-                headers=resp_headers,
                 conditional_response=True,
                 app_iter=app_iter)
+            update_headers(resp, resp_headers)
             try:
                 app_iter.kickoff(req, resp)
             except HTTPException as err_resp:

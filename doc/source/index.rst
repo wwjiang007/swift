@@ -14,6 +14,7 @@
       License for the specific language governing permissions and limitations
       under the License.
 
+=================================
 Welcome to Swift's documentation!
 =================================
 
@@ -62,6 +63,7 @@ Overview and Concepts
     overview_encryption
     overview_backing_store
     ring_background
+    ring_partpower
     associated_projects
 
 Developer Documentation
@@ -91,6 +93,8 @@ Administrator Documentation
     replication_network
     logs
     ops_runbook/index
+    admin/index
+    install/index
 
 Object Storage v1 REST API Documentation
 ========================================

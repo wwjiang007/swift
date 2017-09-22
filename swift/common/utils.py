@@ -17,6 +17,7 @@
 
 from __future__ import print_function
 
+import binascii
 import errno
 import fcntl
 import grp
@@ -27,6 +28,7 @@ import operator
 import os
 import pwd
 import re
+import struct
 import sys
 import time
 import uuid
@@ -48,9 +50,12 @@ import stat
 import datetime
 
 import eventlet
+import eventlet.debug
+import eventlet.greenthread
 import eventlet.semaphore
 from eventlet import GreenPool, sleep, Timeout, tpool
 from eventlet.green import socket, threading
+from eventlet.hubs import trampoline
 import eventlet.queue
 import netifaces
 import codecs
@@ -183,6 +188,29 @@ class InvalidHashPathConfigError(ValueError):
     def __str__(self):
         return "[swift-hash]: both swift_hash_path_suffix and " \
             "swift_hash_path_prefix are missing from %s" % SWIFT_CONF_FILE
+
+
+def set_swift_dir(swift_dir):
+    """
+    Sets the directory from which swift config files will be read. If the given
+    directory differs from that already set then the swift.conf file in the new
+    directory will be validated and storage policies will be reloaded from the
+    new swift.conf file.
+
+    :param swift_dir: non-default directory to read swift.conf from
+    """
+    global HASH_PATH_SUFFIX
+    global HASH_PATH_PREFIX
+    global SWIFT_CONF_FILE
+    if (swift_dir is not None and
+            swift_dir != os.path.dirname(SWIFT_CONF_FILE)):
+        SWIFT_CONF_FILE = os.path.join(
+            swift_dir, os.path.basename(SWIFT_CONF_FILE))
+        HASH_PATH_PREFIX = ''
+        HASH_PATH_SUFFIX = ''
+        validate_configuration()
+        return True
+    return False
 
 
 def validate_hash_conf():
@@ -496,8 +524,8 @@ def get_policy_index(req_headers, res_headers):
     Returns the appropriate index of the storage policy for the request from
     a proxy server
 
-    :param req: dict of the request headers.
-    :param res: dict of the response headers.
+    :param req_headers: dict of the request headers.
+    :param res_headers: dict of the response headers.
 
     :returns: string index of storage policy, or None
     """
@@ -907,6 +935,10 @@ class Timestamp(object):
         if self.timestamp >= 10000000000:
             raise ValueError('timestamp too large')
 
+    @classmethod
+    def now(cls, offset=0, delta=0):
+        return cls(time.time(), offset=offset, delta=delta)
+
     def __repr__(self):
         return INTERNAL_FORMAT % (self.timestamp, self.offset)
 
@@ -1276,7 +1308,7 @@ def split_path(path, minsegs=1, maxsegs=None, rest_with_last=False):
                            trailing data, raises ValueError.
     :returns: list of segments with a length of maxsegs (non-existent
               segments will return as None)
-    :raises: ValueError if given an invalid path
+    :raises ValueError: if given an invalid path
     """
     if not maxsegs:
         maxsegs = minsegs
@@ -1311,7 +1343,7 @@ def validate_device_partition(device, partition):
 
     :param device: device to validate
     :param partition: partition to validate
-    :raises: ValueError if given an invalid device or partition
+    :raises ValueError: if given an invalid device or partition
     """
     if not device or '/' in device or device in ['.', '..']:
         raise ValueError('Invalid device: %s' % quote(device or ''))
@@ -1865,17 +1897,18 @@ def get_logger(conf, name=None, log_to_console=False, log_route=None,
     if udp_host:
         udp_port = int(conf.get('log_udp_port',
                                 logging.handlers.SYSLOG_UDP_PORT))
-        handler = SysLogHandler(address=(udp_host, udp_port),
-                                facility=facility)
+        handler = ThreadSafeSysLogHandler(address=(udp_host, udp_port),
+                                          facility=facility)
     else:
         log_address = conf.get('log_address', '/dev/log')
         try:
-            handler = SysLogHandler(address=log_address, facility=facility)
+            handler = ThreadSafeSysLogHandler(address=log_address,
+                                              facility=facility)
         except socket.error as e:
             # Either /dev/log isn't a UNIX socket or it does not exist at all
             if e.errno not in [errno.ENOTSOCK, errno.ENOENT]:
                 raise
-            handler = SysLogHandler(facility=facility)
+            handler = ThreadSafeSysLogHandler(facility=facility)
     handler.setFormatter(formatter)
     logger.addHandler(handler)
     get_logger.handler4logger[logger] = handler
@@ -2443,6 +2476,8 @@ def readconf(conf_path, section_name=None, log_name=None, defaults=None,
     else:
         c = ConfigParser(defaults)
     if hasattr(conf_path, 'readline'):
+        if hasattr(conf_path, 'seek'):
+            conf_path.seek(0)
         c.readfp(conf_path)
     else:
         if os.path.isdir(conf_path):
@@ -2574,7 +2609,7 @@ def remove_file(path):
 
 def audit_location_generator(devices, datadir, suffix='',
                              mount_check=True, logger=None):
-    '''
+    """
     Given a devices path and a data directory, yield (path, device,
     partition) for all files in that directory
 
@@ -2586,7 +2621,7 @@ def audit_location_generator(devices, datadir, suffix='',
     :param mount_check: Flag to check if a mount check should be performed
                     on devices
     :param logger: a logger object
-    '''
+    """
     device_dir = listdir(devices)
     # randomize devices in case of process restart before sweep completed
     shuffle(device_dir)
@@ -2636,7 +2671,7 @@ def audit_location_generator(devices, datadir, suffix='',
 
 
 def ratelimit_sleep(running_time, max_rate, incr_by=1, rate_buffer=5):
-    '''
+    """
     Will eventlet.sleep() for the appropriate time so that the max_rate
     is never exceeded.  If max_rate is 0, will not ratelimit.  The
     maximum recommended rate should not exceed (1000 * incr_by) a second
@@ -2655,7 +2690,7 @@ def ratelimit_sleep(running_time, max_rate, incr_by=1, rate_buffer=5):
                         A larger number will result in larger spikes in rate
                         but better average accuracy. Must be > 0 to engage
                         rate-limiting behavior.
-    '''
+    """
     if max_rate <= 0 or incr_by <= 0:
         return running_time
 
@@ -2682,7 +2717,7 @@ def ratelimit_sleep(running_time, max_rate, incr_by=1, rate_buffer=5):
 
 
 class ContextPool(GreenPool):
-    "GreenPool subclassed to kill its coros when it gets gc'ed"
+    """GreenPool subclassed to kill its coros when it gets gc'ed"""
 
     def __enter__(self):
         return self
@@ -2828,7 +2863,7 @@ class StreamingPile(GreenAsyncPile):
 
 
 class ModifiedParseResult(ParseResult):
-    "Parse results class for urlparse."
+    """Parse results class for urlparse."""
 
     @property
     def hostname(self):
@@ -2941,7 +2976,7 @@ def affinity_key_function(affinity_str):
     :param affinity_str: affinity config value, e.g. "r1z2=3"
                          or "r1=1, r2z1=2, r2z2=2"
     :returns: single-argument function
-    :raises: ValueError if argument invalid
+    :raises ValueError: if argument invalid
     """
     affinity_str = affinity_str.strip()
 
@@ -2991,10 +3026,10 @@ def affinity_locality_predicate(write_affinity_str):
     If affinity_str is empty or all whitespace, then the resulting function
     will consider everything local
 
-    :param affinity_str: affinity config value, e.g. "r1z2"
+    :param write_affinity_str: affinity config value, e.g. "r1z2"
         or "r1, r2z1, r2z2"
     :returns: single-argument function, or None if affinity_str is empty
-    :raises: ValueError if argument invalid
+    :raises ValueError: if argument invalid
     """
     affinity_str = write_affinity_str.strip()
 
@@ -3056,18 +3091,27 @@ def human_readable(value):
 
 def put_recon_cache_entry(cache_entry, key, item):
     """
-    Function that will check if item is a dict, and if so put it under
-    cache_entry[key].  We use nested recon cache entries when the object
-    auditor runs in parallel or else in 'once' mode with a specified
-    subset of devices.
+    Update a recon cache entry item.
+
+    If ``item`` is an empty dict then any existing ``key`` in ``cache_entry``
+    will be deleted. Similarly if ``item`` is a dict and any of its values are
+    empty dicts then the corrsponsing key will be deleted from the nested dict
+    in ``cache_entry``.
+
+    We use nested recon cache entries when the object auditor
+    runs in parallel or else in 'once' mode with a specified subset of devices.
+
+    :param cache_entry: a dict of existing cache entries
+    :param key: key for item to update
+    :param item: value for item to update
     """
     if isinstance(item, dict):
+        if not item:
+            cache_entry.pop(key, None)
+            return
         if key not in cache_entry or key in cache_entry and not \
                 isinstance(cache_entry[key], dict):
             cache_entry[key] = {}
-        elif key in cache_entry and item == {}:
-            cache_entry.pop(key, None)
-            return
         for k, v in item.items():
             if v == {}:
                 cache_entry[key].pop(k, None)
@@ -3103,7 +3147,7 @@ def dump_recon_cache(cache_dict, cache_file, logger, lock_timeout=2,
             try:
                 with NamedTemporaryFile(dir=os.path.dirname(cache_file),
                                         delete=False) as tf:
-                    tf.write(json.dumps(cache_entry) + '\n')
+                    tf.write(json.dumps(cache_entry, sort_keys=True) + '\n')
                 if set_owner:
                     os.chown(tf.name, pwd.getpwnam(set_owner).pw_uid, -1)
                 renamer(tf.name, cache_file, fsync=False)
@@ -3151,7 +3195,7 @@ def pairs(item_list):
     """
     Returns an iterator of all pairs of elements from item_list.
 
-    :param items: items (no duplicates allowed)
+    :param item_list: items (no duplicates allowed)
     """
     for i, item1 in enumerate(item_list):
         for item2 in item_list[(i + 1):]:
@@ -3583,6 +3627,12 @@ def ismount_raw(path):
         # path/.. is the same i-node as path
         return True
 
+    # Device and inode checks are not properly working inside containerized
+    # environments, therefore using a workaround to check if there is a
+    # stubfile placed by an operator
+    if os.path.isfile(os.path.join(path, ".ismount")):
+        return True
+
     return False
 
 
@@ -3626,7 +3676,7 @@ def parse_content_range(content_range):
     :param content_range: Content-Range header value to parse,
         e.g. "bytes 100-1249/49004"
     :returns: 3-tuple (start, end, total)
-    :raises: ValueError if malformed
+    :raises ValueError: if malformed
     """
     found = re.search(_content_range_pattern, content_range)
     if not found:
@@ -3808,7 +3858,7 @@ def iter_multipart_mime_documents(wsgi_input, boundary, read_chunk_size=4096):
     :param boundary: The mime boundary to separate new file-like
                      objects on.
     :returns: A generator of file-like objects for each part.
-    :raises: MimeInvalid if the document is malformed
+    :raises MimeInvalid: if the document is malformed
     """
     boundary = '--' + boundary
     blen = len(boundary) + 2  # \r\n
@@ -4236,3 +4286,145 @@ def md5_hash_for_file(fname):
         for block in iter(lambda: f.read(MD5_BLOCK_READ_BYTES), ''):
             md5sum.update(block)
     return md5sum.hexdigest()
+
+
+def replace_partition_in_path(path, part_power):
+    """
+    Takes a full path to a file and a partition power and returns
+    the same path, but with the correct partition number. Most useful when
+    increasing the partition power.
+
+    :param path: full path to a file, for example object .data file
+    :param part_power: partition power to compute correct partition number
+    :returns: Path with re-computed partition power
+    """
+
+    path_components = path.split(os.sep)
+    digest = binascii.unhexlify(path_components[-2])
+
+    part_shift = 32 - int(part_power)
+    part = struct.unpack_from('>I', digest)[0] >> part_shift
+
+    path_components[-4] = "%d" % part
+
+    return os.sep.join(path_components)
+
+
+class PipeMutex(object):
+    """
+    Mutex using a pipe. Works across both greenlets and real threads, even
+    at the same time.
+    """
+
+    def __init__(self):
+        self.rfd, self.wfd = os.pipe()
+
+        # You can't create a pipe in non-blocking mode; you must set it
+        # later.
+        rflags = fcntl.fcntl(self.rfd, fcntl.F_GETFL)
+        fcntl.fcntl(self.rfd, fcntl.F_SETFL, rflags | os.O_NONBLOCK)
+        os.write(self.wfd, b'-')  # start unlocked
+
+        self.owner = None
+        self.recursion_depth = 0
+
+        # Usually, it's an error to have multiple greenthreads all waiting
+        # to read the same file descriptor. It's often a sign of inadequate
+        # concurrency control; for example, if you have two greenthreads
+        # trying to use the same memcache connection, they'll end up writing
+        # interleaved garbage to the socket or stealing part of each others'
+        # responses.
+        #
+        # In this case, we have multiple greenthreads waiting on the same
+        # file descriptor by design. This lets greenthreads in real thread A
+        # wait with greenthreads in real thread B for the same mutex.
+        # Therefore, we must turn off eventlet's multiple-reader detection.
+        #
+        # It would be better to turn off multiple-reader detection for only
+        # our calls to trampoline(), but eventlet does not support that.
+        eventlet.debug.hub_prevent_multiple_readers(False)
+
+    def acquire(self, blocking=True):
+        """
+        Acquire the mutex.
+
+        If called with blocking=False, returns True if the mutex was
+        acquired and False if it wasn't. Otherwise, blocks until the mutex
+        is acquired and returns True.
+
+        This lock is recursive; the same greenthread may acquire it as many
+        times as it wants to, though it must then release it that many times
+        too.
+        """
+        current_greenthread_id = id(eventlet.greenthread.getcurrent())
+        if self.owner == current_greenthread_id:
+            self.recursion_depth += 1
+            return True
+
+        while True:
+            try:
+                # If there is a byte available, this will read it and remove
+                # it from the pipe. If not, this will raise OSError with
+                # errno=EAGAIN.
+                os.read(self.rfd, 1)
+                self.owner = current_greenthread_id
+                return True
+            except OSError as err:
+                if err.errno != errno.EAGAIN:
+                    raise
+
+                if not blocking:
+                    return False
+
+                # Tell eventlet to suspend the current greenthread until
+                # self.rfd becomes readable. This will happen when someone
+                # else writes to self.wfd.
+                trampoline(self.rfd, read=True)
+
+    def release(self):
+        """
+        Release the mutex.
+        """
+        current_greenthread_id = id(eventlet.greenthread.getcurrent())
+        if self.owner != current_greenthread_id:
+            raise RuntimeError("cannot release un-acquired lock")
+
+        if self.recursion_depth > 0:
+            self.recursion_depth -= 1
+            return
+
+        self.owner = None
+        os.write(self.wfd, b'X')
+
+    def close(self):
+        """
+        Close the mutex. This releases its file descriptors.
+
+        You can't use a mutex after it's been closed.
+        """
+        if self.wfd is not None:
+            os.close(self.rfd)
+            self.rfd = None
+            os.close(self.wfd)
+            self.wfd = None
+        self.owner = None
+        self.recursion_depth = 0
+
+    def __del__(self):
+        # We need this so we don't leak file descriptors. Otherwise, if you
+        # call get_logger() and don't explicitly dispose of it by calling
+        # logger.logger.handlers[0].lock.close() [1], the pipe file
+        # descriptors are leaked.
+        #
+        # This only really comes up in tests. Swift processes tend to call
+        # get_logger() once and then hang on to it until they exit, but the
+        # test suite calls get_logger() a lot.
+        #
+        # [1] and that's a completely ridiculous thing to expect callers to
+        # do, so nobody does it and that's okay.
+        self.close()
+
+
+class ThreadSafeSysLogHandler(SysLogHandler):
+    def createLock(self):
+        self.lock = PipeMutex()

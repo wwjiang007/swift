@@ -182,14 +182,6 @@ class Replicator(Daemon):
         self.rsync_module = conf.get('rsync_module', '').rstrip('/')
         if not self.rsync_module:
             self.rsync_module = '{replication_ip}::%s' % self.server_type
-            if config_true_value(conf.get('vm_test_mode', 'no')):
-                self.logger.warning('Option %(type)s-replicator/vm_test_mode '
-                                    'is deprecated and will be removed in a '
-                                    'future version. Update your configuration'
-                                    ' to use option %(type)s-replicator/'
-                                    'rsync_module.'
-                                    % {'type': self.server_type})
-                self.rsync_module += '{replication_port}'
         self.reclaim_age = float(conf.get('reclaim_age', 86400 * 7))
         swift.common.db.DB_PREALLOCATION = \
             config_true_value(conf.get('db_preallocation', 'f'))
@@ -229,9 +221,9 @@ class Replicator(Daemon):
              'replication_last': now},
             self.rcache, self.logger)
         self.logger.info(' '.join(['%s:%s' % item for item in
-                         self.stats.items() if item[0] in
+                         sorted(self.stats.items()) if item[0] in
                          ('no_change', 'hashmatch', 'rsync', 'diff', 'ts_repl',
-                          'empty', 'diff_capped')]))
+                          'empty', 'diff_capped', 'remote_merge')]))
 
     def _add_failure_stats(self, failure_devs_info):
         for node, dev in failure_devs_info:
@@ -543,7 +535,7 @@ class Replicator(Daemon):
         more_nodes = self.ring.get_more_nodes(int(partition))
         if not local_dev:
             # Check further if local device is a handoff node
-            for node in more_nodes:
+            for node in self.ring.get_more_nodes(int(partition)):
                 if node['id'] == node_id:
                     local_dev = node
                     break
@@ -559,7 +551,13 @@ class Replicator(Daemon):
                 success = self._repl_to_node(node, broker, partition, info,
                                              different_region)
             except DriveNotMounted:
-                repl_nodes.append(next(more_nodes))
+                try:
+                    repl_nodes.append(next(more_nodes))
+                except StopIteration:
+                    self.logger.error(
+                        _('ERROR There are not enough handoff nodes to reach '
+                          'replica count for partition %s'),
+                        partition)
                 self.logger.error(_('ERROR Remote drive not mounted %s'), node)
             except (Exception, Timeout):
                 self.logger.exception(_('ERROR syncing %(file)s with node'
@@ -833,6 +831,7 @@ class ReplicatorRpc(object):
             objects = existing_broker.get_items_since(point, 1000)
             sleep()
         new_broker.newid(args[0])
+        new_broker.update_metadata(existing_broker.metadata)
         renamer(old_filename, db_file)
         return HTTPNoContent()
 

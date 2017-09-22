@@ -23,7 +23,6 @@ import os
 from textwrap import dedent
 from collections import defaultdict
 
-from eventlet import listen
 import six
 from six import BytesIO
 from six import StringIO
@@ -45,6 +44,7 @@ from swift.common.swob import Request
 from swift.common import wsgi, utils
 from swift.common.storage_policy import POLICIES
 
+from test import listen_zero
 from test.unit import (
     temptree, with_tempdir, write_fake_ring, patch_policies, FakeLogger)
 
@@ -99,13 +99,13 @@ class TestWSGI(unittest.TestCase):
 
         wsgi.monkey_patch_mimetools()
         sio = StringIO('blah')
-        self.assertEqual(mimetools.Message(sio).type, None)
+        self.assertIsNone(mimetools.Message(sio).type)
         sio = StringIO('blah')
         self.assertEqual(mimetools.Message(sio).plisttext, '')
         sio = StringIO('blah')
-        self.assertEqual(mimetools.Message(sio).maintype, None)
+        self.assertIsNone(mimetools.Message(sio).maintype)
         sio = StringIO('blah')
-        self.assertEqual(mimetools.Message(sio).subtype, None)
+        self.assertIsNone(mimetools.Message(sio).subtype)
         sio = StringIO('Content-Type: text/html; charset=ISO-8859-4')
         self.assertEqual(mimetools.Message(sio).type, 'text/html')
         sio = StringIO('Content-Type: text/html; charset=ISO-8859-4')
@@ -136,22 +136,26 @@ class TestWSGI(unittest.TestCase):
             _fake_rings(t)
             app, conf, logger, log_name = wsgi.init_request_processor(
                 conf_file, 'proxy-server')
-        # verify pipeline is catch_errors -> dlo -> proxy-server
+        # verify pipeline is: catch_errors -> gatekeeper -> listing_formats ->
+        #                     copy -> dlo -> proxy-server
         expected = swift.common.middleware.catch_errors.CatchErrorMiddleware
-        self.assertTrue(isinstance(app, expected))
+        self.assertIsInstance(app, expected)
 
         app = app.app
         expected = swift.common.middleware.gatekeeper.GatekeeperMiddleware
-        self.assertTrue(isinstance(app, expected))
+        self.assertIsInstance(app, expected)
 
         app = app.app
-        expected = \
-            swift.common.middleware.copy.ServerSideCopyMiddleware
+        expected = swift.common.middleware.listing_formats.ListingFilter
+        self.assertIsInstance(app, expected)
+
+        app = app.app
+        expected = swift.common.middleware.copy.ServerSideCopyMiddleware
         self.assertIsInstance(app, expected)
 
         app = app.app
         expected = swift.common.middleware.dlo.DynamicLargeObject
-        self.assertTrue(isinstance(app, expected))
+        self.assertIsInstance(app, expected)
 
         app = app.app
         expected = \
@@ -160,7 +164,7 @@ class TestWSGI(unittest.TestCase):
 
         app = app.app
         expected = swift.proxy.server.Application
-        self.assertTrue(isinstance(app, expected))
+        self.assertIsInstance(app, expected)
         # config settings applied to app instance
         self.assertEqual(0.2, app.conn_timeout)
         # appconfig returns values from 'proxy-server' section
@@ -169,6 +173,7 @@ class TestWSGI(unittest.TestCase):
             'here': os.path.dirname(conf_file),
             'conn_timeout': '0.2',
             'swift_dir': t,
+            '__name__': 'proxy-server'
         }
         self.assertEqual(expected, conf)
         # logger works
@@ -234,6 +239,7 @@ class TestWSGI(unittest.TestCase):
             'here': conf_dir,
             'conn_timeout': '0.2',
             'swift_dir': conf_root,
+            '__name__': 'proxy-server'
         }
         self.assertEqual(expected, conf)
         # logger works
@@ -384,7 +390,7 @@ class TestWSGI(unittest.TestCase):
                         with mock.patch('swift.common.wsgi.inspect'):
                             conf = wsgi.appconfig(conf_file)
                             logger = logging.getLogger('test')
-                            sock = listen(('localhost', 0))
+                            sock = listen_zero()
                             wsgi.run_server(conf, logger, sock)
         self.assertEqual('HTTP/1.0',
                          _wsgi.HttpProtocol.default_request_version)
@@ -434,7 +440,7 @@ class TestWSGI(unittest.TestCase):
                                getargspec=argspec_stub):
                 conf = wsgi.appconfig(conf_file)
                 logger = logging.getLogger('test')
-                sock = listen(('localhost', 0))
+                sock = listen_zero()
                 wsgi.run_server(conf, logger, sock)
 
         self.assertTrue(_wsgi.server.called)
@@ -472,7 +478,7 @@ class TestWSGI(unittest.TestCase):
                                 with mock.patch('time.tzset') as mock_tzset:
                                     conf = wsgi.appconfig(conf_dir)
                                     logger = logging.getLogger('test')
-                                    sock = listen(('localhost', 0))
+                                    sock = listen_zero()
                                     wsgi.run_server(conf, logger, sock)
                                     self.assertEqual(os.environ['TZ'], 'UTC+0')
                                     self.assertEqual(mock_tzset.mock_calls,
@@ -529,7 +535,7 @@ class TestWSGI(unittest.TestCase):
                     with mock.patch('swift.common.wsgi.eventlet') as _eventlet:
                         conf = wsgi.appconfig(conf_file)
                         logger = logging.getLogger('test')
-                        sock = listen(('localhost', 0))
+                        sock = listen_zero()
                         wsgi.run_server(conf, logger, sock)
         self.assertEqual('HTTP/1.0',
                          _wsgi.HttpProtocol.default_request_version)
@@ -546,7 +552,7 @@ class TestWSGI(unittest.TestCase):
         self.assertEqual(sock, server_sock)
         self.assertTrue(isinstance(server_app, swift.proxy.server.Application))
         self.assertEqual(20, server_app.client_timeout)
-        self.assertEqual(server_logger, None)
+        self.assertIsNone(server_logger)
         self.assertTrue('custom_pool' in kwargs)
         self.assertEqual(1000, kwargs['custom_pool'].size)
 
@@ -571,7 +577,7 @@ class TestWSGI(unittest.TestCase):
         expected = {
             '__file__': os.path.join(path, 'server.conf.d'),
             'here': os.path.join(path, 'server.conf.d'),
-            'port': '8080',
+            'port': '8080', '__name__': 'main'
         }
         self.assertEqual(conf, expected)
 
@@ -602,7 +608,7 @@ class TestWSGI(unittest.TestCase):
                     environ = {}
                 if headers is None:
                     headers = {}
-                self.assertEqual(environ['swift.authorize']('test'), None)
+                self.assertIsNone(environ['swift.authorize']('test'))
                 self.assertFalse('HTTP_X_TRANS_ID' in environ)
         was_blank = Request.blank
         Request.blank = FakeReq.fake_blank
@@ -720,15 +726,17 @@ class TestWSGI(unittest.TestCase):
                                           mock_run_server):
         # Make sure the right strategy gets used in a number of different
         # config cases.
-        mock_per_port().bind_ports.return_value = 'stop early'
-        mock_workers().bind_ports.return_value = 'stop early'
+        mock_per_port().do_bind_ports.return_value = 'stop early'
+        mock_workers().do_bind_ports.return_value = 'stop early'
         logger = FakeLogger()
         stub__initrp = [
             {'__file__': 'test', 'workers': 2},  # conf
             logger,
             'log_name',
         ]
-        with mock.patch.object(wsgi, '_initrp', return_value=stub__initrp):
+        with mock.patch.object(wsgi, '_initrp', return_value=stub__initrp), \
+                mock.patch.object(wsgi, 'loadapp'), \
+                mock.patch.object(wsgi, 'capture_stdio'):
             for server_type in ('account-server', 'container-server',
                                 'object-server'):
                 mock_per_port.reset_mock()
@@ -741,7 +749,7 @@ class TestWSGI(unittest.TestCase):
                 self.assertEqual([], mock_per_port.mock_calls)
                 self.assertEqual([
                     mock.call(stub__initrp[0], logger),
-                    mock.call().bind_ports(),
+                    mock.call().do_bind_ports(),
                 ], mock_workers.mock_calls)
 
             stub__initrp[0]['servers_per_port'] = 3
@@ -756,7 +764,7 @@ class TestWSGI(unittest.TestCase):
                 self.assertEqual([], mock_per_port.mock_calls)
                 self.assertEqual([
                     mock.call(stub__initrp[0], logger),
-                    mock.call().bind_ports(),
+                    mock.call().do_bind_ports(),
                 ], mock_workers.mock_calls)
 
             mock_per_port.reset_mock()
@@ -768,7 +776,7 @@ class TestWSGI(unittest.TestCase):
             ], logger.get_lines_for_level('error'))
             self.assertEqual([
                 mock.call(stub__initrp[0], logger, servers_per_port=3),
-                mock.call().bind_ports(),
+                mock.call().do_bind_ports(),
             ], mock_per_port.mock_calls)
             self.assertEqual([], mock_workers.mock_calls)
 
@@ -909,7 +917,7 @@ class TestServersPerPortStrategy(unittest.TestCase):
         self.assertEqual(15, self.strategy.loop_timeout())
 
     def test_bind_ports(self):
-        self.strategy.bind_ports()
+        self.strategy.do_bind_ports()
 
         self.assertEqual(set((6006, 6007)), self.strategy.bind_ports)
         self.assertEqual([
@@ -936,7 +944,7 @@ class TestServersPerPortStrategy(unittest.TestCase):
 
     def test_bind_ports_ignores_setsid_errors(self):
         self.mock_setsid.side_effect = OSError()
-        self.strategy.bind_ports()
+        self.strategy.do_bind_ports()
 
         self.assertEqual(set((6006, 6007)), self.strategy.bind_ports)
         self.assertEqual([
@@ -965,7 +973,7 @@ class TestServersPerPortStrategy(unittest.TestCase):
         self.assertIsNone(self.strategy.no_fork_sock())
 
     def test_new_worker_socks(self):
-        self.strategy.bind_ports()
+        self.strategy.do_bind_ports()
         self.all_bind_ports_for_node.reset_mock()
 
         pid = 88
@@ -1100,7 +1108,7 @@ class TestServersPerPortStrategy(unittest.TestCase):
         ], self.mock_drop_privileges.mock_calls)
 
     def test_shutdown_sockets(self):
-        self.strategy.bind_ports()
+        self.strategy.do_bind_ports()
 
         with mock.patch('swift.common.wsgi.greenio') as mock_greenio:
             self.strategy.shutdown_sockets()
@@ -1140,7 +1148,7 @@ class TestWorkersStrategy(unittest.TestCase):
         self.assertEqual(0.5, self.strategy.loop_timeout())
 
     def test_binding(self):
-        self.assertIsNone(self.strategy.bind_ports())
+        self.assertIsNone(self.strategy.do_bind_ports())
 
         self.assertEqual('abc', self.strategy.sock)
         self.assertEqual([
@@ -1155,20 +1163,20 @@ class TestWorkersStrategy(unittest.TestCase):
         self.assertEqual(
             'bind_port wasn\'t properly set in the config file. '
             'It must be explicitly set to a valid port number.',
-            self.strategy.bind_ports())
+            self.strategy.do_bind_ports())
 
     def test_no_fork_sock(self):
-        self.strategy.bind_ports()
+        self.strategy.do_bind_ports()
         self.assertIsNone(self.strategy.no_fork_sock())
 
         self.conf['workers'] = 0
         self.strategy = wsgi.WorkersStrategy(self.conf, self.logger)
-        self.strategy.bind_ports()
+        self.strategy.do_bind_ports()
 
         self.assertEqual('abc', self.strategy.no_fork_sock())
 
     def test_new_worker_socks(self):
-        self.strategy.bind_ports()
+        self.strategy.do_bind_ports()
         pid = 88
         sock_count = 0
         for s, i in self.strategy.new_worker_socks():
@@ -1213,7 +1221,7 @@ class TestWorkersStrategy(unittest.TestCase):
 
     def test_shutdown_sockets(self):
         self.mock_get_socket.return_value = mock.MagicMock()
-        self.strategy.bind_ports()
+        self.strategy.do_bind_ports()
         with mock.patch('swift.common.wsgi.greenio') as mock_greenio:
             self.strategy.shutdown_sockets()
         self.assertEqual([
@@ -1474,6 +1482,7 @@ class TestPipelineModification(unittest.TestCase):
         self.assertEqual(self.pipeline_modules(app),
                          ['swift.common.middleware.catch_errors',
                           'swift.common.middleware.gatekeeper',
+                          'swift.common.middleware.listing_formats',
                           'swift.common.middleware.copy',
                           'swift.common.middleware.dlo',
                           'swift.common.middleware.versioned_writes',
@@ -1506,6 +1515,7 @@ class TestPipelineModification(unittest.TestCase):
         self.assertEqual(self.pipeline_modules(app),
                          ['swift.common.middleware.catch_errors',
                           'swift.common.middleware.gatekeeper',
+                          'swift.common.middleware.listing_formats',
                           'swift.common.middleware.copy',
                           'swift.common.middleware.dlo',
                           'swift.common.middleware.versioned_writes',
@@ -1545,6 +1555,7 @@ class TestPipelineModification(unittest.TestCase):
         self.assertEqual(self.pipeline_modules(app),
                          ['swift.common.middleware.catch_errors',
                           'swift.common.middleware.gatekeeper',
+                          'swift.common.middleware.listing_formats',
                           'swift.common.middleware.copy',
                           'swift.common.middleware.slo',
                           'swift.common.middleware.dlo',
@@ -1645,6 +1656,7 @@ class TestPipelineModification(unittest.TestCase):
         self.assertEqual(self.pipeline_modules(app), [
             'swift.common.middleware.catch_errors',
             'swift.common.middleware.gatekeeper',
+            'swift.common.middleware.listing_formats',
             'swift.common.middleware.copy',
             'swift.common.middleware.dlo',
             'swift.common.middleware.versioned_writes',
@@ -1660,6 +1672,7 @@ class TestPipelineModification(unittest.TestCase):
             'swift.common.middleware.gatekeeper',
             'swift.common.middleware.healthcheck',
             'swift.common.middleware.catch_errors',
+            'swift.common.middleware.listing_formats',
             'swift.common.middleware.copy',
             'swift.common.middleware.dlo',
             'swift.common.middleware.versioned_writes',
@@ -1674,6 +1687,7 @@ class TestPipelineModification(unittest.TestCase):
             'swift.common.middleware.healthcheck',
             'swift.common.middleware.catch_errors',
             'swift.common.middleware.gatekeeper',
+            'swift.common.middleware.listing_formats',
             'swift.common.middleware.copy',
             'swift.common.middleware.dlo',
             'swift.common.middleware.versioned_writes',
@@ -1709,7 +1723,7 @@ class TestPipelineModification(unittest.TestCase):
                 tempdir, policy.ring_name + '.ring.gz')
 
         app = wsgi.loadapp(conf_path)
-        proxy_app = app.app.app.app.app.app.app
+        proxy_app = app.app.app.app.app.app.app.app
         self.assertEqual(proxy_app.account_ring.serialized_path,
                          account_ring_path)
         self.assertEqual(proxy_app.container_ring.serialized_path,

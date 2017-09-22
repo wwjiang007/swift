@@ -476,7 +476,7 @@ class DatabaseBroker(object):
                                    delete_timestamp=MAX(?, delete_timestamp)
             ''' % self.db_type, (created_at, put_timestamp, delete_timestamp))
             if old_status != self._is_deleted(conn):
-                timestamp = Timestamp(time.time())
+                timestamp = Timestamp.now()
                 self._update_status_changed_at(conn, timestamp.internal)
 
             conn.commit()
@@ -738,7 +738,7 @@ class DatabaseBroker(object):
         Validates that metadata falls within acceptable limits.
 
         :param metadata: to be validated
-        :raises: HTTPBadRequest if MAX_META_COUNT or MAX_META_OVERALL_SIZE
+        :raises HTTPBadRequest: if MAX_META_COUNT or MAX_META_OVERALL_SIZE
                  is exceeded, or if metadata contains non-UTF-8 data
         """
         meta_count = 0

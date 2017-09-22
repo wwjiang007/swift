@@ -20,7 +20,7 @@ import time
 
 from six.moves import range
 from test import safe_repr
-from test.unit import MockTrue
+from test.unit import mock_check_drive
 
 from swift.common.swob import Request, HTTPException
 from swift.common.http import HTTP_REQUEST_ENTITY_TOO_LARGE, \
@@ -40,13 +40,13 @@ class TestConstraints(unittest.TestCase):
 
     def test_check_metadata_empty(self):
         headers = {}
-        self.assertEqual(constraints.check_metadata(Request.blank(
-            '/', headers=headers), 'object'), None)
+        self.assertIsNone(constraints.check_metadata(Request.blank(
+            '/', headers=headers), 'object'))
 
     def test_check_metadata_good(self):
         headers = {'X-Object-Meta-Name': 'Value'}
-        self.assertEqual(constraints.check_metadata(Request.blank(
-            '/', headers=headers), 'object'), None)
+        self.assertIsNone(constraints.check_metadata(Request.blank(
+            '/', headers=headers), 'object'))
 
     def test_check_metadata_empty_name(self):
         headers = {'X-Object-Meta-': 'Value'}
@@ -75,8 +75,8 @@ class TestConstraints(unittest.TestCase):
     def test_check_metadata_name_length(self):
         name = 'a' * constraints.MAX_META_NAME_LENGTH
         headers = {'X-Object-Meta-%s' % name: 'v'}
-        self.assertEqual(constraints.check_metadata(Request.blank(
-            '/', headers=headers), 'object'), None)
+        self.assertIsNone(constraints.check_metadata(Request.blank(
+            '/', headers=headers), 'object'))
 
         name = 'a' * (constraints.MAX_META_NAME_LENGTH + 1)
         headers = {'X-Object-Meta-%s' % name: 'v'}
@@ -90,8 +90,8 @@ class TestConstraints(unittest.TestCase):
     def test_check_metadata_value_length(self):
         value = 'a' * constraints.MAX_META_VALUE_LENGTH
         headers = {'X-Object-Meta-Name': value}
-        self.assertEqual(constraints.check_metadata(Request.blank(
-            '/', headers=headers), 'object'), None)
+        self.assertIsNone(constraints.check_metadata(Request.blank(
+            '/', headers=headers), 'object'))
 
         value = 'a' * (constraints.MAX_META_VALUE_LENGTH + 1)
         headers = {'X-Object-Meta-Name': value}
@@ -107,8 +107,8 @@ class TestConstraints(unittest.TestCase):
         headers = {}
         for x in range(constraints.MAX_META_COUNT):
             headers['X-Object-Meta-%d' % x] = 'v'
-        self.assertEqual(constraints.check_metadata(Request.blank(
-            '/', headers=headers), 'object'), None)
+        self.assertIsNone(constraints.check_metadata(Request.blank(
+            '/', headers=headers), 'object'))
 
         headers['X-Object-Meta-Too-Many'] = 'v'
         resp = constraints.check_metadata(Request.blank(
@@ -128,8 +128,8 @@ class TestConstraints(unittest.TestCase):
                 'v' * constraints.MAX_META_VALUE_LENGTH
             size += chunk
             x += 1
-        self.assertEqual(constraints.check_metadata(Request.blank(
-            '/', headers=headers), 'object'), None)
+        self.assertIsNone(constraints.check_metadata(Request.blank(
+            '/', headers=headers), 'object'))
         # add two more headers in case adding just one falls exactly on the
         # limit (eg one header adds 1024 and the limit is 2048)
         headers['X-Object-Meta-%04d%s' %
@@ -146,8 +146,8 @@ class TestConstraints(unittest.TestCase):
     def test_check_object_creation_content_length(self):
         headers = {'Content-Length': str(constraints.MAX_FILE_SIZE),
                    'Content-Type': 'text/plain'}
-        self.assertEqual(constraints.check_object_creation(Request.blank(
-            '/', headers=headers), 'object_name'), None)
+        self.assertIsNone(constraints.check_object_creation(Request.blank(
+            '/', headers=headers), 'object_name'))
 
         headers = {'Content-Length': str(constraints.MAX_FILE_SIZE + 1),
                    'Content-Type': 'text/plain'}
@@ -157,8 +157,8 @@ class TestConstraints(unittest.TestCase):
 
         headers = {'Transfer-Encoding': 'chunked',
                    'Content-Type': 'text/plain'}
-        self.assertEqual(constraints.check_object_creation(Request.blank(
-            '/', headers=headers), 'object_name'), None)
+        self.assertIsNone(constraints.check_object_creation(Request.blank(
+            '/', headers=headers), 'object_name'))
 
         headers = {'Transfer-Encoding': 'gzip',
                    'Content-Type': 'text/plain'}
@@ -189,8 +189,8 @@ class TestConstraints(unittest.TestCase):
         headers = {'Transfer-Encoding': 'chunked',
                    'Content-Type': 'text/plain'}
         name = 'o' * constraints.MAX_OBJECT_NAME_LENGTH
-        self.assertEqual(constraints.check_object_creation(Request.blank(
-            '/', headers=headers), name), None)
+        self.assertIsNone(constraints.check_object_creation(Request.blank(
+            '/', headers=headers), name))
 
         name = 'o' * (MAX_OBJECT_NAME_LENGTH + 1)
         resp = constraints.check_object_creation(
@@ -203,8 +203,8 @@ class TestConstraints(unittest.TestCase):
     def test_check_object_creation_content_type(self):
         headers = {'Transfer-Encoding': 'chunked',
                    'Content-Type': 'text/plain'}
-        self.assertEqual(constraints.check_object_creation(Request.blank(
-            '/', headers=headers), 'object_name'), None)
+        self.assertIsNone(constraints.check_object_creation(Request.blank(
+            '/', headers=headers), 'object_name'))
 
         headers = {'Transfer-Encoding': 'chunked'}
         resp = constraints.check_object_creation(
@@ -372,21 +372,49 @@ class TestConstraints(unittest.TestCase):
         self.assertTrue('X-Delete-At' in req.headers)
         self.assertEqual(req.headers['X-Delete-At'], expected)
 
-    def test_check_dir(self):
-        self.assertFalse(constraints.check_dir('', ''))
-        with mock.patch("os.path.isdir", MockTrue()):
-            self.assertTrue(constraints.check_dir('/srv', 'foo/bar'))
+    def test_check_drive_invalid_path(self):
+        root = '/srv/'
+        with mock_check_drive() as mocks:
+            self.assertIsNone(constraints.check_dir(root, 'foo?bar'))
+            self.assertIsNone(constraints.check_mount(root, 'foo bar'))
+            self.assertIsNone(constraints.check_drive(root, 'foo/bar', True))
+            self.assertIsNone(constraints.check_drive(root, 'foo%bar', False))
+        self.assertEqual([], mocks['isdir'].call_args_list)
+        self.assertEqual([], mocks['ismount'].call_args_list)
 
-    def test_check_mount(self):
-        self.assertFalse(constraints.check_mount('', ''))
-        with mock.patch("swift.common.utils.ismount", MockTrue()):
-            self.assertTrue(constraints.check_mount('/srv', '1'))
-            self.assertTrue(constraints.check_mount('/srv', 'foo-bar'))
-            self.assertTrue(constraints.check_mount(
-                '/srv', '003ed03c-242a-4b2f-bee9-395f801d1699'))
-            self.assertFalse(constraints.check_mount('/srv', 'foo bar'))
-            self.assertFalse(constraints.check_mount('/srv', 'foo/bar'))
-            self.assertFalse(constraints.check_mount('/srv', 'foo?bar'))
+    def test_check_drive_ismount(self):
+        root = '/srv'
+        path = 'sdb1'
+        with mock_check_drive(ismount=True) as mocks:
+            self.assertIsNone(constraints.check_dir(root, path))
+            self.assertIsNone(constraints.check_drive(root, path, False))
+            self.assertEqual([mock.call('/srv/sdb1'), mock.call('/srv/sdb1')],
+                             mocks['isdir'].call_args_list)
+            self.assertEqual([], mocks['ismount'].call_args_list)
+        with mock_check_drive(ismount=True) as mocks:
+            self.assertEqual('/srv/sdb1', constraints.check_mount(root, path))
+            self.assertEqual('/srv/sdb1', constraints.check_drive(
+                root, path, True))
+            self.assertEqual([], mocks['isdir'].call_args_list)
+            self.assertEqual([mock.call('/srv/sdb1'), mock.call('/srv/sdb1')],
+                             mocks['ismount'].call_args_list)
+
+    def test_check_drive_isdir(self):
+        root = '/srv'
+        path = 'sdb2'
+        with mock_check_drive(isdir=True) as mocks:
+            self.assertEqual('/srv/sdb2', constraints.check_dir(root, path))
+            self.assertEqual('/srv/sdb2', constraints.check_drive(
+                root, path, False))
+            self.assertEqual([mock.call('/srv/sdb2'), mock.call('/srv/sdb2')],
+                             mocks['isdir'].call_args_list)
+            self.assertEqual([], mocks['ismount'].call_args_list)
+        with mock_check_drive(isdir=True) as mocks:
+            self.assertIsNone(constraints.check_mount(root, path))
+            self.assertIsNone(constraints.check_drive(root, path, True))
+            self.assertEqual([], mocks['isdir'].call_args_list)
+            self.assertEqual([mock.call('/srv/sdb2'), mock.call('/srv/sdb2')],
+                             mocks['ismount'].call_args_list)
 
     def test_check_float(self):
         self.assertFalse(constraints.check_float(''))
@@ -400,7 +428,7 @@ class TestConstraints(unittest.TestCase):
                           constraints.valid_timestamp,
                           Request.blank('/', headers={
                               'X-Timestamp': 'asdf'}))
-        timestamp = utils.Timestamp(time.time())
+        timestamp = utils.Timestamp.now()
         req = Request.blank('/', headers={'X-Timestamp': timestamp.internal})
         self.assertEqual(timestamp, constraints.valid_timestamp(req))
         req = Request.blank('/', headers={'X-Timestamp': timestamp.normal})

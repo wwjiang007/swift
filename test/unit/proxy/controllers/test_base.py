@@ -26,8 +26,8 @@ from swift.common import exceptions
 from swift.common.utils import split_path
 from swift.common.header_key_dict import HeaderKeyDict
 from swift.common.http import is_success
-from swift.common.storage_policy import StoragePolicy
-from test.unit import fake_http_connect, FakeRing, FakeMemcache
+from swift.common.storage_policy import StoragePolicy, StoragePolicyCollection
+from test.unit import fake_http_connect, FakeRing, FakeMemcache, PatchPolicies
 from swift.proxy import server as proxy_server
 from swift.common.request_helpers import (
     get_sys_meta_prefix, get_object_transient_sysmeta
@@ -615,6 +615,27 @@ class TestFuncs(unittest.TestCase):
             resp,
             headers_to_account_info(headers.items(), 200))
 
+    def test_headers_to_account_info_storage_policies(self):
+        headers = {
+            'x-account-storage-policy-zero-object-count': '13',
+            'x-account-storage-policy-zero-container-count': '120',
+            'x-account-storage-policy-zero-bytes-used': '1002',
+            'x-account-storage-policy-one-object-count': '10',
+            'x-account-storage-policy-one-container-count': '20',
+        }
+        spc = StoragePolicyCollection([StoragePolicy(0, 'zero', True),
+                                       StoragePolicy(1, 'one', False)])
+        with PatchPolicies(spc):
+            resp = headers_to_account_info(headers.items(), 200)
+        self.assertEqual(resp['storage_policies'], {
+            0: {'object_count': 13,
+                'container_count': 120,
+                'bytes': 1002},
+            1: {'object_count': 10,
+                'container_count': 20,
+                'bytes': 0},
+        })
+
     def test_headers_to_object_info_missing(self):
         resp = headers_to_object_info({}, 404)
         self.assertEqual(resp['status'], 404)
@@ -876,18 +897,32 @@ class TestFuncs(unittest.TestCase):
 
         node = {'ip': '1.2.3.4', 'port': 6200, 'device': 'sda'}
 
-        source1 = TestSource(['abcd', '1234', 'abc', None])
-        source2 = TestSource(['efgh5678'])
+        data = ['abcd', '1234', 'efgh', '5678', 'lots', 'more', 'data']
+
+        # NB: content length on source1 should be correct
+        # but that reversed piece never makes it to the client
+        source1 = TestSource(data[:2] + [data[2][::-1], None] + data[3:])
+        source2 = TestSource(data[2:4] + ['nope', None])
+        source3 = TestSource(data[4:])
         req = Request.blank('/v1/a/c/o')
         handler = GetOrHeadHandler(
             self.app, req, 'Object', None, None, None, {},
             client_chunk_size=8)
 
+        range_headers = []
+        sources = [(source2, node), (source3, node)]
+
+        def mock_get_source_and_node():
+            range_headers.append(handler.backend_headers['Range'])
+            return sources.pop(0)
+
         app_iter = handler._make_app_iter(req, node, source1)
         with mock.patch.object(handler, '_get_source_and_node',
-                               lambda: (source2, node)):
+                               side_effect=mock_get_source_and_node):
             client_chunks = list(app_iter)
-        self.assertEqual(client_chunks, ['abcd1234', 'efgh5678'])
+        self.assertEqual(range_headers, ['bytes=8-27', 'bytes=16-27'])
+        self.assertEqual(client_chunks, [
+            'abcd1234', 'efgh5678', 'lotsmore', 'data'])
 
     def test_client_chunk_size_resuming_chunked(self):
 

@@ -31,10 +31,9 @@ from swift.common.header_key_dict import HeaderKeyDict
 
 from swift import gettext_ as _
 from swift.common.storage_policy import POLICIES
-from swift.common.constraints import FORMAT2CONTENT_TYPE
 from swift.common.exceptions import ListingIterError, SegmentError
 from swift.common.http import is_success
-from swift.common.swob import HTTPBadRequest, HTTPNotAcceptable, \
+from swift.common.swob import HTTPBadRequest, \
     HTTPServiceUnavailable, Range, is_chunked, multi_range_iterator
 from swift.common.utils import split_path, validate_device_partition, \
     close_if_possible, maybe_multipart_byteranges_to_document_iters, \
@@ -57,7 +56,7 @@ def get_param(req, name, default=None):
     :param default: result to return if the parameter is not found
     :returns: HTTP request parameter value
               (as UTF-8 encoded str, not unicode object)
-    :raises: HTTPBadRequest if param not valid UTF-8 byte sequence
+    :raises HTTPBadRequest: if param not valid UTF-8 byte sequence
     """
     value = req.params.get(name, default)
     if value and not isinstance(value, six.text_type):
@@ -68,28 +67,6 @@ def get_param(req, name, default=None):
                 request=req, content_type='text/plain',
                 body='"%s" parameter not valid UTF-8' % name)
     return value
-
-
-def get_listing_content_type(req):
-    """
-    Determine the content type to use for an account or container listing
-    response.
-
-    :param req: request object
-    :returns: content type as a string (e.g. text/plain, application/json)
-    :raises: HTTPNotAcceptable if the requested content type is not acceptable
-    :raises: HTTPBadRequest if the 'format' query param is provided and
-             not valid UTF-8
-    """
-    query_format = get_param(req, 'format')
-    if query_format:
-        req.accept = FORMAT2CONTENT_TYPE.get(
-            query_format.lower(), FORMAT2CONTENT_TYPE['plain'])
-    out_content_type = req.accept.best_match(
-        ['text/plain', 'application/json', 'application/xml', 'text/xml'])
-    if not out_content_type:
-        raise HTTPNotAcceptable(request=req)
-    return out_content_type
 
 
 def get_name_and_placement(request, minsegs=1, maxsegs=None,
@@ -103,7 +80,7 @@ def get_name_and_placement(request, minsegs=1, maxsegs=None,
 
     :returns: a list, result of :meth:`split_and_validate_path` with
               the BaseStoragePolicy instance appended on the end
-    :raises: HTTPServiceUnavailable if the path is invalid or no policy exists
+    :raises HTTPServiceUnavailable: if the path is invalid or no policy exists
              with the extracted policy_index.
     """
     policy_index = request.headers.get('X-Backend-Storage-Policy-Index')
@@ -126,7 +103,7 @@ def split_and_validate_path(request, minsegs=1, maxsegs=None,
 
     :returns: result of :meth:`~swift.common.utils.split_path` if
               everything's okay
-    :raises: HTTPBadRequest if something's not okay
+    :raises HTTPBadRequest: if something's not okay
     """
     try:
         segs = split_path(unquote(request.path),
@@ -200,6 +177,8 @@ def strip_user_meta_prefix(server_type, key):
     :param key: header key
     :returns: stripped header key
     """
+    if not is_user_meta(server_type, key):
+        raise ValueError('Key is not user meta')
     return key[len(get_user_meta_prefix(server_type)):]
 
 
@@ -212,6 +191,8 @@ def strip_sys_meta_prefix(server_type, key):
     :param key: header key
     :returns: stripped header key
     """
+    if not is_sys_meta(server_type, key):
+        raise ValueError('Key is not sysmeta')
     return key[len(get_sys_meta_prefix(server_type)):]
 
 
@@ -223,6 +204,8 @@ def strip_object_transient_sysmeta_prefix(key):
     :param key: header key
     :returns: stripped header key
     """
+    if not is_object_transient_sysmeta(key):
+        raise ValueError('Key is not object transient sysmeta')
     return key[len(OBJECT_TRANSIENT_SYSMETA_PREFIX):]
 
 

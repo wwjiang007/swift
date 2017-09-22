@@ -90,13 +90,6 @@ class ObjectReplicator(Daemon):
         self.rsync_module = conf.get('rsync_module', '').rstrip('/')
         if not self.rsync_module:
             self.rsync_module = '{replication_ip}::object'
-            if config_true_value(conf.get('vm_test_mode', 'no')):
-                self.logger.warning('Option object-replicator/vm_test_mode '
-                                    'is deprecated and will be removed in a '
-                                    'future version. Update your '
-                                    'configuration to use option '
-                                    'object-replicator/rsync_module.')
-                self.rsync_module += '{replication_port}'
         self.http_timeout = int(conf.get('http_timeout', 60))
         self.lockup_timeout = int(conf.get('lockup_timeout', 1800))
         self.recon_cache_path = conf.get('recon_cache_path',
@@ -408,7 +401,8 @@ class ObjectReplicator(Daemon):
         df_mgr = self._df_router[job['policy']]
         try:
             hashed, local_hash = tpool_reraise(
-                df_mgr._get_hashes, job['path'],
+                df_mgr._get_hashes, job['device'],
+                job['partition'], job['policy'],
                 do_listdir=_do_listdir(
                     int(job['partition']),
                     self.replication_cycle))
@@ -462,7 +456,8 @@ class ObjectReplicator(Daemon):
                         continue
                     hashed, recalc_hash = tpool_reraise(
                         df_mgr._get_hashes,
-                        job['path'], recalculate=suffixes)
+                        job['device'], job['partition'], job['policy'],
+                        recalculate=suffixes)
                     self.logger.update_stats('suffix.hashes', hashed)
                     local_hash = recalc_hash
                     suffixes = [suffix for suffix in local_hash if
@@ -674,6 +669,19 @@ class ObjectReplicator(Daemon):
         jobs = []
         ips = whataremyips(self.bind_ip)
         for policy in POLICIES:
+            # Skip replication if next_part_power is set. In this case
+            # every object is hard-linked twice, but the replicator can't
+            # detect them and would create a second copy of the file if not
+            # yet existing - and this might double the actual transferred
+            # and stored data
+            next_part_power = getattr(
+                policy.object_ring, 'next_part_power', None)
+            if next_part_power is not None:
+                self.logger.warning(
+                    _("next_part_power set in policy '%s'. Skipping"),
+                    policy.name)
+                continue
+
             if policy.policy_type == REPL_POLICY:
                 if (override_policies is not None and
                         str(policy.idx) not in override_policies):
@@ -742,6 +750,7 @@ class ObjectReplicator(Daemon):
                     self.logger.info(_("Ring change detected. Aborting "
                                        "current replication pass."))
                     return
+
                 try:
                     if isfile(job['path']):
                         # Clean up any (probably zero-byte) files where a

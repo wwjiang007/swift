@@ -13,12 +13,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import contextlib
 import copy
 import errno
 import itertools
 import logging
 import math
 import random
+import uuid
+
 import six.moves.cPickle as pickle
 from copy import deepcopy
 from contextlib import contextmanager
@@ -32,7 +35,7 @@ from time import time
 from swift.common import exceptions
 from swift.common.ring import RingData
 from swift.common.ring.utils import tiers_for_dev, build_tier_tree, \
-    validate_and_normalize_address
+    validate_and_normalize_address, pretty_dev
 
 # we can't store None's in the replica2part2dev array, so we high-jack
 # the max value for magic to represent the part is not currently
@@ -54,6 +57,24 @@ except ImportError:
     class NullHandler(logging.Handler):
         def emit(self, *a, **kw):
             pass
+
+
+@contextlib.contextmanager
+def _set_random_seed(seed):
+    # If random seed is set when entering this context then reset original
+    # random state when exiting the context. This avoids a test calling this
+    # method with a fixed seed value causing all subsequent tests to use a
+    # repeatable random sequence.
+    random_state = None
+    if seed is not None:
+        random_state = random.getstate()
+        random.seed(seed)
+    try:
+        yield
+    finally:
+        if random_state:
+            # resetting state rather than calling seed() eases unit testing
+            random.setstate(random_state)
 
 
 class RingBuilder(object):
@@ -84,6 +105,7 @@ class RingBuilder(object):
                              % (min_part_hours,))
 
         self.part_power = part_power
+        self.next_part_power = None
         self.replicas = replicas
         self.min_part_hours = min_part_hours
         self.parts = 2 ** self.part_power
@@ -91,6 +113,7 @@ class RingBuilder(object):
         self.devs_changed = False
         self.version = 0
         self.overload = 0.0
+        self._id = None
 
         # _replica2part2dev maps from replica number to partition number to
         # device id. So, for a three replica, 2**23 ring, it's an array of
@@ -127,6 +150,25 @@ class RingBuilder(object):
             # silence "no handler for X" error messages
             self.logger.addHandler(NullHandler())
 
+    @property
+    def id(self):
+        if self._id is None:
+            # We don't automatically assign an id here because we want a caller
+            # to explicitly know when a builder needs an id to be assigned. In
+            # that case the caller must save the builder in order that a newly
+            # assigned id is persisted.
+            raise AttributeError(
+                'id attribute has not been initialised by calling save()')
+        return self._id
+
+    @property
+    def part_shift(self):
+        return 32 - self.part_power
+
+    @property
+    def ever_rebalanced(self):
+        return self._last_part_moves is not None
+
     def _set_part_moved(self, part):
         self._last_part_moves[part] = 0
         byte, bit = divmod(part, 8)
@@ -137,6 +179,9 @@ class RingBuilder(object):
         return bool(self._part_moved_bitmap[byte] & (128 >> bit))
 
     def _can_part_move(self, part):
+        # if min_part_hours is zero then checking _last_part_moves will not
+        # indicate if the part has already moved during the current rebalance,
+        # but _has_part_moved will.
         return (self._last_part_moves[part] >= self.min_part_hours and
                 not self._has_part_moved(part))
 
@@ -192,6 +237,7 @@ class RingBuilder(object):
         """
         if hasattr(builder, 'devs'):
             self.part_power = builder.part_power
+            self.next_part_power = builder.next_part_power
             self.replicas = builder.replicas
             self.min_part_hours = builder.min_part_hours
             self.parts = builder.parts
@@ -204,8 +250,10 @@ class RingBuilder(object):
             self._last_part_moves = builder._last_part_moves
             self._last_part_gather_start = builder._last_part_gather_start
             self._remove_devs = builder._remove_devs
+            self._id = getattr(builder, '_id', None)
         else:
             self.part_power = builder['part_power']
+            self.next_part_power = builder.get('next_part_power')
             self.replicas = builder['replicas']
             self.min_part_hours = builder['min_part_hours']
             self.parts = builder['parts']
@@ -220,6 +268,7 @@ class RingBuilder(object):
             self._dispersion_graph = builder.get('_dispersion_graph', {})
             self.dispersion = builder.get('dispersion')
             self._remove_devs = builder['_remove_devs']
+            self._id = builder.get('id')
         self._ring = None
 
         # Old builders may not have a region defined for their devices, in
@@ -241,6 +290,7 @@ class RingBuilder(object):
         copy_from.
         """
         return {'part_power': self.part_power,
+                'next_part_power': self.next_part_power,
                 'replicas': self.replicas,
                 'min_part_hours': self.min_part_hours,
                 'parts': self.parts,
@@ -254,7 +304,8 @@ class RingBuilder(object):
                 '_last_part_gather_start': self._last_part_gather_start,
                 '_dispersion_graph': self._dispersion_graph,
                 'dispersion': self.dispersion,
-                '_remove_devs': self._remove_devs}
+                '_remove_devs': self._remove_devs,
+                'id': self._id}
 
     def change_min_part_hours(self, min_part_hours):
         """
@@ -315,12 +366,13 @@ class RingBuilder(object):
             # shift an unsigned int >I right to obtain the partition for the
             # int).
             if not self._replica2part2dev:
-                self._ring = RingData([], devs, 32 - self.part_power)
+                self._ring = RingData([], devs, self.part_shift)
             else:
                 self._ring = \
                     RingData([array('H', p2d) for p2d in
                               self._replica2part2dev],
-                             devs, 32 - self.part_power)
+                             devs, self.part_shift,
+                             self.next_part_power)
         return self._ring
 
     def add_dev(self, dev):
@@ -367,8 +419,14 @@ class RingBuilder(object):
         # Add holes to self.devs to ensure self.devs[dev['id']] will be the dev
         while dev['id'] >= len(self.devs):
             self.devs.append(None)
+        required_keys = ('ip', 'port', 'weight')
+        if any(required not in dev for required in required_keys):
+            raise ValueError(
+                '%r is missing at least one the required key %r' % (
+                    dev, required_keys))
         dev['weight'] = float(dev['weight'])
         dev['parts'] = 0
+        dev.setdefault('meta', '')
         self.devs[dev['id']] = dev
         self.devs_changed = True
         self.version += 1
@@ -425,6 +483,7 @@ class RingBuilder(object):
         below 1% or doesn't change by more than 1% (only happens with a ring
         that can't be balanced no matter what).
 
+        :param seed: a value for the random seed (optional)
         :returns: (number_of_partitions_altered, resulting_balance,
                    number_of_removed_devices)
         """
@@ -442,58 +501,56 @@ class RingBuilder(object):
                     'num_devices': num_devices,
                 })
 
-        if seed is not None:
-            random.seed(seed)
-
         self._ring = None
 
         old_replica2part2dev = copy.deepcopy(self._replica2part2dev)
 
-        if self._last_part_moves is None:
+        if not self.ever_rebalanced:
             self.logger.debug("New builder; performing initial balance")
             self._last_part_moves = array('B', itertools.repeat(0, self.parts))
-        self._part_moved_bitmap = bytearray(max(2 ** (self.part_power - 3), 1))
         self._update_last_part_moves()
 
-        replica_plan = self._build_replica_plan()
-        self._set_parts_wanted(replica_plan)
+        with _set_random_seed(seed):
+            replica_plan = self._build_replica_plan()
+            self._set_parts_wanted(replica_plan)
 
-        assign_parts = defaultdict(list)
-        # gather parts from replica count adjustment
-        self._adjust_replica2part2dev_size(assign_parts)
-        # gather parts from failed devices
-        removed_devs = self._gather_parts_from_failed_devices(assign_parts)
-        # gather parts for dispersion (N.B. this only picks up parts that
-        # *must* disperse according to the replica plan)
-        self._gather_parts_for_dispersion(assign_parts, replica_plan)
-
-        # we'll gather a few times, or until we archive the plan
-        for gather_count in range(MAX_BALANCE_GATHER_COUNT):
-            self._gather_parts_for_balance(assign_parts, replica_plan)
-            if not assign_parts:
-                # most likely min part hours
-                finish_status = 'Unable to finish'
-                break
-            assign_parts_list = list(assign_parts.items())
-            # shuffle the parts to be reassigned, we have no preference on the
-            # order in which the replica plan is fulfilled.
-            random.shuffle(assign_parts_list)
-            # reset assign_parts map for next iteration
             assign_parts = defaultdict(list)
+            # gather parts from replica count adjustment
+            self._adjust_replica2part2dev_size(assign_parts)
+            # gather parts from failed devices
+            removed_devs = self._gather_parts_from_failed_devices(assign_parts)
+            # gather parts for dispersion (N.B. this only picks up parts that
+            # *must* disperse according to the replica plan)
+            self._gather_parts_for_dispersion(assign_parts, replica_plan)
 
-            num_part_replicas = sum(len(r) for p, r in assign_parts_list)
-            self.logger.debug("Gathered %d parts", num_part_replicas)
-            self._reassign_parts(assign_parts_list, replica_plan)
-            self.logger.debug("Assigned %d parts", num_part_replicas)
+            # we'll gather a few times, or until we archive the plan
+            for gather_count in range(MAX_BALANCE_GATHER_COUNT):
+                self._gather_parts_for_balance(assign_parts, replica_plan)
+                if not assign_parts:
+                    # most likely min part hours
+                    finish_status = 'Unable to finish'
+                    break
+                assign_parts_list = list(assign_parts.items())
+                # shuffle the parts to be reassigned, we have no preference on
+                # the order in which the replica plan is fulfilled.
+                random.shuffle(assign_parts_list)
+                # reset assign_parts map for next iteration
+                assign_parts = defaultdict(list)
 
-            if not sum(d['parts_wanted'] < 0 for d in
-                       self._iter_devs()):
-                finish_status = 'Finished'
-                break
-        else:
-            finish_status = 'Unable to finish'
-        self.logger.debug('%(status)s rebalance plan after %(count)s attempts',
-                          {'status': finish_status, 'count': gather_count + 1})
+                num_part_replicas = sum(len(r) for p, r in assign_parts_list)
+                self.logger.debug("Gathered %d parts", num_part_replicas)
+                self._reassign_parts(assign_parts_list, replica_plan)
+                self.logger.debug("Assigned %d parts", num_part_replicas)
+
+                if not sum(d['parts_wanted'] < 0 for d in
+                           self._iter_devs()):
+                    finish_status = 'Finished'
+                    break
+            else:
+                finish_status = 'Unable to finish'
+            self.logger.debug(
+                '%(status)s rebalance plan after %(count)s attempts',
+                {'status': finish_status, 'count': gather_count + 1})
 
         self.devs_changed = False
         self.version += 1
@@ -745,7 +802,7 @@ class RingBuilder(object):
             required = (wanted[tier] - weighted[tier]) / weighted[tier]
             self.logger.debug('%(tier)s wants %(wanted)s and is weighted for '
                               '%(weight)s so therefore requires %(required)s '
-                              'overload', {'tier': tier,
+                              'overload', {'tier': pretty_dev(dev),
                                            'wanted': wanted[tier],
                                            'weight': weighted[tier],
                                            'required': required})
@@ -864,8 +921,9 @@ class RingBuilder(object):
         current time. The builder won't move a partition that has been moved
         more recently than min_part_hours.
         """
+        self._part_moved_bitmap = bytearray(max(2 ** (self.part_power - 3), 1))
         elapsed_hours = int(time() - self._last_part_moves_epoch) / 3600
-        if elapsed_hours <= 0:
+        if elapsed_hours <= 0 or not self._last_part_moves:
             return
         for part in range(self.parts):
             # The "min(self._last_part_moves[part] + elapsed_hours, 0xff)"
@@ -1021,8 +1079,8 @@ class RingBuilder(object):
                 dev['parts'] -= 1
                 assign_parts[part].append(replica)
                 self.logger.debug(
-                    "Gathered %d/%d from dev %d [dispersion]",
-                    part, replica, dev['id'])
+                    "Gathered %d/%d from dev %s [dispersion]",
+                    part, replica, pretty_dev(dev))
                 self._replica2part2dev[replica][part] = NONE_DEV
                 for tier in dev['tiers']:
                     replicas_at_tier[tier] -= 1
@@ -1078,8 +1136,8 @@ class RingBuilder(object):
                 dev['parts'] -= 1
                 assign_parts[part].append(replica)
                 self.logger.debug(
-                    "Gathered %d/%d from dev %d [weight disperse]",
-                    part, replica, dev['id'])
+                    "Gathered %d/%d from dev %s [weight disperse]",
+                    part, replica, pretty_dev(dev))
                 self._replica2part2dev[replica][part] = NONE_DEV
                 for tier in dev['tiers']:
                     replicas_at_tier[tier] -= 1
@@ -1150,8 +1208,8 @@ class RingBuilder(object):
             dev['parts'] -= 1
             assign_parts[part].append(replica)
             self.logger.debug(
-                "Gathered %d/%d from dev %d [weight forced]",
-                part, replica, dev['id'])
+                "Gathered %d/%d from dev %s [weight forced]",
+                part, replica, pretty_dev(dev))
             self._replica2part2dev[replica][part] = NONE_DEV
             self._set_part_moved(part)
 
@@ -1272,7 +1330,7 @@ class RingBuilder(object):
 
                 self._replica2part2dev[replica][part] = dev['id']
                 self.logger.debug(
-                    "Placed %d/%d onto dev %d", part, replica, dev['id'])
+                    "Placed %d/%d onto dev %s", part, replica, pretty_dev(dev))
 
         # Just to save memory and keep from accidental reuse.
         for dev in self._iter_devs():
@@ -1619,7 +1677,7 @@ class RingBuilder(object):
                 yield (part, replica)
 
     @classmethod
-    def load(cls, builder_file, open=open):
+    def load(cls, builder_file, open=open, **kwargs):
         """
         Obtain RingBuilder instance of the provided builder file
 
@@ -1648,8 +1706,12 @@ class RingBuilder(object):
 
         if not hasattr(builder, 'devs'):
             builder_dict = builder
-            builder = RingBuilder(1, 1, 1)
+            builder = cls(1, 1, 1, **kwargs)
             builder.copy_from(builder_dict)
+
+        if not hasattr(builder, '_id'):
+            builder._id = None
+
         for dev in builder.devs:
             # really old rings didn't have meta keys
             if dev and 'meta' not in dev:
@@ -1657,10 +1719,8 @@ class RingBuilder(object):
             # NOTE(akscram): An old ring builder file don't contain
             #                replication parameters.
             if dev:
-                if 'ip' in dev:
-                    dev.setdefault('replication_ip', dev['ip'])
-                if 'port' in dev:
-                    dev.setdefault('replication_port', dev['port'])
+                dev.setdefault('replication_ip', dev['ip'])
+                dev.setdefault('replication_port', dev['port'])
         return builder
 
     def save(self, builder_file):
@@ -1668,8 +1728,21 @@ class RingBuilder(object):
 
         :param builder_file: path to builder file to save
         """
-        with open(builder_file, 'wb') as f:
-            pickle.dump(self.to_dict(), f, protocol=2)
+        # We want to be sure the builder id's are persistent, so this is the
+        # only place where the id is assigned. Newly created instances of this
+        # class, or instances loaded from legacy builder files that have no
+        # persisted id, must be saved in order for an id to be assigned.
+        id_persisted = True
+        if self._id is None:
+            id_persisted = False
+            self._id = uuid.uuid4().hex
+        try:
+            with open(builder_file, 'wb') as f:
+                pickle.dump(self.to_dict(), f, protocol=2)
+        except Exception:
+            if not id_persisted:
+                self._id = None
+            raise
 
     def search_devs(self, search_values):
         """Search devices by parameters.
@@ -1709,6 +1782,26 @@ class RingBuilder(object):
                 matched_devs.append(dev)
         return matched_devs
 
+    def prepare_increase_partition_power(self):
+        """
+        Prepares a ring for partition power increase.
+
+        This makes it possible to compute the future location of any object
+        based on the next partition power.
+
+        In this phase object servers should create hard links when finalizing a
+        write to the new location as well. A relinker will be run after
+        restarting object-servers, creating hard links to all existing objects
+        in their future location.
+
+        :returns: False if next_part_power was not set, otherwise True.
+        """
+        if self.next_part_power:
+            return False
+        self.next_part_power = self.part_power + 1
+        self.version += 1
+        return True
+
     def increase_partition_power(self):
         """
         Increases ring partition power by one.
@@ -1717,7 +1810,16 @@ class RingBuilder(object):
 
         OLD: 0, 3, 7, 5, 2, 1, ...
         NEW: 0, 0, 3, 3, 7, 7, 5, 5, 2, 2, 1, 1, ...
+
+        :returns: False if next_part_power was not set or is equal to current
+                  part_power, None if something went wrong, otherwise True.
         """
+
+        if not self.next_part_power:
+            return False
+
+        if self.next_part_power != (self.part_power + 1):
+            return False
 
         new_replica2part2dev = []
         for replica in self._replica2part2dev:
@@ -1733,13 +1835,47 @@ class RingBuilder(object):
 
         # We need to update the time when a partition has been moved the last
         # time. Since this is an array of all partitions, we need to double it
-        # two
+        # too
         new_last_part_moves = []
         for partition in self._last_part_moves:
             new_last_part_moves.append(partition)
             new_last_part_moves.append(partition)
         self._last_part_moves = new_last_part_moves
 
-        self.part_power += 1
+        self.part_power = self.next_part_power
         self.parts *= 2
         self.version += 1
+        return True
+
+    def cancel_increase_partition_power(self):
+        """
+        Cancels a ring partition power increasement.
+
+        This sets the next_part_power to the current part_power. Object
+        replicators will still skip replication, and a cleanup is still
+        required. Finally, a finish_increase_partition_power needs to be run.
+
+        :returns: False if next_part_power was not set or is equal to current
+                  part_power, otherwise True.
+        """
+
+        if not self.next_part_power:
+            return False
+
+        if self.next_part_power != (self.part_power + 1):
+            return False
+
+        self.next_part_power = self.part_power
+        self.version += 1
+        return True
+
+    def finish_increase_partition_power(self):
+        """Finish the partition power increase.
+
+        The hard links from the old object locations should be removed by now.
+        """
+        if self.next_part_power and self.next_part_power == self.part_power:
+            self.next_part_power = None
+            self.version += 1
+            return True
+        return False

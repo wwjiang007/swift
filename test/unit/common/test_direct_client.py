@@ -99,8 +99,9 @@ def mocked_http_conn(*args, **kwargs):
 class TestDirectClient(unittest.TestCase):
 
     def setUp(self):
-        self.node = {'ip': '1.2.3.4', 'port': '6200', 'device': 'sda',
-                     'replication_ip': '1.2.3.5', 'replication_port': '7000'}
+        self.node = json.loads(json.dumps({  # json roundtrip to ring-like
+            'ip': '1.2.3.4', 'port': '6200', 'device': 'sda',
+            'replication_ip': '1.2.3.5', 'replication_port': '7000'}))
         self.part = '0'
 
         self.account = u'\u062a account'
@@ -336,7 +337,7 @@ class TestDirectClient(unittest.TestCase):
         self.assertTrue('HEAD' in str(err))
 
     def test_direct_head_container_deleted(self):
-        important_timestamp = Timestamp(time.time()).internal
+        important_timestamp = Timestamp.now().internal
         headers = HeaderKeyDict({'X-Backend-Important-Timestamp':
                                  important_timestamp})
 
@@ -463,7 +464,7 @@ class TestDirectClient(unittest.TestCase):
             self.assertTrue('x-timestamp' in conn.req_headers)
             self.assertEqual('bar', conn.req_headers.get('x-foo'))
 
-        self.assertEqual(rv, None)
+        self.assertIsNone(rv)
 
     def test_direct_put_container_object_error(self):
         with mocked_http_conn(500) as conn:
@@ -493,7 +494,7 @@ class TestDirectClient(unittest.TestCase):
             self.assertEqual(conn.method, 'DELETE')
             self.assertEqual(conn.path, self.obj_path)
 
-        self.assertEqual(rv, None)
+        self.assertIsNone(rv)
 
     def test_direct_delete_container_obj_error(self):
         with mocked_http_conn(500) as conn:
@@ -528,8 +529,7 @@ class TestDirectClient(unittest.TestCase):
 
         self.assertEqual(conn.req_headers['user-agent'], self.user_agent)
         self.assertEqual('bar', conn.req_headers.get('x-foo'))
-        self.assertNotIn('x-timestamp', conn.req_headers,
-                         'x-timestamp was in HEAD request headers')
+        self.assertNotIn('x-timestamp', conn.req_headers)
         self.assertEqual(headers, resp)
 
     def test_direct_head_object_error(self):
@@ -551,7 +551,7 @@ class TestDirectClient(unittest.TestCase):
         self.assertTrue('HEAD' in str(err))
 
     def test_direct_head_object_not_found(self):
-        important_timestamp = Timestamp(time.time()).internal
+        important_timestamp = Timestamp.now().internal
         stub_headers = {'X-Backend-Important-Timestamp': important_timestamp}
         with mocked_http_conn(404, headers=stub_headers) as conn:
             try:
@@ -670,7 +670,7 @@ class TestDirectClient(unittest.TestCase):
             self.assertEqual(conn.port, self.node['port'])
             self.assertEqual(conn.method, 'DELETE')
             self.assertEqual(conn.path, self.obj_path)
-        self.assertEqual(resp, None)
+        self.assertIsNone(resp)
 
     def test_direct_delete_object_with_timestamp(self):
         # ensure timestamp is different from any that might be auto-generated
@@ -837,7 +837,8 @@ class TestDirectClient(unittest.TestCase):
         self.assertEqual(err_ctx.exception.http_status, 500)
         self.assertIn('DELETE', err_ctx.exception.message)
         self.assertIn(quote('/%s/%s/%s/%s/%s'
-                            % (self.node['device'], self.part, self.account,
+                            % (self.node['device'].encode('utf-8'),
+                               self.part, self.account,
                                self.container, self.obj)),
                       err_ctx.exception.message)
         self.assertIn(self.node['ip'], err_ctx.exception.message)
@@ -871,6 +872,15 @@ class TestDirectClient(unittest.TestCase):
         self.assertEqual(3, len(error_lines))
         for line in error_lines:
             self.assertIn('Kaboom!', line)
+
+
+class TestUTF8DirectClient(TestDirectClient):
+
+    def setUp(self):
+        super(TestUTF8DirectClient, self).setUp()
+        self.account = self.account.encode('utf-8')
+        self.container = self.container.encode('utf-8')
+        self.obj = self.obj.encode('utf-8')
 
 if __name__ == '__main__':
     unittest.main()

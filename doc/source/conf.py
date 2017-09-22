@@ -27,11 +27,19 @@
 # serve to show the default.
 
 import datetime
+import logging
 import os
 from swift import __version__
-import subprocess
 import sys
-import warnings
+
+# NOTE(amotoki): Our current doc build job uses an older version of
+# liberasurecode which comes from Ubuntu 16.04.
+# pyeclib emits a warning message if liberasurecode <1.3.1 is used [1] and
+# this causes the doc build failure if warning-is-error is enabled in Sphinx.
+# As a workaround we suppress the warning message from pyeclib until we use
+# a newer version of liberasurecode in our doc build job.
+# [1] https://github.com/openstack/pyeclib/commit/d163972b
+logging.getLogger('pyeclib').setLevel(logging.ERROR)
 
 # If extensions (or modules to document with autodoc) are in another directory,
 # add these directories to sys.path here. If the directory is relative to the
@@ -44,19 +52,14 @@ sys.path.extend([os.path.abspath('../swift'), os.path.abspath('..'),
 # Add any Sphinx extension module names here, as strings. They can be
 # extensions coming with Sphinx (named 'sphinx.ext.*') or your custom ones.
 extensions = ['sphinx.ext.autodoc',
-              'sphinx.ext.todo', 'sphinx.ext.coverage',
-              'sphinx.ext.ifconfig', 'oslosphinx']
+              'sphinx.ext.todo',
+              'sphinx.ext.coverage',
+              'sphinx.ext.ifconfig',
+              'openstackdocstheme']
 todo_include_todos = True
 
 # Add any paths that contain templates here, relative to this directory.
-# Changing the path so that the Hudson build output contains GA code and the
-# source docs do not contain the code so local, offline sphinx builds are
-# "clean."
 # templates_path = []
-# if os.getenv('HUDSON_PUBLISH_DOCS'):
-#     templates_path = ['_ga', '_templates']
-# else:
-#     templates_path = ['_templates']
 
 # The suffix of source filenames.
 source_suffix = '.rst'
@@ -125,7 +128,7 @@ modindex_common_prefix = ['swift.']
 # Sphinx are currently 'default' and 'sphinxdoc'.
 # html_theme = 'default'
 # html_theme_path = ["."]
-# html_theme = '_theme'
+html_theme = 'openstackdocs'
 
 # Theme options are theme-specific and customize the look and feel of a theme
 # further.  For a list of options available for each theme, see the
@@ -156,17 +159,14 @@ modindex_common_prefix = ['swift.']
 # so a file named "default.css" will overwrite the builtin "default.css".
 # html_static_path = ['_static']
 
+# Add any paths that contain "extra" files, such as .htaccess or
+# robots.txt.
+html_extra_path = ['_extra']
+
 # If not '', a 'Last updated on:' timestamp is inserted at every page bottom,
 # using the given strftime format.
 # html_last_updated_fmt = '%b %d, %Y'
-git_cmd = ["git", "log", "--pretty=format:'%ad, commit %h'", "--date=local",
-           "-n1"]
-try:
-    html_last_updated_fmt = subprocess.Popen(
-        git_cmd, stdout=subprocess.PIPE).communicate()[0]
-except OSError:
-    warnings.warn('Cannot get last updated time from git repository. '
-                  'Not setting "html_last_updated_fmt".')
+html_last_updated_fmt = '%Y-%m-%d %H:%M'
 
 # If true, SmartyPants will be used to convert quotes and dashes to
 # typographically correct entities.
@@ -235,3 +235,8 @@ latex_documents = [
 
 # If false, no module index is generated.
 # latex_use_modindex = True
+
+# -- Options for openstackdocstheme -------------------------------------------
+repository_name = 'openstack/swift'
+bug_project = 'swift'
+bug_tag = ''

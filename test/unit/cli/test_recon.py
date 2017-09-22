@@ -16,11 +16,13 @@
 import json
 import mock
 import os
+import random
 import re
 import tempfile
 import time
 import unittest
 import shutil
+import string
 import sys
 import six
 
@@ -147,6 +149,7 @@ class TestScout(unittest.TestCase):
 @patch_policies
 class TestRecon(unittest.TestCase):
     def setUp(self, *_args, **_kwargs):
+        self.swift_conf_file = utils.SWIFT_CONF_FILE
         self.recon_instance = recon.SwiftRecon()
         self.swift_dir = tempfile.mkdtemp()
         self.ring_name = POLICIES.legacy.ring_name
@@ -156,10 +159,24 @@ class TestRecon(unittest.TestCase):
         self.tmpfile_name2 = os.path.join(
             self.swift_dir, self.ring_name2 + '.ring.gz')
 
-        utils.HASH_PATH_SUFFIX = 'endcap'
-        utils.HASH_PATH_PREFIX = 'startcap'
+        swift_conf = os.path.join(self.swift_dir, 'swift.conf')
+        self.policy_name = ''.join(random.sample(string.letters, 20))
+        with open(swift_conf, "wb") as sc:
+            sc.write('''
+[swift-hash]
+swift_hash_path_suffix = changeme
+
+[storage-policy:0]
+name = default
+default = yes
+
+[storage-policy:1]
+name = unu
+aliases = %s
+''' % self.policy_name)
 
     def tearDown(self, *_args, **_kwargs):
+        utils.SWIFT_CONF_FILE = self.swift_conf_file
         shutil.rmtree(self.swift_dir, ignore_errors=True)
 
     def _make_object_rings(self):
@@ -262,6 +279,26 @@ class TestRecon(unittest.TestCase):
             0, 1, self.swift_dir, [self.ring_name, self.ring_name2])
         self.assertEqual(set([('127.0.0.1', 10001),
                               ('127.0.0.2', 10004)]), ips)
+
+    def test_get_error_ringnames(self):
+        # create invalid ring name files
+        invalid_ring_file_names = ('object.sring.gz',
+                                   'object-1.sring.gz',
+                                   'broken')
+        for invalid_ring in invalid_ring_file_names:
+            ring_path = os.path.join(self.swift_dir, invalid_ring)
+            with open(ring_path, 'w'):
+                pass
+
+        hosts = [("127.0.0.1", "8080")]
+        self.recon_instance.verbose = True
+        self.recon_instance.server_type = 'object'
+        stdout = StringIO()
+        with mock.patch('sys.stdout', new=stdout), \
+                mock.patch('swift.common.utils.md5'):
+            self.recon_instance.get_ringmd5(hosts, self.swift_dir)
+        output = stdout.getvalue()
+        self.assertNotIn('On disk ', output)
 
     def test_get_ringmd5(self):
         for server_type in ('account', 'container', 'object', 'object-1'):
@@ -570,7 +607,7 @@ class TestRecon(unittest.TestCase):
 
         self.assertEqual(expected, discovered_hosts)
 
-    def test_main_object_hosts_default_unu(self):
+    def _test_main_object_hosts_policy_name(self, policy_name='unu'):
         self._make_object_rings()
         discovered_hosts = set()
 
@@ -582,7 +619,7 @@ class TestRecon(unittest.TestCase):
 
         with mock.patch.object(sys, 'argv', [
                 "prog", "object", "--swiftdir=%s" % self.swift_dir,
-                "--validate-servers", '--policy=unu']):
+                "--validate-servers", '--policy', policy_name]):
 
             self.recon_instance.main()
 
@@ -591,6 +628,12 @@ class TestRecon(unittest.TestCase):
             ('127.0.0.2', 10004),
         ])
         self.assertEqual(expected, discovered_hosts)
+
+    def test_main_object_hosts_default_unu(self):
+        self._test_main_object_hosts_policy_name()
+
+    def test_main_object_hosts_default_alias(self):
+        self._test_main_object_hosts_policy_name(self.policy_name)
 
     def test_main_object_hosts_default_invalid(self):
         self._make_object_rings()
@@ -957,12 +1000,12 @@ class TestReconCommands(unittest.TestCase):
 
         def dummy_request(*args, **kwargs):
             return [
-                ('http://127.0.0.1:6010/recon/load',
+                ('http://127.0.0.1:6010/recon/time',
                  now,
                  200,
                  now - 0.5,
                  now + 0.5),
-                ('http://127.0.0.1:6020/recon/load',
+                ('http://127.0.0.1:6020/recon/time',
                  now,
                  200,
                  now,
@@ -1007,11 +1050,82 @@ class TestReconCommands(unittest.TestCase):
         default_calls = [
             mock.call("!! http://127.0.0.1:6010/recon/time current time is "
                       "2015-04-25 22:13:21, but remote is "
-                      "2015-04-25 22:13:20, differs by 1.30 sec"),
+                      "2015-04-25 22:13:20, differs by 1.3000 sec"),
             mock.call('1/2 hosts matched, 0 error[s] while checking hosts.'),
         ]
 
         cli.time_check([('127.0.0.1', 6010), ('127.0.0.1', 6020)])
+
+        # We need any_order=True because the order of calls depends on the dict
+        # that is returned from the recon middleware, thus can't rely on it
+        mock_print.assert_has_calls(default_calls, any_order=True)
+
+    @mock.patch('six.moves.builtins.print')
+    @mock.patch('time.time')
+    def test_time_check_jitter(self, mock_now, mock_print):
+        now = 1430000000.0
+        mock_now.return_value = now
+
+        def dummy_request(*args, **kwargs):
+            return [
+                ('http://127.0.0.1:6010/recon/time',
+                 now - 2,
+                 200,
+                 now,
+                 now + 3),
+                ('http://127.0.0.1:6020/recon/time',
+                 now + 2,
+                 200,
+                 now - 3,
+                 now),
+            ]
+
+        cli = recon.SwiftRecon()
+        cli.pool.imap = dummy_request
+
+        default_calls = [
+            mock.call('2/2 hosts matched, 0 error[s] while checking hosts.')
+        ]
+
+        cli.time_check([('127.0.0.1', 6010), ('127.0.0.1', 6020)], 3)
+        # We need any_order=True because the order of calls depends on the dict
+        # that is returned from the recon middleware, thus can't rely on it
+        mock_print.assert_has_calls(default_calls, any_order=True)
+
+    @mock.patch('six.moves.builtins.print')
+    @mock.patch('time.time')
+    def test_time_check_jitter_mismatch(self, mock_now, mock_print):
+        now = 1430000000.0
+        mock_now.return_value = now
+
+        def dummy_request(*args, **kwargs):
+            return [
+                ('http://127.0.0.1:6010/recon/time',
+                 now - 4,
+                 200,
+                 now,
+                 now + 2),
+                ('http://127.0.0.1:6020/recon/time',
+                 now + 4,
+                 200,
+                 now - 2,
+                 now),
+            ]
+
+        cli = recon.SwiftRecon()
+        cli.pool.imap = dummy_request
+
+        default_calls = [
+            mock.call("!! http://127.0.0.1:6010/recon/time current time is "
+                      "2015-04-25 22:13:22, but remote is "
+                      "2015-04-25 22:13:16, differs by 6.0000 sec"),
+            mock.call("!! http://127.0.0.1:6020/recon/time current time is "
+                      "2015-04-25 22:13:20, but remote is "
+                      "2015-04-25 22:13:24, differs by 4.0000 sec"),
+            mock.call('0/2 hosts matched, 0 error[s] while checking hosts.'),
+        ]
+
+        cli.time_check([('127.0.0.1', 6010), ('127.0.0.1', 6020)], 3)
 
         # We need any_order=True because the order of calls depends on the dict
         # that is returned from the recon middleware, thus can't rely on it

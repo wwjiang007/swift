@@ -95,7 +95,8 @@ class TestCommands(unittest.TestCase, RunSwiftRingBuilderMixin):
         except OSError:
             pass
 
-    def assertOutputStub(self, output, ext='stub'):
+    def assertOutputStub(self, output, ext='stub',
+                         builder_id='(not assigned)'):
         """
         assert that the given output string is equal to a in-tree stub file,
         if a test needs to check multiple outputs it can use custom ext's
@@ -113,6 +114,7 @@ class TestCommands(unittest.TestCase, RunSwiftRingBuilderMixin):
             else:
                 self.fail('%r could not be read (%s)' % (filepath, e))
         output = output.replace(self.tempfile, '__RINGFILE__')
+        stub = stub.replace('__BUILDER_ID__', builder_id)
         for i, (value, expected) in enumerate(
                 itertools.izip_longest(
                     output.splitlines(), stub.splitlines())):
@@ -132,7 +134,7 @@ class TestCommands(unittest.TestCase, RunSwiftRingBuilderMixin):
                     msg += '%3d: %s\n' % (i, line)
                 self.fail(msg)
 
-    def create_sample_ring(self, part_power=6):
+    def create_sample_ring(self, part_power=6, overload=None):
         """
         Create a sample ring with four devices
 
@@ -149,6 +151,8 @@ class TestCommands(unittest.TestCase, RunSwiftRingBuilderMixin):
             pass
 
         ring = RingBuilder(part_power, 3, 1)
+        if overload is not None:
+            ring.set_overload(overload)
         ring.add_dev({'weight': 100.0,
                       'region': 0,
                       'zone': 0,
@@ -179,6 +183,7 @@ class TestCommands(unittest.TestCase, RunSwiftRingBuilderMixin):
                       'device': 'sdd4'
                       })
         ring.save(self.tmpfile)
+        return ring
 
     def assertSystemExit(self, return_code, func, *argv):
         with self.assertRaises(SystemExit) as cm:
@@ -486,6 +491,16 @@ class TestCommands(unittest.TestCase, RunSwiftRingBuilderMixin):
         dev = ring.devs[-1]
         self.assertGreater(dev['region'], 0)
 
+    def test_add_device_part_power_increase(self):
+        self.create_sample_ring()
+        ring = RingBuilder.load(self.tmpfile)
+        ring.next_part_power = 1
+        ring.save(self.tmpfile)
+
+        argv = ["", self.tmpfile, "add",
+                "r0z0-127.0.1.1:6200/sda1_some meta data", "100"]
+        self.assertSystemExit(EXIT_WARNING, ringbuilder.main, argv)
+
     def test_remove_device(self):
         for search_value in self.search_values:
             self.create_sample_ring()
@@ -758,6 +773,15 @@ class TestCommands(unittest.TestCase, RunSwiftRingBuilderMixin):
         argv = ["", self.tmpfile, "remove",
                 "--ip", "unknown"]
         self.assertSystemExit(EXIT_ERROR, ringbuilder.main, argv)
+
+    def test_remove_device_part_power_increase(self):
+        self.create_sample_ring()
+        ring = RingBuilder.load(self.tmpfile)
+        ring.next_part_power = 1
+        ring.save(self.tmpfile)
+
+        argv = ["", self.tmpfile, "remove", "d0"]
+        self.assertSystemExit(EXIT_WARNING, ringbuilder.main, argv)
 
     def test_set_weight(self):
         for search_value in self.search_values:
@@ -1656,9 +1680,15 @@ class TestCommands(unittest.TestCase, RunSwiftRingBuilderMixin):
         self.assertSystemExit(EXIT_SUCCESS, ringbuilder.main, argv)
 
     def test_default_output(self):
-        self.create_sample_ring()
+        with mock.patch('uuid.uuid4', return_value=mock.Mock(hex=None)):
+            self.create_sample_ring()
         out, err = self.run_srb('')
         self.assertOutputStub(out)
+
+    def test_default_output_id_assigned(self):
+        ring = self.create_sample_ring()
+        out, err = self.run_srb('')
+        self.assertOutputStub(out, builder_id=ring.id)
 
     def test_ipv6_output(self):
         ring = RingBuilder(8, 3, 1)
@@ -1697,13 +1727,13 @@ class TestCommands(unittest.TestCase, RunSwiftRingBuilderMixin):
                       })
         ring.save(self.tmpfile)
         out, err = self.run_srb('')
-        self.assertOutputStub(out)
+        self.assertOutputStub(out, builder_id=ring.id)
 
     def test_default_show_removed(self):
         mock_stdout = six.StringIO()
         mock_stderr = six.StringIO()
 
-        self.create_sample_ring()
+        ring = self.create_sample_ring()
 
         # Note: it also sets device's weight to zero.
         argv = ["", self.tmpfile, "remove", "--id", "1"]
@@ -1719,7 +1749,7 @@ class TestCommands(unittest.TestCase, RunSwiftRingBuilderMixin):
             with mock.patch("sys.stderr", mock_stderr):
                 self.assertSystemExit(EXIT_SUCCESS, ringbuilder.main, argv)
 
-        expected = "%s, build version 6\n" \
+        expected = "%s, build version 6, id %s\n" \
             "64 partitions, 3.000000 replicas, 4 regions, 4 zones, " \
             "4 devices, 100.00 balance, 0.00 dispersion\n" \
             "The minimum number of hours before a partition can be " \
@@ -1741,8 +1771,46 @@ class TestCommands(unittest.TestCase, RunSwiftRingBuilderMixin):
             "          0 -100.00       \n" \
             "            3      3    3  127.0.0.4:6203 " \
             "     127.0.0.4:6203  sdd4   0.00" \
-            "          0    0.00       \n" % (self.tmpfile, self.tmpfile)
+            "          0    0.00       \n" %\
+                   (self.tmpfile, ring.id, self.tmpfile)
         self.assertEqual(expected, mock_stdout.getvalue())
+
+    def test_default_sorted_output(self):
+        mock_stdout = six.StringIO()
+        mock_stderr = six.StringIO()
+
+        # Create a sample ring and remove/add some devices.
+        now = time.time()
+        ring = self.create_sample_ring()
+        argv = ["", self.tmpfile, "add",
+                "--region", "1", "--zone", "2",
+                "--ip", "127.0.0.5", "--port", "6004",
+                "--replication-ip", "127.0.0.5",
+                "--replication-port", "6004",
+                "--device", "sda5", "--weight", "100.0"]
+        self.assertRaises(SystemExit, ringbuilder.main, argv)
+        argv = ["", self.tmpfile, "remove", "--id", "0"]
+        self.assertRaises(SystemExit, ringbuilder.main, argv)
+        argv = ["", self.tmpfile, "remove", "--id", "3"]
+        self.assertRaises(SystemExit, ringbuilder.main, argv)
+        argv = ["", self.tmpfile, "rebalance"]
+        self.assertRaises(SystemExit, ringbuilder.main, argv)
+        argv = \
+            ["", self.tmpfile, "add",
+             "--region", "2", "--zone", "1",
+             "--ip", "127.0.0.6", "--port", "6005",
+             "--replication-ip", "127.0.0.6",
+             "--replication-port", "6005",
+             "--device", "sdb6", "--weight", "100.0"]
+        self.assertRaises(SystemExit, ringbuilder.main, argv)
+
+        # Check the order of the devices listed the output.
+        argv = ["", self.tmpfile]
+        with mock.patch("sys.stdout", mock_stdout), mock.patch(
+                "sys.stderr", mock_stderr), mock.patch(
+                    'swift.common.ring.builder.time', return_value=now):
+            self.assertRaises(SystemExit, ringbuilder.main, argv)
+        self.assertOutputStub(mock_stdout.getvalue(), builder_id=ring.id)
 
     def test_default_ringfile_check(self):
         self.create_sample_ring()
@@ -1978,6 +2046,15 @@ class TestCommands(unittest.TestCase, RunSwiftRingBuilderMixin):
         ring = RingBuilder.load(self.tmpfile)
         self.assertEqual(last_replica2part2dev, ring._replica2part2dev)
 
+    def test_rebalance_part_power_increase(self):
+        self.create_sample_ring()
+        ring = RingBuilder.load(self.tmpfile)
+        ring.next_part_power = 1
+        ring.save(self.tmpfile)
+
+        argv = ["", self.tmpfile, "rebalance", "3"]
+        self.assertSystemExit(EXIT_WARNING, ringbuilder.main, argv)
+
     def test_write_ring(self):
         self.create_sample_ring()
         argv = ["", self.tmpfile, "rebalance"]
@@ -2020,36 +2097,51 @@ class TestCommands(unittest.TestCase, RunSwiftRingBuilderMixin):
         self.assertIsNone(ringbuilder.main(argv))
 
     def test_warn_at_risk(self):
-        # when the number of total part replicas (3 * 2 ** 4 = 48 in
-        # this ring) is less than the total units of weight (310 in this
-        # ring) the relative number of parts per unit of weight (called
-        # weight_of_one_part) is less than 1 - and each whole part
-        # placed takes up a larger ratio of the fractional number of
-        # parts the device wants - so it's much more difficult to
-        # satisfy a device's weight exactly - that is to say less parts
-        # to go around tends to make things lumpy
-        self.create_sample_ring(4)
-        ring = RingBuilder.load(self.tmpfile)
-        ring.devs[0]['weight'] = 10
-        ring.save(self.tmpfile)
+        # check that warning is generated when rebalance does not achieve
+        # satisfactory balance
+        self.create_sample_ring()
+        orig_rebalance = RingBuilder.rebalance
+        fake_balance = 6
+
+        def fake_rebalance(builder_instance, *args, **kwargs):
+            parts, balance, removed_devs = orig_rebalance(builder_instance)
+            return parts, fake_balance, removed_devs
+
         argv = ["", self.tmpfile, "rebalance"]
-        self.assertSystemExit(EXIT_WARNING, ringbuilder.main, argv)
+        with mock.patch("swift.common.ring.builder.RingBuilder.rebalance",
+                        fake_rebalance):
+            self.assertSystemExit(EXIT_WARNING, ringbuilder.main, argv)
+
+        # even when some overload is allowed
+        self.create_sample_ring(overload=0.05)
+        argv = ["", self.tmpfile, "rebalance"]
+        with mock.patch("swift.common.ring.builder.RingBuilder.rebalance",
+                        fake_rebalance):
+            self.assertSystemExit(EXIT_WARNING, ringbuilder.main, argv)
 
     def test_no_warn_when_balanced(self):
-        # when the number of total part replicas (3 * 2 ** 10 = 3072 in
-        # this ring) is larger than the total units of weight (310 in
-        # this ring) the relative number of parts per unit of weight
-        # (called weight_of_one_part) is more than 1 - and each whole
-        # part placed takes up a smaller ratio of the larger number of
-        # parts the device wants - so it's much easier to satisfy a
-        # device's weight exactly - that is to say more parts to go
-        # around tends to smooth things out
-        self.create_sample_ring(10)
-        ring = RingBuilder.load(self.tmpfile)
-        ring.devs[0]['weight'] = 10
-        ring.save(self.tmpfile)
+        # check that no warning is generated when satisfactory balance is
+        # achieved...
+        self.create_sample_ring()
+        orig_rebalance = RingBuilder.rebalance
+        fake_balance = 5
+
+        def fake_rebalance(builder_instance, *args, **kwargs):
+            parts, balance, removed_devs = orig_rebalance(builder_instance)
+            return parts, fake_balance, removed_devs
+
         argv = ["", self.tmpfile, "rebalance"]
-        self.assertSystemExit(EXIT_SUCCESS, ringbuilder.main, argv)
+        with mock.patch("swift.common.ring.builder.RingBuilder.rebalance",
+                        fake_rebalance):
+            self.assertSystemExit(EXIT_SUCCESS, ringbuilder.main, argv)
+
+        # ...or balance is within permitted overload
+        self.create_sample_ring(overload=0.06)
+        fake_balance = 6
+        argv = ["", self.tmpfile, "rebalance"]
+        with mock.patch("swift.common.ring.builder.RingBuilder.rebalance",
+                        fake_rebalance):
+            self.assertSystemExit(EXIT_SUCCESS, ringbuilder.main, argv)
 
     def test_invalid_device_name(self):
         self.create_sample_ring()

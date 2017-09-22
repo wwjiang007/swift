@@ -21,7 +21,6 @@ through the proxy.
 import json
 import os
 import socket
-from time import time
 
 from eventlet import sleep, Timeout
 import six
@@ -43,6 +42,8 @@ class DirectClientException(ClientException):
         # host can be used to override the node ip and port reported in
         # the exception
         host = host if host is not None else node
+        if not isinstance(path, six.text_type):
+            path = path.decode("utf-8")
         full_path = quote('/%s/%s%s' % (node['device'], part, path))
         msg = '%s server %s:%s direct %s %r gave status %s' % (
             stype, host['ip'], host['port'], method, full_path, resp.status)
@@ -87,19 +88,20 @@ def _get_direct_account_container(path, stype, node, part,
     Do not use directly use the get_direct_account or
     get_direct_container instead.
     """
-    qs = 'format=json'
+    params = ['format=json']
     if marker:
-        qs += '&marker=%s' % quote(marker)
+        params.append('marker=%s' % quote(marker))
     if limit:
-        qs += '&limit=%d' % limit
+        params.append('limit=%d' % limit)
     if prefix:
-        qs += '&prefix=%s' % quote(prefix)
+        params.append('prefix=%s' % quote(prefix))
     if delimiter:
-        qs += '&delimiter=%s' % quote(delimiter)
+        params.append('delimiter=%s' % quote(delimiter))
     if end_marker:
-        qs += '&end_marker=%s' % quote(end_marker)
+        params.append('end_marker=%s' % quote(end_marker))
     if reverse:
-        qs += '&reverse=%s' % quote(reverse)
+        params.append('reverse=%s' % quote(reverse))
+    qs = '&'.join(params)
     with Timeout(conn_timeout):
         conn = http_connect(node['ip'], node['port'], node['device'], part,
                             'GET', path, query_string=qs,
@@ -122,7 +124,7 @@ def _get_direct_account_container(path, stype, node, part,
 def gen_headers(hdrs_in=None, add_ts=False):
     hdrs_out = HeaderKeyDict(hdrs_in) if hdrs_in else HeaderKeyDict()
     if add_ts:
-        hdrs_out['X-Timestamp'] = Timestamp(time()).internal
+        hdrs_out['X-Timestamp'] = Timestamp.now().internal
     hdrs_out['User-Agent'] = 'direct-client %s' % os.getpid()
     return hdrs_out
 

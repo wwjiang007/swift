@@ -572,7 +572,7 @@ class TestStoragePolicies(unittest.TestCase):
 
         # remove name
         policies.remove_policy_alias('tahi')
-        self.assertEqual(policies.get_by_name('tahi'), None)
+        self.assertIsNone(policies.get_by_name('tahi'))
 
         # remove only name
         self.assertRaisesWithMessage(PolicyError,
@@ -586,7 +586,7 @@ class TestStoragePolicies(unittest.TestCase):
 
         # remove default name
         policies.remove_policy_alias('two')
-        self.assertEqual(policies.get_by_name('two'), None)
+        self.assertIsNone(policies.get_by_name('two'))
         self.assertEqual(policies.get_by_index(2).name, 'rua')
 
         # change default name to a new name
@@ -650,7 +650,7 @@ class TestStoragePolicies(unittest.TestCase):
             parse_storage_policies(good_conf)
         mock_driver.assert_called_once()
         mock_driver.reset_mock()
-        self.assertFalse([(r.levelname, r.message) for r in records])
+        self.assertFalse([(r.levelname, r.msg) for r in records])
 
         good_conf = self._conf("""
         [storage-policy:0]
@@ -665,7 +665,7 @@ class TestStoragePolicies(unittest.TestCase):
             parse_storage_policies(good_conf)
         mock_driver.assert_called_once()
         mock_driver.reset_mock()
-        self.assertFalse([(r.levelname, r.message) for r in records])
+        self.assertFalse([(r.levelname, r.msg) for r in records])
 
         bad_conf = self._conf("""
         [storage-policy:0]
@@ -676,18 +676,21 @@ class TestStoragePolicies(unittest.TestCase):
         ec_num_parity_fragments = 5
         """)
 
-        with capture_logging('swift.common.storage_policy') as records:
+        with capture_logging('swift.common.storage_policy') as records, \
+                self.assertRaises(PolicyError) as exc_mgr:
             parse_storage_policies(bad_conf)
-        mock_driver.assert_called_once()
+        self.assertEqual(exc_mgr.exception.message,
+                         'Storage policy bad-policy uses an EC '
+                         'configuration known to harm data durability. This '
+                         'policy MUST be deprecated.')
+        mock_driver.assert_not_called()
         mock_driver.reset_mock()
         self.assertEqual([r.levelname for r in records],
-                         ['WARNING', 'WARNING'])
+                         ['WARNING'])
         for msg in ('known to harm data durability',
                     'Any data in this policy should be migrated',
                     'https://bugs.launchpad.net/swift/+bug/1639691'):
-            self.assertIn(msg, records[0].message)
-        self.assertIn('In a future release, this will prevent services from '
-                      'starting', records[1].message)
+            self.assertIn(msg, records[0].msg)
 
         slightly_less_bad_conf = self._conf("""
         [storage-policy:0]
@@ -716,7 +719,7 @@ class TestStoragePolicies(unittest.TestCase):
         for msg in ('known to harm data durability',
                     'Any data in this policy should be migrated',
                     'https://bugs.launchpad.net/swift/+bug/1639691'):
-            self.assertIn(msg, records[0].message)
+            self.assertIn(msg, records[0].msg)
 
     def test_no_default(self):
         orig_conf = self._conf("""
@@ -1048,7 +1051,7 @@ class TestStoragePolicies(unittest.TestCase):
         with NamedTemporaryFile() as f:
             conf.write(f)
             f.flush()
-            with mock.patch('swift.common.storage_policy.SWIFT_CONF_FILE',
+            with mock.patch('swift.common.utils.SWIFT_CONF_FILE',
                             new=f.name):
                 try:
                     reload_storage_policies()

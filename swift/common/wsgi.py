@@ -65,6 +65,7 @@ class NamedConfigLoader(loadwsgi.ConfigLoader):
         context = super(NamedConfigLoader, self).get_context(
             object_type, name=name, global_conf=global_conf)
         context.name = name
+        context.local_conf['__name__'] = name
         return context
 
 
@@ -114,7 +115,7 @@ class ConfigString(NamedConfigLoader):
         self.filename = "string"
         defaults = {
             'here': "string",
-            '__file__': "string",
+            '__file__': self.contents,
         }
         self.parser = loadwsgi.NicerConfigParser("string", defaults=defaults)
         self.parser.optionxform = str  # Don't lower-case keys
@@ -479,7 +480,7 @@ class WorkersStrategy(object):
 
         return 0.5
 
-    def bind_ports(self):
+    def do_bind_ports(self):
         """
         Bind the one listen socket for this strategy and drop privileges
         (since the parent process will never need to bind again).
@@ -730,7 +731,7 @@ class ServersPerPortStrategy(object):
 
         return self.ring_check_interval
 
-    def bind_ports(self):
+    def do_bind_ports(self):
         """
         Bind one listen socket per unique local storage policy ring port.  Then
         do all the work of drop_privileges except the actual dropping of
@@ -891,12 +892,6 @@ def run_wsgi(conf_path, app_section, *args, **kwargs):
     else:
         strategy = WorkersStrategy(conf, logger)
 
-    error_msg = strategy.bind_ports()
-    if error_msg:
-        logger.error(error_msg)
-        print(error_msg)
-        return 1
-
     # Ensure the configuration and application can be loaded before proceeding.
     global_conf = {'log_name': log_name}
     if 'global_conf_callback' in kwargs:
@@ -907,7 +902,15 @@ def run_wsgi(conf_path, app_section, *args, **kwargs):
     utils.FALLOCATE_RESERVE, utils.FALLOCATE_IS_PERCENT = \
         utils.config_fallocate_value(conf.get('fallocate_reserve', '1%'))
 
-    # redirect errors to logger and close stdio
+    # Start listening on bind_addr/port
+    error_msg = strategy.do_bind_ports()
+    if error_msg:
+        logger.error(error_msg)
+        print(error_msg)
+        return 1
+
+    # Redirect errors to logger and close stdio. Do this *after* binding ports;
+    # we use this to signal that the service is ready to accept connections.
     capture_stdio(logger)
 
     no_fork_sock = strategy.no_fork_sock()

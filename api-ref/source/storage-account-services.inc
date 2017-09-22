@@ -7,7 +7,7 @@ Accounts
 Lists containers for an account. Creates, updates, shows, and
 deletes account metadata. For more information and concepts about
 accounts see `Object Storage API overview
-<http://docs.openstack.org/developer/swift/api/object_api_v1_overview.html>`_.
+<https://docs.openstack.org/swift/latest/api/object_api_v1_overview.html>`_.
 
 
 
@@ -112,8 +112,8 @@ Response Parameters
    - X-Account-Access-Control: X-Account-Access-Control_resp
    - Content-Type: Content-Type_listing_resp
    - count: count
-   - bytes: bytes
-   - name: name
+   - bytes: bytes_in_account_get
+   - name: name_in_account_get
 
 
 Create, update, or delete account metadata

@@ -16,6 +16,9 @@
 import mimetypes
 import os
 import socket
+
+from collections import defaultdict
+
 from swift import gettext_ as _
 from random import shuffle
 from time import time
@@ -23,7 +26,6 @@ import functools
 import sys
 
 from eventlet import Timeout
-import six
 
 from swift import __canonical_version__ as swift_version
 from swift.common import constraints
@@ -32,7 +34,7 @@ from swift.common.ring import Ring
 from swift.common.utils import cache_from_env, get_logger, \
     get_remote_client, split_path, config_true_value, generate_trans_id, \
     affinity_key_function, affinity_locality_predicate, list_from_csv, \
-    register_swift_info
+    register_swift_info, readconf, config_auto_int_value
 from swift.common.constraints import check_utf8, valid_api_version
 from swift.proxy.controllers import AccountController, ContainerController, \
     ObjectControllerRouter, InfoController
@@ -64,16 +66,94 @@ required_filters = [
      'after_fn': lambda pipe: (['catch_errors']
                                if pipe.startswith('catch_errors')
                                else [])},
+    {'name': 'listing_formats', 'after_fn': lambda _junk: [
+        'catch_errors', 'gatekeeper', 'proxy_logging', 'memcache']},
+    # Put copy before dlo, slo and versioned_writes
+    {'name': 'copy', 'after_fn': lambda _junk: [
+        'staticweb', 'tempauth', 'keystoneauth',
+        'catch_errors', 'gatekeeper', 'proxy_logging']},
     {'name': 'dlo', 'after_fn': lambda _junk: [
         'copy', 'staticweb', 'tempauth', 'keystoneauth',
         'catch_errors', 'gatekeeper', 'proxy_logging']},
     {'name': 'versioned_writes', 'after_fn': lambda _junk: [
         'slo', 'dlo', 'copy', 'staticweb', 'tempauth',
         'keystoneauth', 'catch_errors', 'gatekeeper', 'proxy_logging']},
-    # Put copy before dlo, slo and versioned_writes
-    {'name': 'copy', 'after_fn': lambda _junk: [
-        'staticweb', 'tempauth', 'keystoneauth',
-        'catch_errors', 'gatekeeper', 'proxy_logging']}]
+]
+
+
+def _label_for_policy(policy):
+    if policy is not None:
+        return 'policy %s (%s)' % (policy.idx, policy.name)
+    return '(default)'
+
+
+class ProxyOverrideOptions(object):
+    """
+    Encapsulates proxy server options that may be overridden e.g. for
+    policy specific configurations.
+
+    :param conf: the proxy-server config dict.
+    :param override_conf: a dict of overriding configuration options.
+    """
+    def __init__(self, base_conf, override_conf):
+        def get(key, default):
+            return override_conf.get(key, base_conf.get(key, default))
+
+        self.sorting_method = get('sorting_method', 'shuffle').lower()
+        self.read_affinity = get('read_affinity', '')
+        try:
+            self.read_affinity_sort_key = affinity_key_function(
+                self.read_affinity)
+        except ValueError as err:
+            # make the message a little more useful
+            raise ValueError("Invalid read_affinity value: %r (%s)" %
+                             (self.read_affinity, err.message))
+
+        self.write_affinity = get('write_affinity', '')
+        try:
+            self.write_affinity_is_local_fn \
+                = affinity_locality_predicate(self.write_affinity)
+        except ValueError as err:
+            # make the message a little more useful
+            raise ValueError("Invalid write_affinity value: %r (%s)" %
+                             (self.write_affinity, err.message))
+        self.write_affinity_node_count = get(
+            'write_affinity_node_count', '2 * replicas').lower()
+        value = self.write_affinity_node_count.split()
+        if len(value) == 1:
+            wanc_value = int(value[0])
+            self.write_affinity_node_count_fn = lambda replicas: wanc_value
+        elif len(value) == 3 and value[1] == '*' and value[2] == 'replicas':
+            wanc_value = int(value[0])
+            self.write_affinity_node_count_fn = \
+                lambda replicas: wanc_value * replicas
+        else:
+            raise ValueError(
+                'Invalid write_affinity_node_count value: %r' %
+                (' '.join(value)))
+
+        self.write_affinity_handoff_delete_count = config_auto_int_value(
+            get('write_affinity_handoff_delete_count', 'auto'), None
+        )
+
+    def __repr__(self):
+        return '%s({}, {%s})' % (self.__class__.__name__, ', '.join(
+            '%r: %r' % (k, getattr(self, k)) for k in (
+                'sorting_method',
+                'read_affinity',
+                'write_affinity',
+                'write_affinity_node_count',
+                'write_affinity_handoff_delete_count')))
+
+    def __eq__(self, other):
+        if not isinstance(other, ProxyOverrideOptions):
+            return False
+        return all(getattr(self, k) == getattr(other, k) for k in (
+            'sorting_method',
+            'read_affinity',
+            'write_affinity',
+            'write_affinity_node_count',
+            'write_affinity_handoff_delete_count'))
 
 
 class Application(object):
@@ -87,6 +167,9 @@ class Application(object):
             self.logger = get_logger(conf, log_route='proxy-server')
         else:
             self.logger = logger
+        self._override_options = self._load_per_policy_config(conf)
+        self.sorts_by_timing = any(pc.sorting_method == 'timing'
+                                   for pc in self._override_options.values())
 
         self._error_limiting = {}
 
@@ -155,7 +238,6 @@ class Application(object):
             conf.get('strict_cors_mode', 't'))
         self.node_timings = {}
         self.timing_expiry = int(conf.get('timing_expiry', 300))
-        self.sorting_method = conf.get('sorting_method', 'shuffle').lower()
         self.concurrent_gets = \
             config_true_value(conf.get('concurrent_gets'))
         self.concurrency_timeout = float(conf.get('concurrency_timeout',
@@ -170,33 +252,6 @@ class Application(object):
         else:
             raise ValueError(
                 'Invalid request_node_count value: %r' % ''.join(value))
-        try:
-            self._read_affinity = read_affinity = conf.get('read_affinity', '')
-            self.read_affinity_sort_key = affinity_key_function(read_affinity)
-        except ValueError as err:
-            # make the message a little more useful
-            raise ValueError("Invalid read_affinity value: %r (%s)" %
-                             (read_affinity, err.message))
-        try:
-            write_affinity = conf.get('write_affinity', '')
-            self.write_affinity_is_local_fn \
-                = affinity_locality_predicate(write_affinity)
-        except ValueError as err:
-            # make the message a little more useful
-            raise ValueError("Invalid write_affinity value: %r (%s)" %
-                             (write_affinity, err.message))
-        value = conf.get('write_affinity_node_count',
-                         '2 * replicas').lower().split()
-        if len(value) == 1:
-            wanc_value = int(value[0])
-            self.write_affinity_node_count = lambda replicas: wanc_value
-        elif len(value) == 3 and value[1] == '*' and value[2] == 'replicas':
-            wanc_value = int(value[0])
-            self.write_affinity_node_count = \
-                lambda replicas: wanc_value * replicas
-        else:
-            raise ValueError(
-                'Invalid write_affinity_node_count value: %r' % ''.join(value))
         # swift_owner_headers are stripped by the account and container
         # controllers; we should extend header stripping to object controller
         # when a privileged object header is implemented.
@@ -235,15 +290,69 @@ class Application(object):
             account_autocreate=self.account_autocreate,
             **constraints.EFFECTIVE_CONSTRAINTS)
 
+    def _make_policy_override(self, policy, conf, override_conf):
+        label_for_policy = _label_for_policy(policy)
+        try:
+            override = ProxyOverrideOptions(conf, override_conf)
+            self.logger.debug("Loaded override config for %s: %r" %
+                              (label_for_policy, override))
+            return override
+        except ValueError as err:
+            raise ValueError(err.message + ' for %s' % label_for_policy)
+
+    def _load_per_policy_config(self, conf):
+        """
+        Loads per-policy config override values from proxy server conf file.
+
+        :param conf: the proxy server local conf dict
+        :return: a dict mapping :class:`BaseStoragePolicy` to an instance of
+            :class:`ProxyOverrideOptions` that has policy-specific config
+            attributes
+        """
+        # the default options will be used when looking up a policy that had no
+        # override options
+        default_options = self._make_policy_override(None, conf, {})
+        overrides = defaultdict(lambda: default_options)
+        # force None key to be set in the defaultdict so that it is found when
+        # iterating over items in check_config
+        overrides[None] = default_options
+        for index, override_conf in conf.get('policy_config', {}).items():
+            try:
+                index = int(index)
+            except ValueError:
+                # require policies to be referenced by index; using index *or*
+                # name isn't possible because names such as "3" are allowed
+                raise ValueError(
+                    'Override config must refer to policy index: %r' % index)
+            try:
+                policy = POLICIES[index]
+            except KeyError:
+                raise ValueError(
+                    "No policy found for override config, index: %s" % index)
+            override = self._make_policy_override(policy, conf, override_conf)
+            overrides[policy] = override
+        return overrides
+
+    def get_policy_options(self, policy):
+        """
+        Return policy specific options.
+
+        :param policy: an instance of :class:`BaseStoragePolicy`
+        :return: an instance of :class:`ProxyOverrideOptions`
+        """
+        return self._override_options[policy]
+
     def check_config(self):
         """
         Check the configuration for possible errors
         """
-        if self._read_affinity and self.sorting_method != 'affinity':
-            self.logger.warning(
-                _("sorting_method is set to '%s', not 'affinity'; "
-                  "read_affinity setting will have no effect."),
-                self.sorting_method)
+        for policy, options in self._override_options.items():
+            if options.read_affinity and options.sorting_method != 'affinity':
+                self.logger.warning(
+                    _("sorting_method is set to '%(method)s', not 'affinity'; "
+                      "%(label)s read_affinity setting will have no effect."),
+                    {'label': _label_for_policy(policy),
+                     'method': options.sorting_method})
 
     def get_object_ring(self, policy_idx):
         """
@@ -262,7 +371,7 @@ class Application(object):
         :param req: the request
         :returns: tuple of (controller class, path dictionary)
 
-        :raises: ValueError (thrown by split_path) if given invalid path
+        :raises ValueError: (thrown by split_path) if given invalid path
         """
         if req.path == '/info':
             d = dict(version=None,
@@ -355,9 +464,6 @@ class Application(object):
 
             try:
                 controller, path_parts = self.get_controller(req)
-                p = req.path_info
-                if isinstance(p, six.text_type):
-                    p = p.encode('utf-8')
             except APIVersionError:
                 self.logger.increment('errors')
                 return HTTPBadRequest(request=req)
@@ -425,30 +531,34 @@ class Application(object):
             self.logger.exception(_('ERROR Unhandled exception in request'))
             return HTTPServerError(request=req)
 
-    def sort_nodes(self, nodes):
-        '''
+    def sort_nodes(self, nodes, policy=None):
+        """
         Sorts nodes in-place (and returns the sorted list) according to
         the configured strategy. The default "sorting" is to randomly
         shuffle the nodes. If the "timing" strategy is chosen, the nodes
         are sorted according to the stored timing data.
-        '''
+
+        :param nodes: a list of nodes
+        :param policy: an instance of :class:`BaseStoragePolicy`
+        """
         # In the case of timing sorting, shuffling ensures that close timings
         # (ie within the rounding resolution) won't prefer one over another.
         # Python's sort is stable (http://wiki.python.org/moin/HowTo/Sorting/)
         shuffle(nodes)
-        if self.sorting_method == 'timing':
+        policy_options = self.get_policy_options(policy)
+        if policy_options.sorting_method == 'timing':
             now = time()
 
             def key_func(node):
                 timing, expires = self.node_timings.get(node['ip'], (-1.0, 0))
                 return timing if expires > now else -1.0
             nodes.sort(key=key_func)
-        elif self.sorting_method == 'affinity':
-            nodes.sort(key=self.read_affinity_sort_key)
+        elif policy_options.sorting_method == 'affinity':
+            nodes.sort(key=policy_options.read_affinity_sort_key)
         return nodes
 
     def set_node_timing(self, node, timing):
-        if self.sorting_method != 'timing':
+        if not self.sorts_by_timing:
             return
         now = time()
         timing = round(timing, 3)  # sort timings to the millisecond
@@ -516,8 +626,9 @@ class Application(object):
                           {'msg': msg.decode('utf-8'), 'ip': node['ip'],
                           'port': node['port'], 'device': node['device']})
 
-    def iter_nodes(self, ring, partition, node_iter=None):
-        return NodeIter(self, ring, partition, node_iter=node_iter)
+    def iter_nodes(self, ring, partition, node_iter=None, policy=None):
+        return NodeIter(self, ring, partition, node_iter=node_iter,
+                        policy=policy)
 
     def exception_occurred(self, node, typ, additional_info,
                            **kwargs):
@@ -575,10 +686,35 @@ class Application(object):
             self.logger.debug(_("Pipeline is \"%s\""), pipe)
 
 
+def parse_per_policy_config(conf):
+    """
+    Search the config file for any per-policy config sections and load those
+    sections to a dict mapping policy reference (name or index) to policy
+    options.
+
+    :param conf: the proxy server conf dict
+    :return: a dict mapping policy reference -> dict of policy options
+    :raises ValueError: if a policy config section has an invalid name
+    """
+    policy_config = {}
+    all_conf = readconf(conf['__file__'])
+    policy_section_prefix = conf['__name__'] + ':policy:'
+    for section, options in all_conf.items():
+        if not section.startswith(policy_section_prefix):
+            continue
+        policy_ref = section[len(policy_section_prefix):]
+        policy_config[policy_ref] = options
+    return policy_config
+
+
 def app_factory(global_conf, **local_conf):
     """paste.deploy app factory for creating WSGI proxy apps."""
     conf = global_conf.copy()
     conf.update(local_conf)
+    # Do this here so that the use of conf['__file__'] and conf['__name__'] is
+    # isolated from the Application. This also simplifies tests that construct
+    # an Application instance directly.
+    conf['policy_config'] = parse_per_policy_config(conf)
     app = Application(conf)
     app.check_config()
     return app

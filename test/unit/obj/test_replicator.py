@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import collections
+import json
 import unittest
 import os
 import mock
@@ -131,7 +132,7 @@ def _mock_process(ret):
     object_replicator.subprocess.Popen = orig_process
 
 
-def _create_test_rings(path, devs=None):
+def _create_test_rings(path, devs=None, next_part_power=None):
     testgz = os.path.join(path, 'object.ring.gz')
     intended_replica2part2dev_id = [
         [0, 1, 2, 3, 4, 5, 6],
@@ -159,14 +160,14 @@ def _create_test_rings(path, devs=None):
     with closing(GzipFile(testgz, 'wb')) as f:
         pickle.dump(
             ring.RingData(intended_replica2part2dev_id,
-                          intended_devs, intended_part_shift),
+                          intended_devs, intended_part_shift, next_part_power),
             f)
 
     testgz = os.path.join(path, 'object-1.ring.gz')
     with closing(GzipFile(testgz, 'wb')) as f:
         pickle.dump(
             ring.RingData(intended_replica2part2dev_id,
-                          intended_devs, intended_part_shift),
+                          intended_devs, intended_part_shift, next_part_power),
             f)
     for policy in POLICIES:
         policy.object_ring = None  # force reload
@@ -320,12 +321,31 @@ class TestObjectReplicator(unittest.TestCase):
         self.assertEqual((start + 1) % 10, replicator.replication_cycle)
         self.assertFalse(process_errors)
         self.assertFalse(self.logger.get_lines_for_level('error'))
+
+        # Returns 0 at first, and 60 on all following .next() calls
+        def _infinite_gen():
+            yield 0
+            while True:
+                yield 60
+
+        for cycle in range(1, 10):
+            with _mock_process(process_arg_checker):
+                with mock.patch('time.time', side_effect=_infinite_gen()):
+                    replicator.run_once()
+                    self.assertEqual((start + 1 + cycle) % 10,
+                                     replicator.replication_cycle)
+
+        self.assertEqual(0, replicator.stats['start'])
+        recon_fname = os.path.join(self.recon_cache, "object.recon")
+        with open(recon_fname) as cachefile:
+            recon = json.loads(cachefile.read())
+            self.assertEqual(1, recon.get('replication_time'))
+            self.assertIn('replication_stats', recon)
+            self.assertIn('replication_last', recon)
+        expected = 'Object replication complete (once). (1.00 minutes)'
+        self.assertIn(expected, self.logger.get_lines_for_level('info'))
+        self.assertFalse(self.logger.get_lines_for_level('error'))
         object_replicator.http_connect = was_connector
-        with _mock_process(process_arg_checker):
-            for cycle in range(1, 10):
-                replicator.run_once()
-                self.assertEqual((start + 1 + cycle) % 10,
-                                 replicator.replication_cycle)
 
     # policy 1
     def test_run_once_1(self):
@@ -1627,8 +1647,11 @@ class TestObjectReplicator(unittest.TestCase):
         # if a timeout occurs while replicating one partition to one node.
         timeouts = [Timeout()]
 
-        def fake_get_hashes(df_mgr, part_path, **kwargs):
+        def fake_get_hashes(df_mgr, device, partition, policy, **kwargs):
             self.get_hash_count += 1
+            dev_path = df_mgr.get_dev_path(device)
+            part_path = os.path.join(dev_path, diskfile.get_data_dir(policy),
+                                     str(partition))
             # Simulate a REPLICATE timeout by raising Timeout for second call
             # to get_hashes (with recalculate suffixes) for a specific
             # partition
@@ -1750,7 +1773,7 @@ class TestObjectReplicator(unittest.TestCase):
         mock_do_listdir.side_effect = do_listdir_results
         expected_tpool_calls = [
             mock.call(self.replicator._df_router[job['policy']]._get_hashes,
-                      job['path'],
+                      job['device'], job['partition'], job['policy'],
                       do_listdir=do_listdir)
             for job, do_listdir in zip(jobs, do_listdir_results)
         ]
@@ -1955,6 +1978,15 @@ class TestObjectReplicator(unittest.TestCase):
 
             # After 10 cycles every partition is seen exactly once
             self.assertEqual(sorted(range(partitions)), sorted(seen))
+
+    def test_replicate_skipped_partpower_increase(self):
+        _create_test_rings(self.testdir, next_part_power=4)
+        self.replicator.replicate()
+        self.assertEqual(0, self.replicator.job_count)
+        self.assertEqual(0, self.replicator.replication_count)
+        warnings = self.logger.get_lines_for_level('warning')
+        self.assertIn(
+            "next_part_power set in policy 'one'. Skipping", warnings)
 
 
 if __name__ == '__main__':
