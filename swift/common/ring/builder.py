@@ -130,7 +130,7 @@ class RingBuilder(object):
         # within a given number of hours (24 is my usual test). Removing
         # a device overrides this behavior as it's assumed that's only
         # done because of device failure.
-        self._last_part_moves = None
+        self._last_part_moves = array('B', itertools.repeat(0, self.parts))
         # _part_moved_bitmap record parts have been moved
         self._part_moved_bitmap = None
         # _last_part_moves_epoch indicates the time the offsets in
@@ -167,7 +167,7 @@ class RingBuilder(object):
 
     @property
     def ever_rebalanced(self):
-        return self._last_part_moves is not None
+        return self._replica2part2dev is not None
 
     def _set_part_moved(self, part):
         self._last_part_moves[part] = 0
@@ -507,7 +507,7 @@ class RingBuilder(object):
 
         if not self.ever_rebalanced:
             self.logger.debug("New builder; performing initial balance")
-            self._last_part_moves = array('B', itertools.repeat(0, self.parts))
+
         self._update_last_part_moves()
 
         with _set_random_seed(seed):
@@ -525,7 +525,9 @@ class RingBuilder(object):
 
             # we'll gather a few times, or until we archive the plan
             for gather_count in range(MAX_BALANCE_GATHER_COUNT):
-                self._gather_parts_for_balance(assign_parts, replica_plan)
+                self._gather_parts_for_balance(assign_parts, replica_plan,
+                                               # firsrt attempt go for disperse
+                                               gather_count == 0)
                 if not assign_parts:
                     # most likely min part hours
                     finish_status = 'Unable to finish'
@@ -923,7 +925,7 @@ class RingBuilder(object):
         """
         self._part_moved_bitmap = bytearray(max(2 ** (self.part_power - 3), 1))
         elapsed_hours = int(time() - self._last_part_moves_epoch) / 3600
-        if elapsed_hours <= 0 or not self._last_part_moves:
+        if elapsed_hours <= 0:
             return
         for part in range(self.parts):
             # The "min(self._last_part_moves[part] + elapsed_hours, 0xff)"
@@ -1097,6 +1099,12 @@ class RingBuilder(object):
         :param start: offset into self.parts to begin search
         :param replica_plan: replicanth targets for tiers
         """
+        tier2children = self._build_tier2children()
+        parts_wanted_in_tier = defaultdict(int)
+        for dev in self._iter_devs():
+            wanted = max(dev['parts_wanted'], 0)
+            for tier in dev['tiers']:
+                parts_wanted_in_tier[tier] += wanted
         # Last, we gather partitions from devices that are "overweight" because
         # they have more partitions than their parts_wanted.
         for offset in range(self.parts):
@@ -1128,8 +1136,17 @@ class RingBuilder(object):
                        replicas_at_tier[tier] <
                        replica_plan[tier]['max']
                        for tier in dev['tiers']):
+                    # we're stuck by replica plan
                     continue
-
+                for t in reversed(dev['tiers']):
+                    if replicas_at_tier[t] - 1 < replica_plan[t]['min']:
+                        # we're stuck at tier t
+                        break
+                if sum(parts_wanted_in_tier[c]
+                       for c in tier2children[t]
+                       if c not in dev['tiers']) <= 0:
+                    # we're stuck by weight
+                    continue
                 # this is the most overweight_device holding a replica
                 # of this part that can shed it according to the plan
                 dev['parts_wanted'] += 1
@@ -1141,15 +1158,19 @@ class RingBuilder(object):
                 self._replica2part2dev[replica][part] = NONE_DEV
                 for tier in dev['tiers']:
                     replicas_at_tier[tier] -= 1
+                    parts_wanted_in_tier[tier] -= 1
                 self._set_part_moved(part)
                 break
 
-    def _gather_parts_for_balance(self, assign_parts, replica_plan):
+    def _gather_parts_for_balance(self, assign_parts, replica_plan,
+                                  disperse_first):
         """
         Gather parts that look like they should move for balance reasons.
 
         A simple gathers of parts that looks dispersible normally works out,
         we'll switch strategies if things don't seem to move.
+        :param disperse_first: boolean, avoid replicas on overweight devices
+                               that need to be there for dispersion
         """
         # pick a random starting point on the other side of the ring
         quarter_turn = (self.parts // 4)
@@ -1162,10 +1183,10 @@ class RingBuilder(object):
                            'last_start': self._last_part_gather_start})
         self._last_part_gather_start = start
 
-        self._gather_parts_for_balance_can_disperse(
-            assign_parts, start, replica_plan)
-        if not assign_parts:
-            self._gather_parts_for_balance_forced(assign_parts, start)
+        if disperse_first:
+            self._gather_parts_for_balance_can_disperse(
+                assign_parts, start, replica_plan)
+        self._gather_parts_for_balance_forced(assign_parts, start)
 
     def _gather_parts_for_balance_forced(self, assign_parts, start, **kwargs):
         """
