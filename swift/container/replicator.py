@@ -14,23 +14,21 @@
 # limitations under the License.
 
 import os
-import itertools
 import json
 from collections import defaultdict
 from eventlet import Timeout
+from random import choice
 
 from swift.container.sync_store import ContainerSyncStore
-from swift.container.backend import ContainerBroker, DATADIR
+from swift.container.backend import ContainerBroker, DATADIR, SHARDED
 from swift.container.reconciler import (
     MISPLACED_OBJECTS_ACCOUNT, incorrect_policy_index,
     get_reconciler_container_name, get_row_to_q_entry_translator)
 from swift.common import db_replicator
 from swift.common.storage_policy import POLICIES
-from swift.common.exceptions import DeviceUnavailable
+from swift.common.swob import HTTPOk, HTTPAccepted
 from swift.common.http import is_success
-from swift.common.db import DatabaseAlreadyExists
-from swift.common.utils import (Timestamp, hash_path,
-                                storage_directory, majority_size)
+from swift.common.utils import Timestamp, majority_size, get_db_files
 
 
 class ContainerReplicator(db_replicator.Replicator):
@@ -38,6 +36,10 @@ class ContainerReplicator(db_replicator.Replicator):
     brokerclass = ContainerBroker
     datadir = DATADIR
     default_port = 6201
+
+    def __init__(self, conf, logger=None):
+        super(ContainerReplicator, self).__init__(conf, logger=logger)
+        self.reconciler_cleanups = self.sync_store = None
 
     def report_up_to_date(self, full_info):
         reported_key_map = {
@@ -61,10 +63,9 @@ class ContainerReplicator(db_replicator.Replicator):
         return sync_args
 
     def _handle_sync_response(self, node, response, info, broker, http,
-                              different_region):
-        parent = super(ContainerReplicator, self)
+                              different_region=False):
         if is_success(response.status):
-            remote_info = json.loads(response.data)
+            remote_info = json.loads(response.data.decode('ascii'))
             if incorrect_policy_index(info, remote_info):
                 status_changed_at = Timestamp.now()
                 broker.set_storage_policy_index(
@@ -75,24 +76,104 @@ class ContainerReplicator(db_replicator.Replicator):
             if any(info[key] != remote_info[key] for key in sync_timestamps):
                 broker.merge_timestamps(*(remote_info[key] for key in
                                           sync_timestamps))
-        rv = parent._handle_sync_response(
+
+            if remote_info.get('shard_max_row', -1) >= 0:
+                # Grab remote's shard ranges, too
+                self._fetch_and_merge_shard_ranges(http, broker)
+
+        return super(ContainerReplicator, self)._handle_sync_response(
             node, response, info, broker, http, different_region)
-        return rv
+
+    def _sync_shard_ranges(self, broker, http, local_id):
+        # TODO: currently the number of shard ranges is expected to be _much_
+        # less than normal objects so all are sync'd on each cycle. However, in
+        # future there should be sync points maintained much like for object
+        # syncing so that only new shard range rows are sync'd.
+        shard_range_data = broker.get_all_shard_range_data()
+        if shard_range_data:
+            if not self._send_replicate_request(
+                    http, 'merge_shard_ranges', shard_range_data, local_id):
+                return False
+            self.logger.debug('%s synced %s shard ranges to %s',
+                              broker.db_file, len(shard_range_data),
+                              '%(ip)s:%(port)s/%(device)s' % http.node)
+        return True
+
+    def _choose_replication_mode(self, node, rinfo, info, local_sync, broker,
+                                 http, different_region):
+        if 'shard_max_row' in rinfo:
+            # Always replicate shard ranges to new-enough swift
+            shard_range_success = self._sync_shard_ranges(
+                broker, http, info['id'])
+        else:
+            shard_range_success = False
+            self.logger.warning(
+                '%s is unable to replicate shard ranges to peer %s; '
+                'peer may need upgrading', broker.db_file,
+                '%(ip)s:%(port)s/%(device)s' % node)
+        if broker.sharding_initiated():
+            if info['db_state'] == SHARDED and len(
+                    broker.get_objects(limit=1)) == 0:
+                self.logger.debug('%s is sharded and has nothing more to '
+                                  'replicate to peer %s',
+                                  broker.db_file,
+                                  '%(ip)s:%(port)s/%(device)s' % node)
+            else:
+                # Only print the scary warning if there was something that
+                # didn't get replicated
+                self.logger.warning(
+                    '%s is able to shard -- refusing to replicate objects to '
+                    'peer %s; have shard ranges and will wait for cleaving',
+                    broker.db_file,
+                    '%(ip)s:%(port)s/%(device)s' % node)
+            self.stats['deferred'] += 1
+            return shard_range_success
+
+        success = super(ContainerReplicator, self)._choose_replication_mode(
+            node, rinfo, info, local_sync, broker, http,
+            different_region)
+        return shard_range_success and success
+
+    def _fetch_and_merge_shard_ranges(self, http, broker):
+        with Timeout(self.node_timeout):
+            response = http.replicate('get_shard_ranges')
+        if response and is_success(response.status):
+            broker.merge_shard_ranges(json.loads(
+                response.data.decode('ascii')))
 
     def find_local_handoff_for_part(self, part):
         """
-        Look through devices in the ring for the first handoff device that was
-        identified during job creation as available on this node.
+        Find a device in the ring that is on this node on which to place a
+        partition. Preference is given to a device that is a primary location
+        for the partition. If no such device is found then a local device with
+        weight is chosen, and failing that any local device.
 
+        :param part: a partition
         :returns: a node entry from the ring
         """
-        nodes = self.ring.get_part_nodes(part)
-        more_nodes = self.ring.get_more_nodes(part)
+        if not self._local_device_ids:
+            raise RuntimeError('Cannot find local handoff; no local devices')
 
-        for node in itertools.chain(nodes, more_nodes):
+        for node in self.ring.get_part_nodes(part):
             if node['id'] in self._local_device_ids:
                 return node
-        return None
+
+        # don't attempt to minimize handoff depth: just choose any local
+        # device, but start by only picking a device with a weight, just in
+        # case some devices are being drained...
+        local_devs_with_weight = [
+            dev for dev in self._local_device_ids.values()
+            if dev.get('weight', 0)]
+        if local_devs_with_weight:
+            return choice(local_devs_with_weight)
+
+        # we have to return something, so choose any local device..
+        node = choice(list(self._local_device_ids.values()))
+        self.logger.warning(
+            "Could not find a non-zero weight device for handoff partition "
+            "%d, falling back device %s" %
+            (part, node['device']))
+        return node
 
     def get_reconciler_broker(self, timestamp):
         """
@@ -110,19 +191,12 @@ class ContainerReplicator(db_replicator.Replicator):
         account = MISPLACED_OBJECTS_ACCOUNT
         part = self.ring.get_part(account, container)
         node = self.find_local_handoff_for_part(part)
-        if not node:
-            raise DeviceUnavailable(
-                'No mounted devices found suitable to Handoff reconciler '
-                'container %s in partition %s' % (container, part))
-        hsh = hash_path(account, container)
-        db_dir = storage_directory(DATADIR, part, hsh)
-        db_path = os.path.join(self.root, node['device'], db_dir, hsh + '.db')
-        broker = ContainerBroker(db_path, account=account, container=container)
-        if not os.path.exists(broker.db_file):
-            try:
-                broker.initialize(timestamp, 0)
-            except DatabaseAlreadyExists:
-                pass
+        broker, initialized = ContainerBroker.create_broker(
+            os.path.join(self.root, node['device']), part, account, container,
+            logger=self.logger, put_timestamp=timestamp,
+            storage_policy_index=0)
+        self.logger.increment('reconciler_db_created' if initialized
+                              else 'reconciler_db_exists')
         if self.reconciler_containers is not None:
             self.reconciler_containers[container] = part, broker, node['id']
         return broker
@@ -140,8 +214,9 @@ class ContainerReplicator(db_replicator.Replicator):
 
         try:
             reconciler = self.get_reconciler_broker(container)
-        except DeviceUnavailable as e:
-            self.logger.warning('DeviceUnavailable: %s', e)
+        except Exception:
+            self.logger.exception('Failed to get reconciler broker for '
+                                  'container %s', container)
             return False
         self.logger.debug('Adding %d objects to the reconciler at %s',
                           len(item_list), reconciler.db_file)
@@ -207,6 +282,18 @@ class ContainerReplicator(db_replicator.Replicator):
             # replication
             broker.update_reconciler_sync(max_sync)
 
+    def cleanup_post_replicate(self, broker, orig_info, responses):
+        if broker.sharding_required():
+            # despite being a handoff, since we're sharding we're not going to
+            # do any cleanup so we can continue cleaving - this is still
+            # considered "success"
+            self.logger.debug(
+                'Not deleting db %s (requires sharding, state %s)',
+                broker.db_file, broker.get_db_state())
+            return True
+        return super(ContainerReplicator, self).cleanup_post_replicate(
+            broker, orig_info, responses)
+
     def delete_db(self, broker):
         """
         Ensure that reconciler databases are only cleaned up at the end of the
@@ -217,12 +304,13 @@ class ContainerReplicator(db_replicator.Replicator):
             # this container shouldn't be here, make sure it's cleaned up
             self.reconciler_cleanups[broker.container] = broker
             return
-        try:
-            # DB is going to get deleted. Be preemptive about it
-            self.sync_store.remove_synced_container(broker)
-        except Exception:
-            self.logger.exception('Failed to remove sync_store entry %s' %
-                                  broker.db_file)
+        if self.sync_store:
+            try:
+                # DB is going to get deleted. Be preemptive about it
+                self.sync_store.remove_synced_container(broker)
+            except Exception:
+                self.logger.exception('Failed to remove sync_store entry %s' %
+                                      broker.db_file)
 
         return super(ContainerReplicator, self).delete_db(broker)
 
@@ -262,6 +350,9 @@ class ContainerReplicator(db_replicator.Replicator):
 
 class ContainerReplicatorRpc(db_replicator.ReplicatorRpc):
 
+    def _db_file_exists(self, db_path):
+        return bool(get_db_files(db_path))
+
     def _parse_sync_args(self, args):
         parent = super(ContainerReplicatorRpc, self)
         remote_info = parent._parse_sync_args(args)
@@ -289,3 +380,27 @@ class ContainerReplicatorRpc(db_replicator.ReplicatorRpc):
                 timestamp=status_changed_at)
             info = broker.get_replication_info()
         return info
+
+    def _abort_rsync_then_merge(self, db_file, old_filename):
+        if super(ContainerReplicatorRpc, self)._abort_rsync_then_merge(
+                db_file, old_filename):
+            return True
+        # if the local db has started sharding since the original 'sync'
+        # request then abort object replication now; instantiate a fresh broker
+        # each time this check if performed so to get latest state
+        broker = ContainerBroker(db_file, logger=self.logger)
+        return broker.sharding_initiated()
+
+    def _post_rsync_then_merge_hook(self, existing_broker, new_broker):
+        # Note the following hook will need to change to using a pointer and
+        # limit in the future.
+        new_broker.merge_shard_ranges(
+            existing_broker.get_all_shard_range_data())
+
+    def merge_shard_ranges(self, broker, args):
+        broker.merge_shard_ranges(args[0])
+        return HTTPAccepted()
+
+    def get_shard_ranges(self, broker, args):
+        return HTTPOk(headers={'Content-Type': 'application/json'},
+                      body=json.dumps(broker.get_all_shard_range_data()))

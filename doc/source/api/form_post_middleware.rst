@@ -29,9 +29,8 @@ The format of the form **POST** request is:
 
 **Example 1.14. Form POST format**
 
-.. code::
+.. code:: xml
 
-    <![CDATA[
     <form action="SWIFT_URL"
         method="POST"
         enctype="multipart/form-data">
@@ -44,7 +43,6 @@ The format of the form **POST** request is:
         <br/>
         <input type="submit"/>
     </form>
-    ]]>
 
 
 **action="SWIFT_URL"**
@@ -53,14 +51,14 @@ Set to full URL where the objects are to be uploaded. The names of
 uploaded files are appended to the specified *SWIFT_URL*. So, you
 can upload directly to the root of a container with a URL like:
 
-.. code::
+.. code:: none
 
     https://swift-cluster.example.com/v1/my_account/container/
 
 Optionally, you can include an object prefix to separate uploads, such
 as:
 
-.. code::
+.. code:: none
 
     https://swift-cluster.example.com/v1/my_account/container/OBJECT_PREFIX
 
@@ -123,7 +121,7 @@ follow the file attributes are ignored.
 
 Optionally, if you want the uploaded files to be temporary you can set x-delete-at or x-delete-after attributes by adding one of these as a form input:
 
-.. code::
+.. code:: xml
 
     <input type="hidden" name="x_delete_at" value="<unix-timestamp>" />
     <input type="hidden" name="x_delete_after" value="<seconds>" />
@@ -140,24 +138,24 @@ Form **POST** middleware uses an HMAC-SHA1 cryptographic signature. This
 signature includes these elements from the form:
 
 -  The path. Starting with ``/v1/`` onwards and including a container
-   name and, optionally, an object prefix. In `Example 1.15`, “HMAC-SHA1
+   name and, optionally, an object prefix. In `Example 1.15`, "HMAC-SHA1
    signature for form
-   POST” the path is
+   POST" the path is
    ``/v1/my_account/container/object_prefix``. Do not URL-encode the
    path at this stage.
 
 -  A redirect URL. If there is no redirect URL, use the empty string.
 
--  Maximum file size. In `Example 1.15`, “HMAC-SHA1 signature for form
-   POST” the
+-  Maximum file size. In `Example 1.15`, "HMAC-SHA1 signature for form
+   POST" the
    ``max_file_size`` is ``104857600`` bytes.
 
--  The maximum number of objects to upload. In `Example 1.15`, “HMAC-SHA1
+-  The maximum number of objects to upload. In `Example 1.15`, "HMAC-SHA1
    signature for form
-   POST” ``max_file_count`` is ``10``.
+   POST" ``max_file_count`` is ``10``.
 
--  Expiry time. In `Example 1.15, “HMAC-SHA1 signature for form
-   POST” the expiry time
+-  Expiry time. In `Example 1.15, "HMAC-SHA1 signature for form
+   POST" the expiry time
    is set to ``600`` seconds into the future.
 
 -  The secret key. Set as the ``X-Account-Meta-Temp-URL-Key`` header
@@ -169,7 +167,7 @@ The following example code generates a signature for use with form
 
 **Example 1.15. HMAC-SHA1 signature for form POST**
 
-.. code::
+.. code:: python
 
     import hmac
     from hashlib import sha1
@@ -198,13 +196,13 @@ being uploaded is called ``flower.jpg``.
 This example uses the **swift-form-signature** script to compute the
 ``expires`` and ``signature`` values.
 
-.. code::
+.. code:: console
 
     $ bin/swift-form-signature /v1/my_account/container/photos/ https://example.com/done.html 5373952000 1 200 MYKEY
     Expires: 1390825338
     Signature: 35129416ebda2f1a21b3c2b8939850dfc63d8f43
 
-.. code::
+.. code:: console
 
     $ curl -i https://swift-cluster.example.com/v1/my_account/container/photos/ -X POST \
            -F max_file_size=5373952000 -F max_file_count=1 -F expires=1390825338 \

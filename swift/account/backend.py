@@ -16,13 +16,13 @@
 Pluggable Back-end for Account Server
 """
 
-from uuid import uuid4
-import six.moves.cPickle as pickle
 
 import sqlite3
 
-from swift.common.utils import Timestamp
-from swift.common.db import DatabaseBroker, utf8encode
+import six
+
+from swift.common.utils import Timestamp, RESERVED_BYTE
+from swift.common.db import DatabaseBroker, utf8encode, zero_like
 
 DATADIR = 'accounts'
 
@@ -153,7 +153,7 @@ class AccountBroker(DatabaseBroker):
         conn.execute('''
             UPDATE account_stat SET account = ?, created_at = ?, id = ?,
                    put_timestamp = ?, status_changed_at = ?
-            ''', (self.account, Timestamp.now().internal, str(uuid4()),
+            ''', (self.account, Timestamp.now().internal, self._new_db_id(),
                   put_timestamp, put_timestamp))
 
     def create_policy_stat_table(self, conn):
@@ -188,28 +188,13 @@ class AccountBroker(DatabaseBroker):
                 self._db_version = 1
         return self._db_version
 
-    def _delete_db(self, conn, timestamp, force=False):
-        """
-        Mark the DB as deleted.
-
-        :param conn: DB connection object
-        :param timestamp: timestamp to mark as deleted
-        """
-        conn.execute("""
-            UPDATE account_stat
-            SET delete_timestamp = ?,
-                status = 'DELETED',
-                status_changed_at = ?
-            WHERE delete_timestamp < ? """, (timestamp, timestamp, timestamp))
-
     def _commit_puts_load(self, item_list, entry):
         """See :func:`swift.common.db.DatabaseBroker._commit_puts_load`"""
-        loaded = pickle.loads(entry.decode('base64'))
         # check to see if the update includes policy_index or not
         (name, put_timestamp, delete_timestamp, object_count, bytes_used,
-         deleted) = loaded[:6]
-        if len(loaded) > 6:
-            storage_policy_index = loaded[6]
+         deleted) = entry[:6]
+        if len(entry) > 6:
+            storage_policy_index = entry[6]
         else:
             # legacy support during upgrade until first non legacy storage
             # policy is defined
@@ -233,7 +218,7 @@ class AccountBroker(DatabaseBroker):
         with self.get() as conn:
             row = conn.execute(
                 'SELECT container_count from account_stat').fetchone()
-            return (row[0] == 0)
+            return zero_like(row[0])
 
     def make_tuple_for_pickle(self, record):
         return (record['name'], record['put_timestamp'],
@@ -246,7 +231,7 @@ class AccountBroker(DatabaseBroker):
         """
         Create a container with the given attributes.
 
-        :param name: name of the container to create
+        :param name: name of the container to create (a native string)
         :param put_timestamp: put_timestamp of the container to create
         :param delete_timestamp: delete_timestamp of the container to create
         :param object_count: number of objects in the container
@@ -254,7 +239,7 @@ class AccountBroker(DatabaseBroker):
         :param storage_policy_index:  the storage policy for this container
         """
         if Timestamp(delete_timestamp) > Timestamp(put_timestamp) and \
-                object_count in (None, '', 0, '0'):
+                zero_like(object_count):
             deleted = 1
         else:
             deleted = 0
@@ -273,8 +258,7 @@ class AccountBroker(DatabaseBroker):
 
         :returns: True if the DB is considered to be deleted, False otherwise
         """
-        return status == 'DELETED' or (
-            container_count in (None, '', 0, '0') and
+        return status == 'DELETED' or zero_like(container_count) and (
             Timestamp(delete_timestamp) > Timestamp(put_timestamp))
 
     def _is_deleted(self, conn):
@@ -337,7 +321,12 @@ class AccountBroker(DatabaseBroker):
                     else:
                         columns.remove('container_count')
                     info = run_query()
-                elif "no such table: policy_stat" not in str(err):
+                elif "no such table: policy_stat" in str(err):
+                    if do_migrations:
+                        self.create_policy_stat_table(conn)
+                        info = run_query()
+                    # else, pass and let the results be empty
+                else:
                     raise
 
         policy_stats = {}
@@ -365,7 +354,7 @@ class AccountBroker(DatabaseBroker):
             ''').fetchone())
 
     def list_containers_iter(self, limit, marker, end_marker, prefix,
-                             delimiter, reverse=False):
+                             delimiter, reverse=False, allow_reserved=False):
         """
         Get a list of containers sorted by name starting at marker onward, up
         to limit entries. Entries will begin with the prefix and will not have
@@ -377,13 +366,15 @@ class AccountBroker(DatabaseBroker):
         :param prefix: prefix query
         :param delimiter: delimiter for query
         :param reverse: reverse the result order.
+        :param allow_reserved: exclude names with reserved-byte by default
 
         :returns: list of tuples of (name, object_count, bytes_used,
                   put_timestamp, 0)
         """
         delim_force_gte = False
-        (marker, end_marker, prefix, delimiter) = utf8encode(
-            marker, end_marker, prefix, delimiter)
+        if six.PY2:
+            (marker, end_marker, prefix, delimiter) = utf8encode(
+                marker, end_marker, prefix, delimiter)
         if reverse:
             # Reverse the markers if we are reversing the listing.
             marker, end_marker = end_marker, marker
@@ -413,12 +404,15 @@ class AccountBroker(DatabaseBroker):
                     query_args.append(marker)
                     # Always set back to False
                     delim_force_gte = False
-                elif marker and marker >= prefix:
+                elif marker and (not prefix or marker >= prefix):
                     query += ' name > ? AND'
                     query_args.append(marker)
                 elif prefix:
                     query += ' name >= ? AND'
                     query_args.append(prefix)
+                if not allow_reserved:
+                    query += ' name >= ? AND'
+                    query_args.append(chr(ord(RESERVED_BYTE) + 1))
                 if self.get_db_version(conn) < 1:
                     query += ' +deleted = 0'
                 else:
@@ -450,14 +444,18 @@ class AccountBroker(DatabaseBroker):
                         curs.close()
                         return results
                     end = name.find(delimiter, len(prefix))
-                    if end > 0:
+                    if end >= 0:
                         if reverse:
-                            end_marker = name[:end + 1]
+                            end_marker = name[:end + len(delimiter)]
                         else:
-                            marker = name[:end] + chr(ord(delimiter) + 1)
+                            marker = ''.join([
+                                name[:end],
+                                delimiter[:-1],
+                                chr(ord(delimiter[-1:]) + 1),
+                            ])
                             # we want result to be inclusive of delim+1
                             delim_force_gte = True
-                        dir_name = name[:end + 1]
+                        dir_name = name[:end + len(delimiter)]
                         if dir_name != orig_marker:
                             results.append([dir_name, 0, 0, '0', 1])
                         curs.close()
@@ -509,7 +507,7 @@ class AccountBroker(DatabaseBroker):
                         record[2] = row[2]
                     # If deleted, mark as such
                     if Timestamp(record[2]) > Timestamp(record[1]) and \
-                            record[3] in (None, '', 0, '0'):
+                            zero_like(record[3]):
                         record[5] = 1
                     else:
                         record[5] = 0

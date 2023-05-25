@@ -12,9 +12,10 @@
 
 from __future__ import print_function
 import itertools
+import json
 import os
 import sqlite3
-from hashlib import md5
+from collections import defaultdict
 
 from six.moves import urllib
 
@@ -23,12 +24,15 @@ from swift.common.utils import hash_path, storage_directory, \
 from swift.common.ring import Ring
 from swift.common.request_helpers import is_sys_meta, is_user_meta, \
     strip_sys_meta_prefix, strip_user_meta_prefix, \
-    is_object_transient_sysmeta
+    is_object_transient_sysmeta, strip_object_transient_sysmeta_prefix
 from swift.account.backend import AccountBroker, DATADIR as ABDATADIR
 from swift.container.backend import ContainerBroker, DATADIR as CBDATADIR
 from swift.obj.diskfile import get_data_dir, read_metadata, DATADIR_BASE, \
     extract_policy
 from swift.common.storage_policy import POLICIES
+from swift.common.swob import wsgi_to_str
+from swift.common.middleware.crypto.crypto_utils import load_crypto_meta
+from swift.common.utils import md5
 
 
 class InfoSystemExit(Exception):
@@ -55,6 +59,8 @@ def parse_get_node_args(options, args):
         else:
             raise InfoSystemExit('Ring file does not exist')
 
+    if options.quoted:
+        args = [urllib.parse.unquote(arg) for arg in args]
     if len(args) == 1:
         args = args[0].strip('/').split('/', 2)
 
@@ -93,6 +99,7 @@ def curl_head_command(ip, port, device, part, target, policy_index):
     if policy_index is not None:
         cmd += ' -H "%s: %s"' % ('X-Backend-Storage-Policy-Index',
                                  policy_index)
+    cmd += ' --path-as-is'
     return cmd
 
 
@@ -191,13 +198,18 @@ def print_ring_locations(ring, datadir, account, container=None, obj=None,
           'real value is set in the config file on each storage node.')
 
 
-def print_db_info_metadata(db_type, info, metadata):
+def print_db_info_metadata(db_type, info, metadata, drop_prefixes=False,
+                           verbose=False):
     """
     print out data base info/metadata based on its type
 
     :param db_type: database type, account or container
     :param info: dict of data base info
     :param metadata: dict of data base metadata
+    :param drop_prefixes: if True, strip "X-Account-Meta-",
+                          "X-Container-Meta-", "X-Account-Sysmeta-", and
+                          "X-Container-Sysmeta-" when displaying
+                          User Metadata and System Metadata dicts
     """
     if info is None:
         raise ValueError('DB info is None')
@@ -221,6 +233,7 @@ def print_db_info_metadata(db_type, info, metadata):
         if db_type == 'container':
             print('  Container: %s' % container)
 
+        print('  Deleted: %s' % info['is_deleted'])
         path_hash = hash_path(account, container)
         if db_type == 'container':
             print('  Container Hash: %s' % path_hash)
@@ -274,9 +287,13 @@ def print_db_info_metadata(db_type, info, metadata):
     sys_metadata = {}
     for key, (value, timestamp) in metadata.items():
         if is_user_meta(db_type, key):
-            user_metadata[strip_user_meta_prefix(db_type, key)] = value
+            if drop_prefixes:
+                key = strip_user_meta_prefix(db_type, key)
+            user_metadata[key] = value
         elif is_sys_meta(db_type, key):
-            sys_metadata[strip_sys_meta_prefix(db_type, key)] = value
+            if drop_prefixes:
+                key = strip_sys_meta_prefix(db_type, key)
+            sys_metadata[key] = value
         else:
             title = key.replace('_', '-').title()
             print('  %s: %s' % (title, value))
@@ -290,8 +307,40 @@ def print_db_info_metadata(db_type, info, metadata):
     else:
         print('No user metadata found in db file')
 
+    if db_type == 'container':
+        print('Sharding Metadata:')
+        shard_type = 'root' if info['is_root'] else 'shard'
+        print('  Type: %s' % shard_type)
+        print('  State: %s' % info['db_state'])
+    if info.get('shard_ranges'):
+        num_shards = len(info['shard_ranges'])
+        print('Shard Ranges (%d):' % num_shards)
+        count_by_state = defaultdict(int)
+        for srange in info['shard_ranges']:
+            count_by_state[(srange.state, srange.state_text)] += 1
+        print('  States:')
+        for key_state, count in sorted(count_by_state.items()):
+            key, state = key_state
+            print('    %9s: %s' % (state, count))
+        if verbose:
+            for srange in info['shard_ranges']:
+                srange = dict(srange, state_text=srange.state_text)
+                print('  Name: %(name)s' % srange)
+                print('    lower: %(lower)r, upper: %(upper)r' % srange)
+                print('    Object Count: %(object_count)d, Bytes Used: '
+                      '%(bytes_used)d, State: %(state_text)s (%(state)d)'
+                      % srange)
+                print('    Created at: %s (%s)'
+                      % (Timestamp(srange['timestamp']).isoformat,
+                         srange['timestamp']))
+                print('    Meta Timestamp: %s (%s)'
+                      % (Timestamp(srange['meta_timestamp']).isoformat,
+                         srange['meta_timestamp']))
+        else:
+            print('(Use -v/--verbose to show more Shard Ranges details)')
 
-def print_obj_metadata(metadata):
+
+def print_obj_metadata(metadata, drop_prefixes=False):
     """
     Print out basic info and metadata from object, as returned from
     :func:`swift.obj.diskfile.read_metadata`.
@@ -302,6 +351,10 @@ def print_obj_metadata(metadata):
     Additional metadata is displayed unmodified.
 
     :param metadata: dict of object metadata
+    :param drop_prefixes: if True, strip "X-Object-Meta-", "X-Object-Sysmeta-",
+                          and "X-Object-Transient-Sysmeta-" when displaying
+                          User Metadata, System Metadata, and Transient
+                          System Metadata entries
 
     :raises ValueError:
     """
@@ -341,10 +394,16 @@ def print_obj_metadata(metadata):
 
     for key, value in metadata.items():
         if is_user_meta('Object', key):
+            if drop_prefixes:
+                key = strip_user_meta_prefix('Object', key)
             user_metadata[key] = value
         elif is_sys_meta('Object', key):
+            if drop_prefixes:
+                key = strip_sys_meta_prefix('Object', key)
             sys_metadata[key] = value
         elif is_object_transient_sysmeta(key):
+            if drop_prefixes:
+                key = strip_object_transient_sysmeta_prefix(key)
             transient_sys_metadata[key] = value
         else:
             other_metadata[key] = value
@@ -352,8 +411,8 @@ def print_obj_metadata(metadata):
     def print_metadata(title, items):
         print(title)
         if items:
-            for meta_key in sorted(items):
-                print('  %s: %s' % (meta_key, items[meta_key]))
+            for key, value in sorted(items.items()):
+                print('  %s: %s' % (key, value))
         else:
             print('  No metadata found')
 
@@ -361,9 +420,22 @@ def print_obj_metadata(metadata):
     print_metadata('Transient System Metadata:', transient_sys_metadata)
     print_metadata('User Metadata:', user_metadata)
     print_metadata('Other Metadata:', other_metadata)
+    for label, meta in [
+        ('Data crypto details',
+         sys_metadata.get('X-Object-Sysmeta-Crypto-Body-Meta')),
+        ('Metadata crypto details',
+         transient_sys_metadata.get('X-Object-Transient-Sysmeta-Crypto-Meta')),
+    ]:
+        if meta is None:
+            continue
+        print('%s: %s' % (
+            label,
+            json.dumps(load_crypto_meta(meta, b64decode=False), indent=2,
+                       sort_keys=True, separators=(',', ': '))))
 
 
-def print_info(db_type, db_file, swift_dir='/etc/swift', stale_reads_ok=False):
+def print_info(db_type, db_file, swift_dir='/etc/swift', stale_reads_ok=False,
+               drop_prefixes=False, verbose=False):
     if db_type not in ('account', 'container'):
         print("Unrecognized DB type: internal error")
         raise InfoSystemExit()
@@ -387,8 +459,16 @@ def print_info(db_type, db_file, swift_dir='/etc/swift', stale_reads_ok=False):
             raise InfoSystemExit()
         raise
     account = info['account']
-    container = info['container'] if db_type == 'container' else None
-    print_db_info_metadata(db_type, info, broker.metadata)
+    container = None
+    info['is_deleted'] = broker.is_deleted()
+    if db_type == 'container':
+        container = info['container']
+        info['is_root'] = broker.is_root_container()
+        sranges = broker.get_shard_ranges()
+        if sranges:
+            info['shard_ranges'] = sranges
+    print_db_info_metadata(
+        db_type, info, broker.metadata, drop_prefixes, verbose)
     try:
         ring = Ring(swift_dir, ring_name=db_type)
     except Exception:
@@ -398,7 +478,7 @@ def print_info(db_type, db_file, swift_dir='/etc/swift', stale_reads_ok=False):
 
 
 def print_obj(datafile, check_etag=True, swift_dir='/etc/swift',
-              policy_name=''):
+              policy_name='', drop_prefixes=False):
     """
     Display information about an object read from the datafile.
     Optionally verify the datafile content matches the ETag metadata.
@@ -409,6 +489,10 @@ def print_obj(datafile, check_etag=True, swift_dir='/etc/swift',
                        metadata.
     :param swift_dir: the path on disk to rings
     :param policy_name: optionally the name to use when finding the ring
+    :param drop_prefixes: if True, strip "X-Object-Meta-", "X-Object-Sysmeta-",
+                          and "X-Object-Transient-Sysmeta-" when displaying
+                          User Metadata, System Metadata, and Transient
+                          System Metadata entries
     """
     if not os.path.exists(datafile):
         print("Data file doesn't exist")
@@ -454,16 +538,18 @@ def print_obj(datafile, check_etag=True, swift_dir='/etc/swift',
         except EOFError:
             print("Invalid metadata")
             raise InfoSystemExit()
+        metadata = {wsgi_to_str(k): v if k == 'name' else wsgi_to_str(v)
+                    for k, v in metadata.items()}
 
         etag = metadata.pop('ETag', '')
         length = metadata.pop('Content-Length', '')
         path = metadata.get('name', '')
-        print_obj_metadata(metadata)
+        print_obj_metadata(metadata, drop_prefixes)
 
         # Optional integrity check; it's useful, but slow.
         file_len = None
         if check_etag:
-            h = md5()
+            h = md5(usedforsecurity=False)
             file_len = 0
             while True:
                 data = fp.read(64 * 1024)
@@ -548,15 +634,15 @@ def print_item_locations(ring, ring_name=None, account=None, container=None,
         ring = POLICIES.get_object_ring(policy_index, swift_dir)
         ring_name = (POLICIES.get_by_name(policy_name)).ring_name
 
-    if account is None and (container is not None or obj is not None):
+    if (container or obj) and not account:
         print('No account specified')
         raise InfoSystemExit()
 
-    if container is None and obj is not None:
+    if obj and not container:
         print('No container specified')
         raise InfoSystemExit()
 
-    if account is None and part is None:
+    if not account and not part:
         print('No target specified')
         raise InfoSystemExit()
 
@@ -588,8 +674,11 @@ def print_item_locations(ring, ring_name=None, account=None, container=None,
                 print('Warning: account specified ' +
                       'but ring not named "account"')
 
-    print('\nAccount  \t%s' % account)
-    print('Container\t%s' % container)
-    print('Object   \t%s\n\n' % obj)
+    if account:
+        print('\nAccount  \t%s' % urllib.parse.quote(account))
+    if container:
+        print('Container\t%s' % urllib.parse.quote(container))
+    if obj:
+        print('Object   \t%s\n\n' % urllib.parse.quote(obj))
     print_ring_locations(ring, loc, account, container, obj, part, all_nodes,
                          policy_index=policy_index)

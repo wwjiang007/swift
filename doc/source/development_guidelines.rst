@@ -46,12 +46,39 @@ To execute the tests:
 
     tox
 
+To run a selected subset of unit tests with ``pytest``:
+
+* Create a virtual environment with ``tox``::
+
+    tox devenv -e py3 .env
+
+.. note::
+  Alternatively, here are the steps of manual preparation of the virtual environment::
+
+    virtualenv .env
+    source .env/bin/activate
+    pip3 install -r requirements.txt -r test-requirements.txt -c py36-constraints.txt
+    pip3 install -e .
+    deactivate
+
+* Activate the virtual environment::
+
+    source .env/bin/activate
+
+* Run some unit tests, for example::
+
+    pytest test/unit/common/middleware/crypto
+
+* Run all unit tests::
+
+    pytest test/unit
+
 .. note::
   If you installed using ``cd ~/swift; sudo python setup.py develop``, you may
   need to do ``cd ~/swift; sudo chown -R ${USER}:${USER} swift.egg-info`` prior
   to running ``tox``.
 
-* By default ``tox`` will run all of the unit test and pep8 checks listed in
+* By default ``tox`` will run **all of the unit test** and pep8 checks listed in
   the ``tox.ini`` file ``envlist`` option. A subset of the test environments
   can be specified on the ``tox`` command line or by setting the ``TOXENV``
   environment variable. For example, to run only the pep8 checks and python2.7
@@ -62,6 +89,10 @@ To execute the tests:
   or::
 
     TOXENV=py27,pep8 tox
+
+  To run unit tests with python3.8::
+
+    tox -e py38
 
 .. note::
   As of ``tox`` version 2.0.0, most environment variables are not automatically
@@ -184,6 +215,26 @@ using config files found in ``$HOME/my_tests`` and policy 'silver'::
     SWIFT_TEST_POLICY=silver tox -e func
 
 
+S3 API cross-compatibility tests
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The cross-compatibility tests in directory `test/s3api` are intended to verify
+that the Swift S3 API behaves in the same way as the AWS S3 API. They should
+pass when run against either a Swift endpoint (with S3 API enabled) or an AWS
+S3 endpoint.
+
+To run against an AWS S3 endpoint, the `/etc/swift/test.conf` file must be
+edited to provide AWS key IDs and secrets. Alternatively, an AWS CLI style
+credentials file can be loaded by setting the ``SWIFT_TEST_AWS_CONFIG_FILE``
+environment variable, e.g.::
+
+    SWIFT_TEST_AWS_CONFIG_FILE=~/.aws/credentials pytest ./test/s3api
+
+.. note::
+  When using ``SWIFT_TEST_AWS_CONFIG_FILE``, the region defaults to
+  ``us-east-1`` and only the default credentials are loaded.
+
+
 ------------
 Coding Style
 ------------
@@ -199,7 +250,7 @@ automated and not get `caught` by Jenkins.
 
 For example for Vim the `syntastic`_ plugin can do this for you.
 
-.. _`hacking`: https://pypi.python.org/pypi/hacking
+.. _`hacking`: https://pypi.org/project/hacking
 .. _`syntastic`: https://github.com/scrooloose/syntastic
 
 ------------------------
@@ -221,10 +272,14 @@ More specifically:
     the sphinx specific markup can be found here:
     http://sphinx.pocoo.org/markup/index.html
 
-Installing Sphinx:
+To build documentation run::
 
-#. Install sphinx (On Ubuntu: ``sudo apt-get install python-sphinx``)
-#. ``python setup.py build_sphinx``
+    pip install -r requirements.txt -r doc/requirements.txt
+    sphinx-build -W -b html doc/source doc/build/html
+
+and then browse to doc/build/html/index.html. These docs are auto-generated
+after every commit and available online at
+https://docs.openstack.org/swift/latest/.
 
 --------
 Manpages

@@ -43,6 +43,7 @@ David Hadas <davidh@il.ibm.com> <david.hadas@gmail.com>
 Yaguang Wang <yaguang.wang@intel.com> ywang19 <yaguang.wang@intel.com>
 Liu Siqi <meizu647@gmail.com> dk647 <meizu647@gmail.com>
 James E. Blair <jeblair@openstack.org> <james.blair@rackspace.com>
+James E. Blair <jeblair@openstack.org> <jeblair@redhat.com>
 Kun Huang <gareth@unitedstack.com> <academicgareth@gmail.com>
 Michael Shuler <mshuler@gmail.com> <mshuler@rackspace.com>
 Ilya Kharin <ikharin@mirantis.com> <akscram@gmail.com>
@@ -78,7 +79,7 @@ Minwoo Bae <minwoob@us.ibm.com> Minwoo B
 Jaivish Kothari <jaivish.kothari@nectechnologies.in> <janonymous.codevulture@gmail.com>
 Michael Matur <michael.matur@gmail.com>
 Kazuhiro Miyahara <miyahara.kazuhiro@lab.ntt.co.jp>
-Alexandra Settle <alexandra.settle@rackspace.com>
+Alexandra Settle <asettle@suse.com> <alexandra.settle@rackspace.com>
 Kenichiro Matsuda <matsuda_kenichi@jp.fujitsu.com>
 Atsushi Sakai <sakaia@jp.fujitsu.com>
 Takashi Natsume <natsume.takashi@lab.ntt.co.jp>
@@ -95,7 +96,8 @@ Mehdi Abaakouk <sileht@redhat.com> <mehdi.abaakouk@enovance.com>
 Richard Hawkins <richard.hawkins@rackspace.com> <hurricanerix@gmail.com>
 Ondrej Novy <ondrej.novy@firma.seznam.cz>
 Ondrej Novy <ondrej.novy@firma.seznam.cz> <novy@ondrej.org>
-Peter Lisak <peter.lisak@firma.seznam.cz>
+Peter Lisák <peter.lisak@gmail.com> <peter.lisak@firma.seznam.cz>
+Peter Lisák <peter.lisak@gmail.com> Peter Lisák <peter.lisak@firma.seznam.cz>
 Ke Liang <ke.liang@easystack.cn>
 Daisuke Morita <morita.daisuke@ntti3.com> <morita.daisuke@lab.ntt.co.jp>
 Andreas Jaeger <aj@suse.de> <aj@suse.com>
@@ -121,3 +123,17 @@ Tin Lam <tinlam@gmail.com> <tl3438@att.com>
 Hisashi Osanai <osanai.hisashi@gmail.com> <osanai.hisashi@jp.fujitsu.com>
 Bryan Keller <kellerbr@us.ibm.com>
 Doug Hellmann <doug@doughellmann.com> <doug.hellmann@dreamhost.com>
+zhangdebo1987 <zhangdebo@inspur.com> zhangdebo
+Thomas Goirand <thomas@goirand.fr> <zigo@debian.org>
+Thiago da Silva <thiagodasilva@gmail.com> <thiago@redhat.com>
+Kota Tsuyuzaki <bloodeagle40234@gmail.com> <kota.tsuyuzaki.pc@hco.ntt.co.jp>
+Kota Tsuyuzaki <bloodeagle40234@gmail.com> <tsuyuzaki.kota@lab.ntt.co.jp>
+Kota Tsuyuzaki <bloodeagle40234@gmail.com> <k.tsuyuzaki@ntt.com>
+Ehud Kaldor <ehud@unfairfunction.org> <ehud@UnfairFunction.org>
+Takashi Kajinami <tkajinam@redhat.com> <kajinamit@nttdata.co.jp>
+Yuxin Wang <wang.yuxin@ostorage.com.cn> Wang Yuxin
+Gilles Biannic <gilles.biannic@corp.ovh.com> gillesbiannic
+melissaml <ma.lei@99cloud.net> <malei@maleideMacBook-Pro.local>
+Ashwin Nair <nairashwin952013@gmail.com> indianwhocodes
+Romain de Joux <romain.de-joux@ovhcloud.com> <romain.de-joux@corp.ovh.com>
+Takashi Natsume <takanattie@gmail.com> <natsume.takashi@lab.ntt.co.jp>

@@ -13,12 +13,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import collections
+import errno
+import io
 import json
 import unittest
 import os
 import mock
 from gzip import GzipFile
 from shutil import rmtree
+import six
 import six.moves.cPickle as pickle
 import time
 import tempfile
@@ -27,17 +30,19 @@ from collections import defaultdict
 from errno import ENOENT, ENOTEMPTY, ENOTDIR
 
 from eventlet.green import subprocess
-from eventlet import Timeout
+from eventlet import Timeout, sleep
 
-from test.unit import (debug_logger, patch_policies, make_timestamp_iter,
-                       mocked_http_conn, FakeLogger, mock_check_drive,
-                       skip_if_no_xattrs)
+from test.debug_logger import debug_logger
+from test.unit import (patch_policies, make_timestamp_iter, mocked_http_conn,
+                       mock_check_drive, skip_if_no_xattrs)
 from swift.common import utils
 from swift.common.utils import (hash_path, mkdirs, normalize_timestamp,
                                 storage_directory)
 from swift.common import ring
+from swift.common.recon import RECON_OBJECT_FILE
 from swift.obj import diskfile, replicator as object_replicator
 from swift.common.storage_policy import StoragePolicy, POLICIES
+from swift.common.exceptions import PartitionLockTimeout
 
 
 def _ips(*args, **kwargs):
@@ -72,6 +77,7 @@ def mock_http_connect(status):
         def close(self):
             return
     return lambda *args, **kwargs: FakeConn(status, *args, **kwargs)
+
 
 process_errors = []
 
@@ -125,12 +131,57 @@ def _mock_process(ret):
     MockProcess.captured_log = captured_log
     orig_process = subprocess.Popen
     MockProcess.ret_code = (i[0] for i in ret)
-    MockProcess.ret_log = (i[1] for i in ret)
+    MockProcess.ret_log = (i[1] if six.PY2 else i[1].encode('utf8')
+                           for i in ret)
     MockProcess.check_args = (i[2] for i in ret)
     object_replicator.subprocess.Popen = MockProcess
     yield captured_log
     MockProcess.captured_log = None
     object_replicator.subprocess.Popen = orig_process
+
+
+class MockHungProcess(object):
+    def __init__(self, polls_needed=0, *args, **kwargs):
+        class MockStdout(object):
+            def read(self):
+                pass
+        self.stdout = MockStdout()
+        self._state = 'running'
+        self._calls = []
+        self._polls = 0
+        self._polls_needed = polls_needed
+
+    def wait(self, timeout=None):
+        self._calls.append(('wait', self._state))
+        if self._state == 'running':
+            # Sleep so we trip the rsync timeout
+            sleep(1)
+            raise BaseException('You need to mock out some timeouts')
+        if not self._polls_needed:
+            self._state = 'os-reaped'
+            return 137
+        if timeout is not None:
+            raise subprocess.TimeoutExpired('some cmd', timeout)
+        raise BaseException("You're waiting indefinitely on something "
+                            "we've established is hung")
+
+    def poll(self):
+        self._calls.append(('poll', self._state))
+        self._polls += 1
+        if self._polls >= self._polls_needed:
+            self._state = 'os-reaped'
+            return 137
+        else:
+            return None
+
+    def terminate(self):
+        self._calls.append(('terminate', self._state))
+        if self._state == 'running':
+            self._state = 'terminating'
+
+    def kill(self):
+        self._calls.append(('kill', self._state))
+        self._state = 'killed'
 
 
 def _create_test_rings(path, devs=None, next_part_power=None):
@@ -181,8 +232,8 @@ class TestObjectReplicator(unittest.TestCase):
 
     def setUp(self):
         skip_if_no_xattrs()
-        utils.HASH_PATH_SUFFIX = 'endcap'
-        utils.HASH_PATH_PREFIX = ''
+        utils.HASH_PATH_SUFFIX = b'endcap'
+        utils.HASH_PATH_PREFIX = b''
         # recon cache path
         self.recon_cache = tempfile.mkdtemp()
         rmtree(self.recon_cache, ignore_errors=1)
@@ -201,7 +252,8 @@ class TestObjectReplicator(unittest.TestCase):
         self.conf = dict(
             bind_ip=_ips()[0], bind_port=6200,
             swift_dir=self.testdir, devices=self.devices, mount_check='false',
-            timeout='300', stats_interval='1', sync_method='rsync')
+            timeout='300', stats_interval='1', sync_method='rsync',
+            recon_cache_path=self.recon_cache)
         self._create_replicator()
         self.ts = make_timestamp_iter()
 
@@ -209,6 +261,36 @@ class TestObjectReplicator(unittest.TestCase):
         self.assertFalse(process_errors)
         rmtree(self.testdir, ignore_errors=1)
         rmtree(self.recon_cache, ignore_errors=1)
+
+    def test_ring_ip_and_bind_ip(self):
+        # make clean base_conf
+        base_conf = dict(self.conf)
+        for key in ('bind_ip', 'ring_ip'):
+            base_conf.pop(key, None)
+
+        # default ring_ip is always 0.0.0.0
+        self.conf = base_conf
+        self._create_replicator()
+        self.assertEqual('0.0.0.0', self.replicator.ring_ip)
+
+        # bind_ip works fine for legacy configs
+        self.conf = dict(base_conf)
+        self.conf['bind_ip'] = '192.168.1.42'
+        self._create_replicator()
+        self.assertEqual('192.168.1.42', self.replicator.ring_ip)
+
+        # ring_ip works fine by-itself
+        self.conf = dict(base_conf)
+        self.conf['ring_ip'] = '192.168.1.43'
+        self._create_replicator()
+        self.assertEqual('192.168.1.43', self.replicator.ring_ip)
+
+        # if you have both ring_ip wins
+        self.conf = dict(base_conf)
+        self.conf['bind_ip'] = '192.168.1.44'
+        self.conf['ring_ip'] = '192.168.1.45'
+        self._create_replicator()
+        self.assertEqual('192.168.1.45', self.replicator.ring_ip)
 
     def test_handoff_replication_setting_warnings(self):
         conf_tests = [
@@ -300,7 +382,7 @@ class TestObjectReplicator(unittest.TestCase):
         f = open(os.path.join(df._datadir,
                               normalize_timestamp(time.time()) + '.data'),
                  'wb')
-        f.write('1234567890')
+        f.write(b'1234567890')
         f.close()
         ohash = hash_path('a', 'c', 'o')
         data_dir = ohash[-3:]
@@ -337,8 +419,7 @@ class TestObjectReplicator(unittest.TestCase):
                     self.assertEqual((start + 1 + cycle) % 10,
                                      replicator.replication_cycle)
 
-        self.assertEqual(0, replicator.stats['start'])
-        recon_fname = os.path.join(self.recon_cache, "object.recon")
+        recon_fname = os.path.join(self.recon_cache, RECON_OBJECT_FILE)
         with open(recon_fname) as cachefile:
             recon = json.loads(cachefile.read())
             self.assertEqual(1, recon.get('replication_time'))
@@ -365,7 +446,7 @@ class TestObjectReplicator(unittest.TestCase):
         f = open(os.path.join(df._datadir,
                               normalize_timestamp(time.time()) + '.data'),
                  'wb')
-        f.write('1234567890')
+        f.write(b'1234567890')
         f.close()
         ohash = hash_path('a', 'c', 'o')
         data_dir = ohash[-3:]
@@ -426,7 +507,7 @@ class TestObjectReplicator(unittest.TestCase):
         for job in jobs:
             jobs_by_pol_part[str(int(job['policy'])) + job['partition']] = job
         self.assertEqual(len(jobs_to_delete), 2)
-        self.assertTrue('1', jobs_to_delete[0]['partition'])
+        self.assertEqual('1', jobs_to_delete[0]['partition'])
         self.assertEqual(
             [node['id'] for node in jobs_by_pol_part['00']['nodes']], [1, 2])
         self.assertEqual(
@@ -493,8 +574,26 @@ class TestObjectReplicator(unittest.TestCase):
             self._write_disk_data('sdd', with_json=True)
         _create_test_rings(self.testdir, devs)
 
-        self.replicator.collect_jobs()
-        self.assertEqual(self.replicator.stats['failure'], 0)
+        self.replicator.collect_jobs(override_partitions=[1])
+        self.assertEqual(self.replicator.total_stats.failure, 0)
+
+    def test_collect_jobs_with_override_parts_and_unexpected_part_dir(self):
+        self.replicator.collect_jobs(override_partitions=[0, 2])
+        self.assertEqual(self.replicator.total_stats.failure, 0)
+        os.mkdir(os.path.join(self.objects_1, 'foo'))
+        jobs = self.replicator.collect_jobs(override_partitions=[0, 2])
+        found_jobs = set()
+        for j in jobs:
+            found_jobs.add((int(j['policy']), int(j['partition'])))
+        self.assertEqual(found_jobs, {
+            (0, 0),
+            (0, 2),
+            (1, 0),
+            (1, 2),
+        })
+        num_disks = len(POLICIES[1].object_ring.devs)
+        # N.B. it's not clear why the UUT increments failure per device
+        self.assertEqual(self.replicator.total_stats.failure, num_disks)
 
     @mock.patch('swift.obj.replicator.random.shuffle', side_effect=lambda l: l)
     def test_collect_jobs_multi_disk(self, mock_shuffle):
@@ -792,14 +891,14 @@ class TestObjectReplicator(unittest.TestCase):
         self.assertEqual('1', jobs[0]['partition'])
 
     def test_handoffs_first_mode_will_process_all_jobs_after_handoffs(self):
-        # make a object in the handoff & primary partition
+        # make an object in the handoff & primary partition
         expected_suffix_paths = []
         for policy in POLICIES:
             # primary
             ts = next(self.ts)
             df = self.df_mgr.get_diskfile('sda', '0', 'a', 'c', 'o', policy)
             with df.create() as w:
-                w.write('asdf')
+                w.write(b'asdf')
                 w.put({'X-Timestamp': ts.internal})
                 w.commit(ts)
             expected_suffix_paths.append(os.path.dirname(df._datadir))
@@ -807,7 +906,7 @@ class TestObjectReplicator(unittest.TestCase):
             ts = next(self.ts)
             df = self.df_mgr.get_diskfile('sda', '1', 'a', 'c', 'o', policy)
             with df.create() as w:
-                w.write('asdf')
+                w.write(b'asdf')
                 w.put({'X-Timestamp': ts.internal})
                 w.commit(ts)
             expected_suffix_paths.append(os.path.dirname(df._datadir))
@@ -843,7 +942,7 @@ class TestObjectReplicator(unittest.TestCase):
             self.replicator.replicate()
         # all jobs processed!
         self.assertEqual(self.replicator.job_count,
-                         self.replicator.replication_count)
+                         self.replicator.total_stats.attempted)
         self.assertFalse(self.replicator.handoffs_remaining)
 
         # sanity, all the handoffs suffixes we filled in were rsync'd
@@ -882,7 +981,7 @@ class TestObjectReplicator(unittest.TestCase):
             ts = next(self.ts)
             df = self.df_mgr.get_diskfile('sda', '1', 'a', 'c', 'o', policy)
             with df.create() as w:
-                w.write('asdf')
+                w.write(b'asdf')
                 w.put({'X-Timestamp': ts.internal})
                 w.commit(ts)
             handoff_suffix_paths.append(os.path.dirname(df._datadir))
@@ -905,11 +1004,12 @@ class TestObjectReplicator(unittest.TestCase):
         # stopped after handoffs!
         self.assertEqual(1, self.replicator.handoffs_remaining)
         self.assertEqual(8, self.replicator.job_count)
+        self.assertEqual(self.replicator.total_stats.failure, 1)
         # in addition to the two update_deleted jobs as many as "concurrency"
         # jobs may have been spawned into the pool before the failed
         # update_deleted job incremented handoffs_remaining and caused the
         # handoffs_first check to abort the current pass
-        self.assertLessEqual(self.replicator.replication_count,
+        self.assertLessEqual(self.replicator.total_stats.attempted,
                              2 + self.replicator.concurrency)
 
         # sanity, all the handoffs suffixes we filled in were rsync'd
@@ -946,10 +1046,11 @@ class TestObjectReplicator(unittest.TestCase):
                        side_effect=_ips), \
                 mocked_http_conn(*[200] * 14, body=stub_body) as conn_log:
             self.replicator.handoff_delete = 2
+            self.replicator._zero_stats()
             self.replicator.replicate()
         # all jobs processed!
         self.assertEqual(self.replicator.job_count,
-                         self.replicator.replication_count)
+                         self.replicator.total_stats.attempted)
         self.assertFalse(self.replicator.handoffs_remaining)
         # sanity, all parts got replicated
         found_replicate_calls = defaultdict(int)
@@ -999,7 +1100,7 @@ class TestObjectReplicator(unittest.TestCase):
                                       policy=POLICIES.legacy)
         ts = next(self.ts)
         with df.create() as w:
-            w.write('asdf')
+            w.write(b'asdf')
             w.put({'X-Timestamp': ts.internal})
             w.commit(ts)
         # pre-flight and post sync request for both other primaries
@@ -1081,7 +1182,7 @@ class TestObjectReplicator(unittest.TestCase):
             f = open(os.path.join(df._datadir,
                                   normalize_timestamp(time.time()) + '.data'),
                      'wb')
-            f.write('1234567890')
+            f.write(b'1234567890')
             f.close()
             ohash = hash_path('a', 'c', 'o')
             data_dir = ohash[-3:]
@@ -1111,7 +1212,7 @@ class TestObjectReplicator(unittest.TestCase):
             f = open(os.path.join(df._datadir,
                                   normalize_timestamp(time.time()) + '.data'),
                      'wb')
-            f.write('1234567890')
+            f.write(b'1234567890')
             f.close()
             ohash = hash_path('a', 'c', 'o')
             data_dir = ohash[-3:]
@@ -1162,7 +1263,7 @@ class TestObjectReplicator(unittest.TestCase):
             ts = normalize_timestamp(time.time())
             f = open(os.path.join(df._datadir, ts + '.data'),
                      'wb')
-            f.write('1234567890')
+            f.write(b'1234567890')
             f.close()
             ohash = hash_path('a', 'c', 'o')
             whole_path_from = storage_directory(self.objects, 1, ohash)
@@ -1188,7 +1289,7 @@ class TestObjectReplicator(unittest.TestCase):
             f = open(os.path.join(df._datadir,
                                   normalize_timestamp(time.time()) + '.data'),
                      'wb')
-            f.write('1234567890')
+            f.write(b'1234567890')
             f.close()
             ohash = hash_path('a', 'c', 'o')
             data_dir = ohash[-3:]
@@ -1217,7 +1318,7 @@ class TestObjectReplicator(unittest.TestCase):
             f = open(os.path.join(df._datadir,
                                   normalize_timestamp(time.time()) + '.data'),
                      'wb')
-            f.write('1234567890')
+            f.write(b'1234567890')
             f.close()
             ohash = hash_path('a', 'c', 'o')
             data_dir = ohash[-3:]
@@ -1253,7 +1354,7 @@ class TestObjectReplicator(unittest.TestCase):
             f = open(os.path.join(df._datadir,
                                   normalize_timestamp(time.time()) + '.data'),
                      'wb')
-            f.write('1234567890')
+            f.write(b'1234567890')
             f.close()
             ohash = hash_path('a', 'c', 'o')
             data_dir = ohash[-3:]
@@ -1288,7 +1389,7 @@ class TestObjectReplicator(unittest.TestCase):
             f = open(os.path.join(df._datadir,
                                   normalize_timestamp(time.time()) + '.data'),
                      'wb')
-            f.write('1234567890')
+            f.write(b'1234567890')
             f.close()
             ohash = hash_path('a', 'c', 'o')
             data_dir = ohash[-3:]
@@ -1323,7 +1424,7 @@ class TestObjectReplicator(unittest.TestCase):
             f = open(os.path.join(df._datadir,
                                   normalize_timestamp(time.time()) + '.data'),
                      'wb')
-            f.write('1234567890')
+            f.write(b'1234567890')
             f.close()
             ohash = hash_path('a', 'c', 'o')
             data_dir = ohash[-3:]
@@ -1357,11 +1458,50 @@ class TestObjectReplicator(unittest.TestCase):
         self.assertTrue(os.access(part_path, os.F_OK))
         self.replicator.replicate(override_devices=['sdb'])
         self.assertTrue(os.access(part_path, os.F_OK))
-        self.replicator.replicate(override_partitions=['9'])
+        self.replicator.replicate(override_partitions=[9])
         self.assertTrue(os.access(part_path, os.F_OK))
         self.replicator.replicate(override_devices=['sda'],
-                                  override_partitions=['1'])
+                                  override_partitions=[1])
         self.assertFalse(os.access(part_path, os.F_OK))
+
+    def _make_OSError(self, err):
+        return OSError(err, os.strerror(err))
+
+    def test_delete_partition_override_params_os_not_empty_error(self):
+        part_path = os.path.join(self.objects, '1')
+        with mock.patch('swift.obj.replicator.shutil.rmtree') as mockrmtree:
+            mockrmtree.side_effect = self._make_OSError(errno.ENOTEMPTY)
+            self.replicator.replicate(override_devices=['sda'],
+                                      override_partitions=[1],
+                                      override_policies=[0])
+            error_lines = self.replicator.logger.get_lines_for_level('error')
+            self.assertFalse(error_lines)
+            self.assertTrue(os.path.exists(part_path))
+            self.assertEqual([mock.call(part_path)], mockrmtree.call_args_list)
+
+    def test_delete_partition_ignores_os_no_entity_error(self):
+        part_path = os.path.join(self.objects, '1')
+        with mock.patch('swift.obj.replicator.shutil.rmtree') as mockrmtree:
+            mockrmtree.side_effect = self._make_OSError(errno.ENOENT)
+            self.replicator.replicate(override_devices=['sda'],
+                                      override_partitions=[1],
+                                      override_policies=[0])
+        error_lines = self.replicator.logger.get_lines_for_level('error')
+        self.assertFalse(error_lines)
+        self.assertTrue(os.path.exists(part_path))
+        self.assertEqual([mock.call(part_path)], mockrmtree.call_args_list)
+
+    def test_delete_partition_ignores_os_no_data_error(self):
+        part_path = os.path.join(self.objects, '1')
+        with mock.patch('swift.obj.replicator.shutil.rmtree') as mockrmtree:
+            mockrmtree.side_effect = self._make_OSError(errno.ENODATA)
+            self.replicator.replicate(override_devices=['sda'],
+                                      override_partitions=[1],
+                                      override_policies=[0])
+            error_lines = self.replicator.logger.get_lines_for_level('error')
+            self.assertFalse(error_lines)
+            self.assertTrue(os.path.exists(part_path))
+            self.assertEqual([mock.call(part_path)], mockrmtree.call_args_list)
 
     def test_delete_policy_override_params(self):
         df0 = self.df_mgr.get_diskfile('sda', '99', 'a', 'c', 'o',
@@ -1385,6 +1525,11 @@ class TestObjectReplicator(unittest.TestCase):
         self.assertFalse(os.access(pol1_part_path, os.F_OK))
         self.assertTrue(os.access(pol0_part_path, os.F_OK))
 
+        # since we weren't operating on everything, but only a subset of
+        # storage policies, we didn't dump any recon stats.
+        self.assertFalse(os.path.exists(
+            os.path.join(self.recon_cache, RECON_OBJECT_FILE)))
+
     def test_delete_partition_ssync(self):
         with mock.patch('swift.obj.replicator.http_connect',
                         mock_http_connect(200)):
@@ -1394,7 +1539,7 @@ class TestObjectReplicator(unittest.TestCase):
             ts = normalize_timestamp(time.time())
             f = open(os.path.join(df._datadir, ts + '.data'),
                      'wb')
-            f.write('0')
+            f.write(b'0')
             f.close()
             ohash = hash_path('a', 'c', 'o')
             whole_path_from = storage_directory(self.objects, 1, ohash)
@@ -1442,7 +1587,7 @@ class TestObjectReplicator(unittest.TestCase):
             ts = normalize_timestamp(time.time())
             mkdirs(df._datadir)
             f = open(os.path.join(df._datadir, ts + '.data'), 'wb')
-            f.write('0')
+            f.write(b'0')
             f.close()
             ohash = hash_path('a', 'c', 'o')
             whole_path_from = storage_directory(self.objects, 1, ohash)
@@ -1490,7 +1635,7 @@ class TestObjectReplicator(unittest.TestCase):
             mkdirs(df._datadir)
             ts = normalize_timestamp(time.time())
             f = open(os.path.join(df._datadir, ts + '.data'), 'wb')
-            f.write('0')
+            f.write(b'0')
             f.close()
             ohash = hash_path('a', 'c', 'o')
             whole_path_from = storage_directory(self.objects, 1, ohash)
@@ -1531,7 +1676,7 @@ class TestObjectReplicator(unittest.TestCase):
             mkdirs(df._datadir)
             ts = normalize_timestamp(time.time())
             f = open(os.path.join(df._datadir, ts + '.data'), 'wb')
-            f.write('0')
+            f.write(b'0')
             f.close()
             ohash = hash_path('a', 'c', 'o')
             whole_path_from = storage_directory(self.objects, 1, ohash)
@@ -1558,6 +1703,7 @@ class TestObjectReplicator(unittest.TestCase):
             def raise_exception_rmdir(exception_class, error_no):
                 instance = exception_class()
                 instance.errno = error_no
+                instance.strerror = os.strerror(error_no)
 
                 def func(directory):
                     if directory == suffix_dir_path:
@@ -1596,7 +1742,10 @@ class TestObjectReplicator(unittest.TestCase):
             with mock.patch('os.rmdir',
                             raise_exception_rmdir(OSError, ENOTDIR)):
                 self.replicator.replicate()
-            self.assertEqual(len(mock_logger.get_lines_for_level('error')), 1)
+            self.assertEqual(mock_logger.get_lines_for_level('error'), [
+                'Unexpected error trying to cleanup suffix dir %r: ' %
+                os.path.dirname(df._datadir),
+            ])
             self.assertFalse(os.access(whole_path_from, os.F_OK))
             self.assertTrue(os.access(suffix_dir_path, os.F_OK))
             self.assertTrue(os.access(part_path, os.F_OK))
@@ -1628,7 +1777,7 @@ class TestObjectReplicator(unittest.TestCase):
             f = open(os.path.join(df._datadir,
                                   normalize_timestamp(time.time()) + '.data'),
                      'wb')
-            f.write('1234567890')
+            f.write(b'1234567890')
             f.close()
             ohash = hash_path('a', 'c', 'o')
             data_dir = ohash[-3:]
@@ -1692,13 +1841,13 @@ class TestObjectReplicator(unittest.TestCase):
                             mock_http_connect(200)):
                 with mock.patch('swift.obj.replicator.dump_recon_cache'):
                     replicator = object_replicator.ObjectReplicator(
-                        conf, logger=FakeLogger())
+                        conf, logger=self.logger)
 
                     self.get_hash_count = 0
                     with mock.patch.object(replicator, 'sync', fake_sync):
                         replicator.run_once()
 
-        log_lines = replicator.logger.get_lines_for_level('error')
+        log_lines = replicator.logger.logger.get_lines_for_level('error')
         self.assertIn("Error syncing with node:", log_lines[0])
         self.assertFalse(log_lines[1:])
         # setup creates 4 partitions; partition 1 does not map to local dev id
@@ -1733,7 +1882,7 @@ class TestObjectReplicator(unittest.TestCase):
         # attempt to 16 times but succeeded only 15 times due to Timeout
         suffix_hashes = sum(
             count for (metric, count), _junk in
-            replicator.logger.log_dict['update_stats']
+            replicator.logger.logger.log_dict['update_stats']
             if metric == 'suffix.hashes')
         self.assertEqual(15, suffix_hashes)
 
@@ -1755,21 +1904,22 @@ class TestObjectReplicator(unittest.TestCase):
         self.replicator.sync_method.assert_called_once_with(
             'node', 'job', 'suffixes')
 
-    @mock.patch('swift.obj.replicator.tpool_reraise')
+    @mock.patch('swift.obj.replicator.tpool.execute')
     @mock.patch('swift.obj.replicator.http_connect', autospec=True)
     @mock.patch('swift.obj.replicator._do_listdir')
-    def test_update(self, mock_do_listdir, mock_http, mock_tpool_reraise):
+    def test_update(self, mock_do_listdir, mock_http, mock_tpool_execute):
 
         def set_default(self):
             self.replicator.suffix_count = 0
             self.replicator.suffix_sync = 0
             self.replicator.suffix_hash = 0
-            self.replicator.replication_count = 0
+            self.replicator.last_replication_count = 0
+            self.replicator._zero_stats()
             self.replicator.partition_times = []
 
         self.headers = {'Content-Length': '0',
                         'user-agent': 'object-replicator %s' % os.getpid()}
-        mock_tpool_reraise.return_value = (0, {})
+        mock_tpool_execute.return_value = (0, {})
 
         all_jobs = self.replicator.collect_jobs()
         jobs = [job for job in all_jobs if not job['delete']]
@@ -1779,8 +1929,6 @@ class TestObjectReplicator(unittest.TestCase):
         # Check incorrect http_connect with status 507 and
         # count of attempts and call args
         resp.status = 507
-        error = '%(replication_ip)s/%(device)s responded as unmounted'
-        expect = 'Error syncing partition: '
         expected_listdir_calls = [
             mock.call(int(job['partition']),
                       self.replicator.replication_cycle)
@@ -1800,15 +1948,20 @@ class TestObjectReplicator(unittest.TestCase):
             self.replicator.update(job)
             error_lines = self.logger.get_lines_for_level('error')
             expected = []
+            error = '%s responded as unmounted'
             # ... first the primaries
             for node in job['nodes']:
-                expected.append(error % node)
+                node_str = utils.node_to_string(node, replication=True)
+                expected.append(error % node_str)
             # ... then it will get handoffs
             for node in job['policy'].object_ring.get_more_nodes(
                     int(job['partition'])):
-                expected.append(error % node)
-            # ... and finally it will exception out
-            expected.append(expect)
+                node_str = utils.node_to_string(node, replication=True)
+                expected.append(error % node_str)
+            # ... and finally we get an error about running out of nodes
+            expected.append('Ran out of handoffs while replicating '
+                            'partition %s of policy %d' %
+                            (job['partition'], job['policy']))
             self.assertEqual(expected, error_lines)
             self.assertEqual(len(self.replicator.partition_times), 1)
             self.assertEqual(mock_http.call_count, len(ring._devs) - 1)
@@ -1823,18 +1976,21 @@ class TestObjectReplicator(unittest.TestCase):
             mock_http.reset_mock()
             self.logger.clear()
         mock_do_listdir.assert_has_calls(expected_listdir_calls)
-        mock_tpool_reraise.assert_has_calls(expected_tpool_calls)
+        mock_tpool_execute.assert_has_calls(expected_tpool_calls)
         mock_do_listdir.side_effect = None
         mock_do_listdir.return_value = False
         # Check incorrect http_connect with status 400 != HTTP_OK
         resp.status = 400
-        error = 'Invalid response %(resp)s from %(ip)s'
+        error = 'Invalid response %(resp)s from %(node)s'
         for job in jobs:
             set_default(self)
             self.replicator.update(job)
             # ... only the primaries
-            expected = [error % {'resp': 400, 'ip': node['replication_ip']}
-                        for node in job['nodes']]
+            expected = [
+                error % {
+                    "resp": 400,
+                    "node": utils.node_to_string(node, replication=True)}
+                for node in job['nodes']]
             self.assertEqual(expected,
                              self.logger.get_lines_for_level('error'))
             self.assertEqual(len(self.replicator.partition_times), 1)
@@ -1843,12 +1999,14 @@ class TestObjectReplicator(unittest.TestCase):
         # Check successful http_connection and exception with
         # incorrect pickle.loads(resp.read())
         resp.status = 200
-        expect = 'Error syncing with node: %r: '
+        resp.read.return_value = b'garbage'
+        expect = 'Error syncing with node: %s: '
         for job in jobs:
             set_default(self)
             self.replicator.update(job)
             # ... only the primaries
-            expected = [expect % node for node in job['nodes']]
+            expected = [expect % utils.node_to_string(node, replication=True)
+                        for node in job['nodes']]
             error_lines = self.logger.get_lines_for_level('error')
             self.assertEqual(expected, error_lines)
             self.assertEqual(len(self.replicator.partition_times), 1)
@@ -1874,7 +2032,7 @@ class TestObjectReplicator(unittest.TestCase):
             self.logger.clear()
 
         # Check successful http_connect and sync for local node
-        mock_tpool_reraise.return_value = (1, {'a83': 'ba47fd314242ec8c'
+        mock_tpool_execute.return_value = (1, {'a83': 'ba47fd314242ec8c'
                                                       '7efb91f5d57336e4'})
         resp.read.return_value = pickle.dumps({'a83': 'c130a2c17ed45102a'
                                                       'ada0f4eee69494ff'})
@@ -1887,10 +2045,12 @@ class TestObjectReplicator(unittest.TestCase):
             reqs.append(mock.call(node, local_job, ['a83']))
         fake_func.assert_has_calls(reqs, any_order=True)
         self.assertEqual(fake_func.call_count, 2)
-        self.assertEqual(self.replicator.replication_count, 1)
-        self.assertEqual(self.replicator.suffix_sync, 2)
-        self.assertEqual(self.replicator.suffix_hash, 1)
-        self.assertEqual(self.replicator.suffix_count, 1)
+        stats = self.replicator.total_stats
+        self.assertEqual(stats.attempted, 1)
+        self.assertEqual(stats.suffix_sync, 2)
+        self.assertEqual(stats.suffix_hash, 1)
+        self.assertEqual(stats.suffix_count, 1)
+        self.assertEqual(stats.hashmatch, 0)
 
         # Efficient Replication Case
         set_default(self)
@@ -1906,10 +2066,12 @@ class TestObjectReplicator(unittest.TestCase):
         # belong to another region
         self.replicator.update(job)
         self.assertEqual(fake_func.call_count, 1)
-        self.assertEqual(self.replicator.replication_count, 1)
-        self.assertEqual(self.replicator.suffix_sync, 1)
-        self.assertEqual(self.replicator.suffix_hash, 1)
-        self.assertEqual(self.replicator.suffix_count, 1)
+        stats = self.replicator.total_stats
+        self.assertEqual(stats.attempted, 1)
+        self.assertEqual(stats.suffix_sync, 1)
+        self.assertEqual(stats.suffix_hash, 1)
+        self.assertEqual(stats.suffix_count, 1)
+        self.assertEqual(stats.hashmatch, 0)
 
         mock_http.reset_mock()
         self.logger.clear()
@@ -1930,23 +2092,61 @@ class TestObjectReplicator(unittest.TestCase):
                                   node['replication_port'], node['device'],
                                   repl_job['partition'], 'REPLICATE',
                                   '', headers=self.headers))
-            reqs.append(mock.call(node['replication_ip'],
-                                  node['replication_port'], node['device'],
-                                  repl_job['partition'], 'REPLICATE',
-                                  '/a83', headers=self.headers))
         mock_http.assert_has_calls(reqs, any_order=True)
+
+    @mock.patch('swift.obj.replicator.tpool.execute')
+    @mock.patch('swift.obj.replicator.http_connect', autospec=True)
+    @mock.patch('swift.obj.replicator._do_listdir')
+    def test_update_local_hash_changes_during_replication(
+            self, mock_do_listdir, mock_http, mock_tpool_execute):
+        mock_http.return_value = answer = mock.MagicMock()
+        answer.getresponse.return_value = resp = mock.MagicMock()
+        resp.status = 200
+        resp.read.return_value = pickle.dumps({
+            'a83': 'c130a2c17ed45102aada0f4eee69494ff'})
+
+        self.replicator.sync = fake_sync = \
+            mock.MagicMock(return_value=(True, []))
+        local_job = [
+            job for job in self.replicator.collect_jobs()
+            if not job['delete']
+            and job['partition'] == '0' and int(job['policy']) == 0
+        ][0]
+
+        mock_tpool_execute.side_effect = [
+            (1, {'a83': 'ba47fd314242ec8c7efb91f5d57336e4'}),
+            (1, {'a83': 'c130a2c17ed45102aada0f4eee69494ff'}),
+        ]
+        self.replicator.update(local_job)
+        self.assertEqual(fake_sync.call_count, 0)
+        self.assertEqual(mock_http.call_count, 2)
+        stats = self.replicator.total_stats
+        self.assertEqual(stats.attempted, 1)
+        self.assertEqual(stats.suffix_sync, 0)
+        self.assertEqual(stats.suffix_hash, 1)
+        self.assertEqual(stats.suffix_count, 1)
+        self.assertEqual(stats.hashmatch, 2)
 
     def test_rsync_compress_different_region(self):
         self.assertEqual(self.replicator.sync_method, self.replicator.rsync)
         jobs = self.replicator.collect_jobs()
         _m_rsync = mock.Mock(return_value=0)
         _m_os_path_exists = mock.Mock(return_value=True)
+        expected_reqs = []
         with mock.patch.object(self.replicator, '_rsync', _m_rsync), \
-                mock.patch('os.path.exists', _m_os_path_exists):
+                mock.patch('os.path.exists', _m_os_path_exists), \
+                mocked_http_conn(
+                    *[200] * 2 * sum(len(job['nodes']) for job in jobs),
+                    body=pickle.dumps('{}')) as request_log:
             for job in jobs:
                 self.assertTrue('region' in job)
                 for node in job['nodes']:
                     for rsync_compress in (True, False):
+                        expected_reqs.append((
+                            'REPLICATE', node['ip'],
+                            '/%s/%s/fake_suffix' % (
+                                node['device'], job['partition']),
+                        ))
                         self.replicator.rsync_compress = rsync_compress
                         ret = self.replicator.sync(node, job,
                                                    ['fake_suffix'])
@@ -1971,6 +2171,159 @@ class TestObjectReplicator(unittest.TestCase):
                         self.assertEqual(
                             _m_os_path_exists.call_args_list[-2][0][0],
                             os.path.join(job['path']))
+        self.assertEqual(expected_reqs, [
+            (r['method'], r['ip'], r['path']) for r in request_log.requests])
+
+    def test_rsync_failure_logging(self):
+        with mock.patch('swift.obj.replicator.subprocess.Popen') as mock_popen:
+            mock_popen.return_value.stdout = io.BytesIO(b'\n'.join([
+                b'',
+                b'cd+++++++++ suf',
+                b'cd+++++++++ suf/hash1',
+                b'<f+++++++++ suf/hash1/1637956993.28907.data',
+                b'',
+                b'cd+++++++++ suf/hash2',
+                b'<f+++++++++ suf/hash2/1615174984.55017.data',
+                b'',
+                b'cd+++++++++ suf/hash3',
+                b'<f+++++++++ suf/hash3/1616276756.37760.data',
+                b'<f+++++++++ suf/hash3/1637954870.98055.meta',
+                b'',
+                b'Oh no, some error!',
+            ]))
+            mock_popen.return_value.wait.return_value = 5
+            self.assertEqual(5, self.replicator._rsync([
+                'rsync', '--recursive', '--whole-file', '--human-readable',
+                '--xattrs', '--itemize-changes', '--ignore-existing',
+                '--timeout=30', '--contimeout=30', '--bwlimit=100M',
+                '--exclude=rsync-tempfile-pattern',
+                '/srv/node/d1/objects/part/suf',
+                '192.168.50.30::object/d8/objects/241']))
+        error_lines = self.logger.get_lines_for_level('error')
+        self.assertEqual(error_lines[:5], [
+            '<f+++++++++ suf/hash1/1637956993.28907.data',
+            '<f+++++++++ suf/hash2/1615174984.55017.data',
+            '<f+++++++++ suf/hash3/1616276756.37760.data',
+            '<f+++++++++ suf/hash3/1637954870.98055.meta',
+            'Oh no, some error!',
+        ])
+        expected_start = "Bad rsync return code: 5 <- ['rsync', '--recursive'"
+        self.assertEqual(error_lines[5][:len(expected_start)], expected_start,
+                         'Expected %r to start with %r' % (error_lines[5],
+                                                           expected_start))
+        self.assertFalse(error_lines[6:])
+        self.assertFalse(self.logger.get_lines_for_level('info'))
+        self.assertFalse(self.logger.get_lines_for_level('debug'))
+
+    def test_rsync_failure_logging_no_transfer(self):
+        with mock.patch('swift.obj.replicator.subprocess.Popen') as mock_popen:
+            mock_popen.return_value.stdout = io.BytesIO(b'\n'.join([
+                b'',
+                b'cd+++++++++ suf',
+                b'cd+++++++++ suf/hash1',
+                b'<f+++++++++ suf/hash1/1637956993.28907.data',
+                b'',
+                b'cd+++++++++ suf/hash2',
+                b'<f+++++++++ suf/hash2/1615174984.55017.data',
+                b'',
+                b'cd+++++++++ suf/hash3',
+                b'<f+++++++++ suf/hash3/1616276756.37760.data',
+                b'<f+++++++++ suf/hash3/1637954870.98055.meta',
+                b'',
+                b'Oh no, some error!',
+            ]))
+            mock_popen.return_value.wait.return_value = 5
+            self.replicator.log_rsync_transfers = False
+            self.assertEqual(5, self.replicator._rsync([
+                'rsync', '--recursive', '--whole-file', '--human-readable',
+                '--xattrs', '--itemize-changes', '--ignore-existing',
+                '--timeout=30', '--contimeout=30', '--bwlimit=100M',
+                '--exclude=rsync-tempfile-pattern',
+                '/srv/node/d1/objects/part/suf',
+                '192.168.50.30::object/d8/objects/241']))
+        error_lines = self.logger.get_lines_for_level('error')
+        self.assertEqual(error_lines[0], 'Oh no, some error!')
+        expected_start = "Bad rsync return code: 5 <- ['rsync', '--recursive'"
+        self.assertEqual(error_lines[1][:len(expected_start)], expected_start,
+                         'Expected %r to start with %r' % (error_lines[1],
+                                                           expected_start))
+        self.assertFalse(error_lines[2:])
+        self.assertFalse(self.logger.get_lines_for_level('info'))
+        self.assertFalse(self.logger.get_lines_for_level('debug'))
+
+    def test_rsync_success_logging(self):
+        with mock.patch('swift.obj.replicator.subprocess.Popen') as mock_popen:
+            mock_popen.return_value.stdout = io.BytesIO(b'\n'.join([
+                b'',
+                b'cd+++++++++ suf',
+                b'cd+++++++++ suf/hash1',
+                b'<f+++++++++ suf/hash1/1637956993.28907.data',
+                b'',
+                b'cd+++++++++ suf/hash2',
+                b'<f+++++++++ suf/hash2/1615174984.55017.data',
+                b'',
+                b'cd+++++++++ suf/hash3',
+                b'<f+++++++++ suf/hash3/1616276756.37760.data',
+                b'<f+++++++++ suf/hash3/1637954870.98055.meta',
+                b'',
+                b'Yay! It worked!',
+            ]))
+            mock_popen.return_value.wait.return_value = 0
+            self.assertEqual(0, self.replicator._rsync([
+                'rsync', '--recursive', '--whole-file', '--human-readable',
+                '--xattrs', '--itemize-changes', '--ignore-existing',
+                '--timeout=30', '--contimeout=30', '--bwlimit=100M',
+                '--exclude=rsync-tempfile-pattern',
+                '/srv/node/d1/objects/part/suf',
+                '192.168.50.30::object/d8/objects/241']))
+        self.assertFalse(self.logger.get_lines_for_level('error'))
+        debug_lines = self.logger.get_lines_for_level('debug')
+        self.assertEqual(debug_lines, [
+            '<f+++++++++ suf/hash1/1637956993.28907.data',
+            '<f+++++++++ suf/hash2/1615174984.55017.data',
+            '<f+++++++++ suf/hash3/1616276756.37760.data',
+            '<f+++++++++ suf/hash3/1637954870.98055.meta',
+            'Yay! It worked!',
+        ])
+        info_lines = self.logger.get_lines_for_level('info')
+        self.assertEqual(info_lines, [
+            'Successful rsync of /srv/node/d1/objects/part/... to '
+            '192.168.50.30::object/d8/objects/241 (0.000)'])
+
+    def test_rsync_success_logging_no_transfer(self):
+        with mock.patch('swift.obj.replicator.subprocess.Popen') as mock_popen:
+            mock_popen.return_value.stdout = io.BytesIO(b'\n'.join([
+                b'',
+                b'cd+++++++++ sf1',
+                b'cd+++++++++ sf1/hash1',
+                b'<f+++++++++ sf1/hash1/1637956993.28907.data',
+                b'',
+                b'cd+++++++++ sf1/hash2',
+                b'<f+++++++++ sf1/hash2/1615174984.55017.data',
+                b'',
+                b'cd+++++++++ sf2/hash3',
+                b'<f+++++++++ sf2/hash3/1616276756.37760.data',
+                b'<f+++++++++ sf2/hash3/1637954870.98055.meta',
+                b'',
+                b'Yay! It worked!',
+            ]))
+            mock_popen.return_value.wait.return_value = 0
+            self.replicator.log_rsync_transfers = False
+            self.assertEqual(0, self.replicator._rsync([
+                'rsync', '--recursive', '--whole-file', '--human-readable',
+                '--xattrs', '--itemize-changes', '--ignore-existing',
+                '--timeout=30', '--contimeout=30', '--bwlimit=100M',
+                '--exclude=rsync-tempfile-pattern',
+                '/srv/node/d1/objects/part/sf1',
+                '/srv/node/d1/objects/part/sf2',
+                '192.168.50.30::object/d8/objects/241']))
+        self.assertFalse(self.logger.get_lines_for_level('error'))
+        debug_lines = self.logger.get_lines_for_level('debug')
+        self.assertEqual(debug_lines, ['Yay! It worked!'])
+        info_lines = self.logger.get_lines_for_level('info')
+        self.assertEqual(info_lines, [
+            'Successful rsync of /srv/node/d1/objects/part/... to '
+            '192.168.50.30::object/d8/objects/241 (0.000)'])
 
     def test_do_listdir(self):
         # Test if do_listdir is enabled for every 10th partition to rehash
@@ -1995,14 +2348,660 @@ class TestObjectReplicator(unittest.TestCase):
             # After 10 cycles every partition is seen exactly once
             self.assertEqual(sorted(range(partitions)), sorted(seen))
 
+    def test_update_deleted_partition_lock_timeout(self):
+        self.replicator.handoffs_remaining = 0
+        jobs = self.replicator.collect_jobs()
+        delete_jobs = [j for j in jobs if j['delete']]
+        delete_jobs.sort(key=lambda j: j['policy'])
+        job = delete_jobs[0]
+        df_mgr = self.replicator._df_router[job['policy']]
+        with mock.patch.object(df_mgr, 'partition_lock',
+                               side_effect=PartitionLockTimeout):
+            self.replicator.update_deleted(job)
+        logs = self.logger.get_lines_for_level('info')
+        self.assertEqual(['Unable to lock handoff partition 1 for '
+                          'replication on device sda policy 0'], logs)
+
     def test_replicate_skipped_partpower_increase(self):
         _create_test_rings(self.testdir, next_part_power=4)
+        self.replicator.get_local_devices()  # refresh rings
         self.replicator.replicate()
         self.assertEqual(0, self.replicator.job_count)
-        self.assertEqual(0, self.replicator.replication_count)
+        self.assertEqual(0, self.replicator.total_stats.attempted)
         warnings = self.logger.get_lines_for_level('warning')
         self.assertIn(
             "next_part_power set in policy 'one'. Skipping", warnings)
+
+    def test_replicate_rsync_timeout(self):
+        cur_part = '0'
+        df = self.df_mgr.get_diskfile('sda', cur_part, 'a', 'c', 'o',
+                                      policy=POLICIES[0])
+        mkdirs(df._datadir)
+        f = open(os.path.join(df._datadir,
+                              normalize_timestamp(time.time()) + '.data'),
+                 'wb')
+        f.write(b'1234567890')
+        f.close()
+
+        mock_procs = []
+
+        def new_mock(*a, **kw):
+            proc = MockHungProcess()
+            mock_procs.append(proc)
+            return proc
+
+        with mock.patch('swift.obj.replicator.http_connect',
+                        mock_http_connect(200)), \
+                mock.patch.object(self.replicator, 'rsync_timeout', 0.01), \
+                mock.patch('eventlet.green.subprocess.Popen', new_mock):
+            self.replicator.rsync_error_log_line_length = 40
+            self.replicator.run_once()
+        for proc in mock_procs:
+            self.assertEqual(proc._calls, [
+                ('wait', 'running'),
+                ('kill', 'running'),
+                ('wait', 'killed'),
+            ])
+        self.assertEqual(len(mock_procs), 2)
+        error_lines = self.replicator.logger.get_lines_for_level('error')
+        # verify logs are truncated to rsync_error_log_line_length
+        self.assertEqual(["Killing long-running rsync after 0s: ['r"] * 2,
+                         error_lines)
+
+    def test_replicate_rsync_timeout_wedged(self):
+        cur_part = '0'
+        df = self.df_mgr.get_diskfile('sda', cur_part, 'a', 'c', 'o',
+                                      policy=POLICIES[0])
+        mkdirs(df._datadir)
+        f = open(os.path.join(df._datadir,
+                              normalize_timestamp(time.time()) + '.data'),
+                 'wb')
+        f.write(b'1234567890')
+        f.close()
+
+        mock_procs = []
+
+        def new_mock(*a, **kw):
+            proc = MockHungProcess(polls_needed=2)
+            mock_procs.append(proc)
+            return proc
+
+        with mock.patch('swift.obj.replicator.http_connect',
+                        mock_http_connect(200)), \
+                mock.patch.object(self.replicator, 'rsync_timeout', 0.01), \
+                mock.patch('eventlet.green.subprocess.Popen', new_mock):
+            self.replicator.run_once()
+        for proc in mock_procs:
+            self.assertEqual(proc._calls, [
+                ('wait', 'running'),
+                ('kill', 'running'),
+                ('wait', 'killed'),
+                ('poll', 'killed'),
+                ('poll', 'killed'),
+            ])
+        self.assertEqual(len(mock_procs), 2)
+
+    def test_limit_rsync_log(self):
+        def do_test(length_limit, log_line, expected):
+            self.replicator.rsync_error_log_line_length = length_limit
+            result = self.replicator._limit_rsync_log(log_line)
+            self.assertEqual(result, expected)
+
+        tests = [{'length_limit': 20,
+                  'log_line': 'a' * 20,
+                  'expected': 'a' * 20},
+                 {'length_limit': 20,
+                  'log_line': 'a' * 19,
+                  'expected': 'a' * 19},
+                 {'length_limit': 20,
+                  'log_line': 'a' * 21,
+                  'expected': 'a' * 20},
+                 {'length_limit': None,
+                  'log_line': 'a' * 50,
+                  'expected': 'a' * 50},
+                 {'length_limit': 0,
+                  'log_line': 'a' * 50,
+                  'expected': 'a' * 50}]
+
+        for params in tests:
+            do_test(**params)
+
+
+@patch_policies([StoragePolicy(0, 'zero', False),
+                 StoragePolicy(1, 'one', True)])
+class TestMultiProcessReplicator(unittest.TestCase):
+    def setUp(self):
+        # recon cache path
+        self.recon_cache = tempfile.mkdtemp()
+        rmtree(self.recon_cache, ignore_errors=1)
+        os.mkdir(self.recon_cache)
+        self.recon_file = os.path.join(self.recon_cache, RECON_OBJECT_FILE)
+
+        bind_port = 6200
+
+        # Set up some rings
+        self.testdir = tempfile.mkdtemp()
+        _create_test_rings(self.testdir, devs=[
+            {'id': 0, 'device': 'sda', 'zone': 0,
+             'region': 1, 'ip': '127.0.0.1', 'port': bind_port},
+            {'id': 1, 'device': 'sdb', 'zone': 0,
+             'region': 1, 'ip': '127.0.0.1', 'port': bind_port},
+            {'id': 2, 'device': 'sdc', 'zone': 0,
+             'region': 1, 'ip': '127.0.0.1', 'port': bind_port},
+            {'id': 3, 'device': 'sdd', 'zone': 0,
+             'region': 1, 'ip': '127.0.0.1', 'port': bind_port},
+            {'id': 4, 'device': 'sde', 'zone': 0,
+             'region': 1, 'ip': '127.0.0.1', 'port': bind_port},
+            {'id': 100, 'device': 'notme0', 'zone': 0,
+             'region': 1, 'ip': '127.99.99.99', 'port': bind_port}])
+
+        self.logger = debug_logger('test-replicator')
+        self.conf = dict(
+            bind_ip='127.0.0.1', bind_port=bind_port,
+            swift_dir=self.testdir,
+            mount_check='false', recon_cache_path=self.recon_cache,
+            timeout='300', stats_interval='1', sync_method='rsync')
+
+        self.replicator = object_replicator.ObjectReplicator(
+            self.conf, logger=self.logger)
+
+    def tearDown(self):
+        self.assertFalse(process_errors)
+        rmtree(self.testdir, ignore_errors=1)
+        rmtree(self.recon_cache, ignore_errors=1)
+
+    def fake_replicate(self, override_devices, **kw):
+        # Faked-out replicate() method. Just updates the stats, but doesn't
+        # do any work.
+        for device in override_devices:
+            stats = self.replicator.stats_for_dev[device]
+            if device == 'sda':
+                stats.attempted = 1
+                stats.success = 10
+                stats.failure = 100
+                stats.hashmatch = 1000
+                stats.rsync = 10000
+                stats.remove = 100000
+                stats.suffix_count = 1000000
+                stats.suffix_hash = 10000000
+                stats.suffix_sync = 100000000
+                stats.failure_nodes = {
+                    '10.1.1.1': {'d11': 1}}
+            elif device == 'sdb':
+                stats.attempted = 2
+                stats.success = 20
+                stats.failure = 200
+                stats.hashmatch = 2000
+                stats.rsync = 20000
+                stats.remove = 200000
+                stats.suffix_count = 2000000
+                stats.suffix_hash = 20000000
+                stats.suffix_sync = 200000000
+                stats.failure_nodes = {
+                    '10.2.2.2': {'d22': 2}}
+            elif device == 'sdc':
+                stats.attempted = 3
+                stats.success = 30
+                stats.failure = 300
+                stats.hashmatch = 3000
+                stats.rsync = 30000
+                stats.remove = 300000
+                stats.suffix_count = 3000000
+                stats.suffix_hash = 30000000
+                stats.suffix_sync = 300000000
+                stats.failure_nodes = {
+                    '10.3.3.3': {'d33': 3}}
+            elif device == 'sdd':
+                stats.attempted = 4
+                stats.success = 40
+                stats.failure = 400
+                stats.hashmatch = 4000
+                stats.rsync = 40000
+                stats.remove = 400000
+                stats.suffix_count = 4000000
+                stats.suffix_hash = 40000000
+                stats.suffix_sync = 400000000
+                stats.failure_nodes = {
+                    '10.4.4.4': {'d44': 4}}
+            elif device == 'sde':
+                stats.attempted = 5
+                stats.success = 50
+                stats.failure = 500
+                stats.hashmatch = 5000
+                stats.rsync = 50000
+                stats.remove = 500000
+                stats.suffix_count = 5000000
+                stats.suffix_hash = 50000000
+                stats.suffix_sync = 500000000
+                stats.failure_nodes = {
+                    '10.5.5.5': {'d55': 5}}
+            else:
+                raise Exception("mock can't handle %r" % device)
+
+    def test_no_multiprocessing(self):
+        self.replicator.replicator_workers = 0
+        self.assertEqual(self.replicator.get_worker_args(), [])
+
+    def test_device_distribution(self):
+        self.replicator.replicator_workers = 2
+        self.assertEqual(self.replicator.get_worker_args(), [{
+            'override_devices': ['sda', 'sdc', 'sde'],
+            'override_partitions': [],
+            'override_policies': [],
+            'have_overrides': False,
+            'multiprocess_worker_index': 0,
+        }, {
+            'override_devices': ['sdb', 'sdd'],
+            'override_partitions': [],
+            'override_policies': [],
+            'have_overrides': False,
+            'multiprocess_worker_index': 1,
+        }])
+
+    def test_override_policies(self):
+        self.replicator.replicator_workers = 2
+        args = self.replicator.get_worker_args(policies="3,5,7", once=True)
+        self.assertEqual(args, [{
+            'override_devices': ['sda', 'sdc', 'sde'],
+            'override_partitions': [],
+            'override_policies': [3, 5, 7],
+            'have_overrides': True,
+            'multiprocess_worker_index': 0,
+        }, {
+            'override_devices': ['sdb', 'sdd'],
+            'override_partitions': [],
+            'override_policies': [3, 5, 7],
+            'have_overrides': True,
+            'multiprocess_worker_index': 1,
+        }])
+
+        # override policies don't apply in run-forever mode
+        args = self.replicator.get_worker_args(policies="3,5,7", once=False)
+        self.assertEqual(args, [{
+            'override_devices': ['sda', 'sdc', 'sde'],
+            'override_partitions': [],
+            'override_policies': [],
+            'have_overrides': False,
+            'multiprocess_worker_index': 0,
+        }, {
+            'override_devices': ['sdb', 'sdd'],
+            'override_partitions': [],
+            'override_policies': [],
+            'have_overrides': False,
+            'multiprocess_worker_index': 1,
+        }])
+
+    def test_more_workers_than_disks(self):
+        self.replicator.replicator_workers = 999
+        self.assertEqual(self.replicator.get_worker_args(), [{
+            'override_devices': ['sda'],
+            'override_partitions': [],
+            'override_policies': [],
+            'have_overrides': False,
+            'multiprocess_worker_index': 0,
+        }, {
+            'override_devices': ['sdb'],
+            'override_partitions': [],
+            'override_policies': [],
+            'have_overrides': False,
+            'multiprocess_worker_index': 1,
+        }, {
+            'override_devices': ['sdc'],
+            'override_partitions': [],
+            'override_policies': [],
+            'have_overrides': False,
+            'multiprocess_worker_index': 2,
+        }, {
+            'override_devices': ['sdd'],
+            'override_partitions': [],
+            'override_policies': [],
+            'have_overrides': False,
+            'multiprocess_worker_index': 3,
+        }, {
+            'override_devices': ['sde'],
+            'override_partitions': [],
+            'override_policies': [],
+            'have_overrides': False,
+            'multiprocess_worker_index': 4,
+        }])
+
+        # Remember how many workers we actually have so that the log-line
+        # prefixes are reasonable. Otherwise, we'd have five workers, each
+        # logging lines starting with things like "[worker X/999 pid=P]"
+        # despite there being only five.
+        self.assertEqual(self.replicator.replicator_workers, 5)
+
+    def test_command_line_overrides(self):
+        self.replicator.replicator_workers = 2
+
+        args = self.replicator.get_worker_args(
+            devices="sda,sdc,sdd", partitions="12,34,56", once=True)
+        self.assertEqual(args, [{
+            'override_devices': ['sda', 'sdd'],
+            'override_partitions': [12, 34, 56],
+            'override_policies': [],
+            'have_overrides': True,
+            'multiprocess_worker_index': 0,
+        }, {
+            'override_devices': ['sdc'],
+            'override_partitions': [12, 34, 56],
+            'override_policies': [],
+            'have_overrides': True,
+            'multiprocess_worker_index': 1,
+        }])
+
+        args = self.replicator.get_worker_args(
+            devices="sda,sdc,sdd", once=True)
+        self.assertEqual(args, [{
+            'override_devices': ['sda', 'sdd'],
+            'override_partitions': [],
+            'override_policies': [],
+            'have_overrides': True,
+            'multiprocess_worker_index': 0,
+        }, {
+            'override_devices': ['sdc'],
+            'override_partitions': [],
+            'override_policies': [],
+            'have_overrides': True,
+            'multiprocess_worker_index': 1,
+        }])
+
+        # no overrides apply in run-forever mode
+        args = self.replicator.get_worker_args(
+            devices="sda,sdc,sdd", partitions="12,34,56", once=False)
+        self.assertEqual(args, [{
+            'override_devices': ['sda', 'sdc', 'sde'],
+            'override_partitions': [],
+            'override_policies': [],
+            'have_overrides': False,
+            'multiprocess_worker_index': 0,
+        }, {
+            'override_devices': ['sdb', 'sdd'],
+            'override_partitions': [],
+            'override_policies': [],
+            'have_overrides': False,
+            'multiprocess_worker_index': 1,
+        }])
+
+    def test_worker_logging(self):
+        self.replicator.replicator_workers = 3
+
+        def log_some_stuff(*a, **kw):
+            self.replicator.logger.debug("debug message")
+            self.replicator.logger.info("info message")
+            self.replicator.logger.warning("warning message")
+            self.replicator.logger.error("error message")
+
+        with mock.patch.object(self.replicator, 'replicate', log_some_stuff), \
+                mock.patch("os.getpid", lambda: 8804):
+            self.replicator.get_worker_args()
+            self.replicator.run_once(multiprocess_worker_index=0,
+                                     override_devices=['sda', 'sdb'])
+
+        prefix = "[worker 1/3 pid=8804] "
+        for level, lines in self.logger.logger.all_log_lines().items():
+            for line in lines:
+                self.assertTrue(
+                    line.startswith(prefix),
+                    "%r doesn't start with %r (level %s)" % (
+                        line, prefix, level))
+
+    def test_recon_run_once(self):
+        self.replicator.replicator_workers = 3
+
+        the_time = [1521680000]
+
+        def mock_time():
+            rv = the_time[0]
+            the_time[0] += 120
+            return rv
+
+        # Simulate a couple child processes
+        with mock.patch.object(self.replicator, 'replicate',
+                               self.fake_replicate), \
+                mock.patch('time.time', mock_time):
+            self.replicator.get_worker_args()
+            self.replicator.run_once(multiprocess_worker_index=0,
+                                     override_devices=['sda', 'sdb'])
+            self.replicator.run_once(multiprocess_worker_index=1,
+                                     override_devices=['sdc'])
+            self.replicator.run_once(multiprocess_worker_index=2,
+                                     override_devices=['sdd', 'sde'])
+
+        with open(self.recon_file) as fh:
+            recon_data = json.load(fh)
+        self.assertIn('object_replication_per_disk', recon_data)
+        self.assertIn('sda', recon_data['object_replication_per_disk'])
+        self.assertIn('sdb', recon_data['object_replication_per_disk'])
+        self.assertIn('sdc', recon_data['object_replication_per_disk'])
+        self.assertIn('sdd', recon_data['object_replication_per_disk'])
+        self.assertIn('sde', recon_data['object_replication_per_disk'])
+        sda = recon_data['object_replication_per_disk']['sda']
+
+        # Spot-check a couple of fields
+        self.assertEqual(sda['replication_stats']['attempted'], 1)
+        self.assertEqual(sda['replication_stats']['success'], 10)
+        self.assertEqual(sda['object_replication_time'], 2)  # minutes
+        self.assertEqual(sda['object_replication_last'], 1521680120)
+
+        # Aggregate the workers' recon updates
+        self.replicator.post_multiprocess_run()
+        with open(self.recon_file) as fh:
+            recon_data = json.load(fh)
+        self.assertEqual(recon_data['replication_stats']['attempted'], 15)
+        self.assertEqual(recon_data['replication_stats']['failure'], 1500)
+        self.assertEqual(recon_data['replication_stats']['hashmatch'], 15000)
+        self.assertEqual(recon_data['replication_stats']['remove'], 1500000)
+        self.assertEqual(recon_data['replication_stats']['rsync'], 150000)
+        self.assertEqual(recon_data['replication_stats']['success'], 150)
+        self.assertEqual(recon_data['replication_stats']['suffix_count'],
+                         15000000)
+        self.assertEqual(recon_data['replication_stats']['suffix_hash'],
+                         150000000)
+        self.assertEqual(recon_data['replication_stats']['suffix_sync'],
+                         1500000000)
+        self.assertEqual(recon_data['replication_stats']['failure_nodes'], {
+            '10.1.1.1': {'d11': 1},
+            '10.2.2.2': {'d22': 2},
+            '10.3.3.3': {'d33': 3},
+            '10.4.4.4': {'d44': 4},
+            '10.5.5.5': {'d55': 5},
+        })
+        self.assertEqual(recon_data['object_replication_time'], 2)  # minutes
+        self.assertEqual(recon_data['object_replication_last'], 1521680120)
+
+    def test_recon_skipped_with_overrides(self):
+        self.replicator.replicator_workers = 3
+
+        the_time = [1521680000]
+
+        def mock_time():
+            rv = the_time[0]
+            the_time[0] += 120
+            return rv
+
+        with mock.patch.object(self.replicator, 'replicate',
+                               self.fake_replicate), \
+                mock.patch('time.time', mock_time):
+            self.replicator.get_worker_args()
+            self.replicator.run_once(multiprocess_worker_index=0,
+                                     have_overrides=True,
+                                     override_devices=['sda', 'sdb'])
+        self.assertFalse(os.path.exists(self.recon_file))
+
+        # have_overrides=False makes us get recon stats
+        with mock.patch.object(self.replicator, 'replicate',
+                               self.fake_replicate), \
+                mock.patch('time.time', mock_time):
+            self.replicator.get_worker_args()
+            self.replicator.run_once(multiprocess_worker_index=0,
+                                     have_overrides=False,
+                                     override_devices=['sda', 'sdb'])
+        with open(self.recon_file) as fh:
+            recon_data = json.load(fh)
+        self.assertIn('sda', recon_data['object_replication_per_disk'])
+
+    def test_recon_run_forever(self):
+        the_time = [1521521521.52152]
+
+        def mock_time():
+            rv = the_time[0]
+            the_time[0] += 120
+            return rv
+
+        self.replicator.replicator_workers = 2
+        self.replicator._next_rcache_update = the_time[0]
+
+        # One worker has finished a pass, the other hasn't.
+        with mock.patch.object(self.replicator, 'replicate',
+                               self.fake_replicate), \
+                mock.patch('time.time', mock_time):
+            self.replicator.get_worker_args()
+            # Yes, this says run_once, but this is only to populate
+            # object.recon with some stats. The real test is for the
+            # aggregation.
+            self.replicator.run_once(multiprocess_worker_index=0,
+                                     override_devices=['sda', 'sdb', 'sdc'])
+
+        # This will not produce aggregate stats since not every device has
+        # finished a pass.
+        the_time[0] += self.replicator.stats_interval
+        with mock.patch('time.time', mock_time):
+            rv = self.replicator.is_healthy()
+        self.assertTrue(rv)
+        with open(self.recon_file) as fh:
+            recon_data = json.load(fh)
+        self.assertNotIn('replication_stats', recon_data)
+
+        # Now all the local devices have completed a replication pass, so we
+        # will produce aggregate stats.
+        with mock.patch.object(self.replicator, 'replicate',
+                               self.fake_replicate), \
+                mock.patch('time.time', mock_time):
+            self.replicator.get_worker_args()
+            self.replicator.run_once(multiprocess_worker_index=1,
+                                     override_devices=['sdd', 'sde'])
+        the_time[0] += self.replicator.stats_interval
+        with mock.patch('time.time', mock_time):
+            rv = self.replicator.is_healthy()
+        self.assertTrue(rv)
+        with open(self.recon_file) as fh:
+            recon_data = json.load(fh)
+        self.assertIn('replication_stats', recon_data)
+
+        # no need to exhaustively check every sum
+        self.assertEqual(recon_data['replication_stats']['attempted'], 15)
+        self.assertEqual(recon_data['replication_stats']['success'], 150)
+
+        self.assertEqual(
+            recon_data['replication_last'],
+            min(pd['replication_last']
+                for pd in recon_data['object_replication_per_disk'].values()))
+
+
+class TestReplicatorStats(unittest.TestCase):
+    def test_to_recon(self):
+        st = object_replicator.Stats(
+            attempted=1, failure=2, hashmatch=3, remove=4,
+            rsync=5, success=7,
+            suffix_count=8, suffix_hash=9, suffix_sync=10,
+            failure_nodes={'10.1.2.3': {'sda': 100, 'sdb': 200}})
+        # This is what appears in the recon dump
+        self.assertEqual(st.to_recon(), {
+            'attempted': 1,
+            'failure': 2,
+            'hashmatch': 3,
+            'remove': 4,
+            'rsync': 5,
+            'success': 7,
+            'suffix_count': 8,
+            'suffix_hash': 9,
+            'suffix_sync': 10,
+            'failure_nodes': {'10.1.2.3': {'sda': 100, 'sdb': 200}},
+        })
+
+    def test_recon_roundtrip(self):
+        before = object_replicator.Stats(
+            attempted=1, failure=2, hashmatch=3, remove=4,
+            rsync=5, success=7,
+            suffix_count=8, suffix_hash=9, suffix_sync=10,
+            failure_nodes={'10.1.2.3': {'sda': 100, 'sdb': 200}})
+        after = object_replicator.Stats.from_recon(before.to_recon())
+        self.assertEqual(after.attempted, before.attempted)
+        self.assertEqual(after.failure, before.failure)
+        self.assertEqual(after.hashmatch, before.hashmatch)
+        self.assertEqual(after.remove, before.remove)
+        self.assertEqual(after.rsync, before.rsync)
+        self.assertEqual(after.success, before.success)
+        self.assertEqual(after.suffix_count, before.suffix_count)
+        self.assertEqual(after.suffix_hash, before.suffix_hash)
+        self.assertEqual(after.suffix_sync, before.suffix_sync)
+        self.assertEqual(after.failure_nodes, before.failure_nodes)
+
+    def test_from_recon_skips_extra_fields(self):
+        # If another attribute ever sneaks its way in, we should ignore it.
+        # This will make aborted upgrades a little less painful for
+        # operators.
+        recon_dict = {'attempted': 1, 'failure': 2, 'hashmatch': 3,
+                      'spices': 5, 'treasures': 8}
+        stats = object_replicator.Stats.from_recon(recon_dict)
+        self.assertEqual(stats.attempted, 1)
+        self.assertEqual(stats.failure, 2)
+        self.assertEqual(stats.hashmatch, 3)
+        # We don't gain attributes just because they're in object.recon.
+        self.assertFalse(hasattr(stats, 'spices'))
+        self.assertFalse(hasattr(stats, 'treasures'))
+
+    def test_add_failure_stats(self):
+        st = object_replicator.Stats()
+        st.add_failure_stats([('10.1.1.1', 'd10'), ('10.1.1.1', 'd11')])
+        st.add_failure_stats([('10.1.1.1', 'd10')])
+        st.add_failure_stats([('10.1.1.1', 'd12'), ('10.2.2.2', 'd20'),
+                              ('10.2.2.2', 'd21'), ('10.2.2.2', 'd21'),
+                              ('10.2.2.2', 'd21')])
+        self.assertEqual(st.failure, 8)
+
+        as_dict = st.to_recon()
+        self.assertEqual(as_dict['failure_nodes'], {
+            '10.1.1.1': {
+                'd10': 2,
+                'd11': 1,
+                'd12': 1,
+            },
+            '10.2.2.2': {
+                'd20': 1,
+                'd21': 3,
+            },
+        })
+
+    def test_add(self):
+        st1 = object_replicator.Stats(
+            attempted=1, failure=2, hashmatch=3, remove=4, rsync=5,
+            success=6, suffix_count=7, suffix_hash=8, suffix_sync=9,
+            failure_nodes={
+                '10.1.1.1': {'sda': 10, 'sdb': 20},
+                '10.1.1.2': {'sda': 10, 'sdb': 20}})
+        st2 = object_replicator.Stats(
+            attempted=2, failure=4, hashmatch=6, remove=8, rsync=10,
+            success=12, suffix_count=14, suffix_hash=16, suffix_sync=18,
+            failure_nodes={
+                '10.1.1.2': {'sda': 10, 'sdb': 20},
+                '10.1.1.3': {'sda': 10, 'sdb': 20}})
+        total = st1 + st2
+        self.assertEqual(total.attempted, 3)
+        self.assertEqual(total.failure, 6)
+        self.assertEqual(total.hashmatch, 9)
+        self.assertEqual(total.remove, 12)
+        self.assertEqual(total.rsync, 15)
+        self.assertEqual(total.success, 18)
+        self.assertEqual(total.suffix_count, 21)
+        self.assertEqual(total.suffix_hash, 24)
+        self.assertEqual(total.suffix_sync, 27)
+        self.assertEqual(total.failure_nodes, {
+            '10.1.1.1': {'sda': 10, 'sdb': 20},
+            '10.1.1.2': {'sda': 20, 'sdb': 40},
+            '10.1.1.3': {'sda': 10, 'sdb': 20},
+        })
 
 
 if __name__ == '__main__':

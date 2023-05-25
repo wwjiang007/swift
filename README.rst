@@ -1,22 +1,19 @@
-========================
-Team and repository tags
-========================
+===============
+OpenStack Swift
+===============
 
-.. image:: https://governance.openstack.org/badges/swift.svg
-    :target: https://governance.openstack.org/reference/tags/index.html
+.. image:: https://governance.openstack.org/tc/badges/swift.svg
+    :target: https://governance.openstack.org/tc/reference/tags/index.html
 
 .. Change things from this point on
 
-Swift
-=====
-
-A distributed object storage system designed to scale from a single
-machine to thousands of servers. Swift is optimized for multi-tenancy
-and high concurrency. Swift is ideal for backups, web and mobile
+OpenStack Swift is a distributed object storage system designed to scale
+from a single machine to thousands of servers. Swift is optimized for
+multi-tenancy and high concurrency. Swift is ideal for backups, web and mobile
 content, and any other unstructured data that can grow without bound.
 
 Swift provides a simple, REST-based API fully documented at
-http://docs.openstack.org/.
+https://docs.openstack.org/swift/latest/.
 
 Swift was originally developed as the basis for Rackspace's Cloud Files
 and was open-sourced in 2010 as part of the OpenStack project. It has
@@ -27,10 +24,13 @@ in the AUTHORS file.
 Docs
 ----
 
-To build documentation install sphinx (``pip install sphinx``), run
-``python setup.py build_sphinx``, and then browse to
-/doc/build/html/index.html. These docs are auto-generated after every
-commit and available online at
+To build documentation run::
+
+    pip install -r requirements.txt -r doc/requirements.txt
+    sphinx-build -W -b html doc/source doc/build/html
+
+and then browse to doc/build/html/index.html. These docs are auto-generated
+after every commit and available online at
 https://docs.openstack.org/swift/latest/.
 
 For Developers
@@ -49,7 +49,7 @@ The best place to get started is the
 `"SAIO - Swift All In One" <https://docs.openstack.org/swift/latest/development_saio.html>`__.
 This document will walk you through setting up a development cluster of
 Swift in a VM. The SAIO environment is ideal for running small-scale
-tests against swift and trying out new features and bug fixes.
+tests against Swift and trying out new features and bug fixes.
 
 Tests
 ~~~~~
@@ -118,7 +118,7 @@ Swift is a WSGI application and uses eventlet's WSGI server. After the
 processes are running, the entry point for new requests is the
 ``Application`` class in ``swift/proxy/server.py``. From there, a
 controller is chosen, and the request is processed. The proxy may choose
-to forward the request to a back- end server. For example, the entry
+to forward the request to a back-end server. For example, the entry
 point for requests to the object server is the ``ObjectController``
 class in ``swift/obj/server.py``.
 
@@ -132,7 +132,7 @@ There is an `ops runbook <https://docs.openstack.org/swift/latest/ops_runbook/in
 that gives information about how to diagnose and troubleshoot common issues
 when running a Swift cluster.
 
-You can run functional tests against a swift cluster with
+You can run functional tests against a Swift cluster with
 ``.functests``. These functional tests require ``/etc/swift/test.conf``
 to run. A sample config file can be found in this source tree in
 ``test/sample.conf``.
@@ -141,10 +141,10 @@ For Client Apps
 ---------------
 
 For client applications, official Python language bindings are provided
-at http://github.com/openstack/python-swiftclient.
+at https://opendev.org/openstack/python-swiftclient.
 
 Complete API documentation at
-https://developer.openstack.org/api-ref/object-store/
+https://docs.openstack.org/api-ref/object-store/
 
 There is a large ecosystem of applications and libraries that support and
 work with OpenStack Swift. Several are listed on the
@@ -153,7 +153,7 @@ page.
 
 --------------
 
-For more information come hang out in #openstack-swift on freenode.
+For more information come hang out in #openstack-swift on OFTC.
 
 Thanks,
 

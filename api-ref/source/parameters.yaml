@@ -228,7 +228,7 @@ If-Unmodified-Since:
 Last-Modified:
   description: |
     The date and time when the object was created or its metadata was
-    changed. The date and time is formaatted as shown in this
+    changed. The date and time is formatted as shown in this
     example: ``Fri, 12 Aug 2016 14:24:16 GMT``
 
     The time is always in UTC.
@@ -434,7 +434,7 @@ X-Container-Meta-Access-Control-Expose-Headers:
     request response, separated by spaces.  By default the Object
     Storage service returns the following headers:
 
-    - All “simple response headers” as listed on
+    - All "simple response headers" as listed on
       `http://www.w3.org/TR/cors/#simple-response-header
       <http://www.w3.org/TR/cors/#simple-response-header>`_.
     - The headers ``etag``, ``x-timestamp``, ``x-trans-id``,
@@ -692,18 +692,31 @@ X-Copy-From-Account:
   type: string
 X-Delete-After:
   description: |
-    The number of seconds after which the system
-    removes the object. Internally, the Object Storage system stores
-    this value in the ``X-Delete-At`` metadata item.
+    The number of seconds after which the system removes the object. The value
+    should be a positive integer. Internally, the Object Storage system uses
+    this value to generate an ``X-Delete-At`` metadata item. If both
+    ``X-Delete-After`` and ``X-Delete-At`` are set then ``X-Delete-After``
+    takes precedence.
   in: header
   required: false
   type: integer
 X-Delete-At:
   description: |
-    The date and time in `UNIX Epoch time stamp
-    format <https://en.wikipedia.org/wiki/Unix_time>`_ when the system
-    removes the object.  For example, ``1440619048`` is equivalent to
-    ``Mon, Wed, 26 Aug 2015 19:57:28 GMT``.
+    The date and time in `UNIX Epoch time stamp format
+    <https://en.wikipedia.org/wiki/Unix_time>`_ when the system removes the
+    object.  For example, ``1440619048`` is equivalent to ``Mon, Wed, 26 Aug
+    2015 19:57:28 GMT``.  The value should be a positive integer corresponding
+    to a time in the future. If both ``X-Delete-After`` and ``X-Delete-At`` are
+    set then ``X-Delete-After`` takes precedence.
+  in: header
+  required: false
+  type: integer
+X-Delete-At_resp:
+  description: |
+    If present, specifies date and time in `UNIX Epoch time stamp format
+    <https://en.wikipedia.org/wiki/Unix_time>`_ when the system removes the
+    object.  For example, ``1440619048`` is equivalent to ``Mon, Wed, 26 Aug
+    2015 19:57:28 GMT``.
   in: header
   required: false
   type: integer
@@ -990,18 +1003,17 @@ bulk-delete:
   type: string
 delimiter:
   description: |
-    Delimiter value, which returns the object names
-    that are nested in the container. If you do not set a prefix and
-    set the delimiter to "/" you may get unexpected results where all
-    the objects are returned instead of only those with the delimiter
-    set.
+    The delimiter is a single character used to split object
+    names to present a pseudo-directory hierarchy of objects. When combined
+    with a ``prefix`` query, this enables API users to simulate and
+    traverse the objects in a container as if they were in a directory tree.
   in: query
   required: false
   type: string
 end_marker:
   description: |
-    For a string value, x , returns container names
-    that are less than the marker value.
+    For a string value, `x` , constrains the list to items whose names
+    are less than `x`.
   in: query
   required: false
   type: string
@@ -1048,8 +1060,8 @@ limit:
   type: integer
 marker:
   description: |
-    For a string value, x , returns container names
-    that are greater than the marker value.
+    For a string value, `x` , constrains the list to items whose names
+    are greater than `x`.
   in: query
   required: false
   type: string
@@ -1097,23 +1109,35 @@ multipart-manifest_put:
   description: |
     If you include the ``multipart-manifest=put`` query parameter, the object
     is a static large object manifest and the body contains the manifest.
+    See `Static large objects <https://docs.openstack.org/swift/latest
+    /api/large_objects.html#static-large-objects>`_ for more information.
   in: query
   required: false
   type: string
 path:
   description: |
     For a string value, returns the object names that
-    are nested in the pseudo path.
+    are nested in the pseudo path. Please use ``prefix``/``delimiter``
+    queries instead of using this ``path`` query.
   in: query
   required: false
   type: string
 prefix:
   description: |
-    Prefix value. Named items in the response begin
-    with this value.
+    Only objects with this prefix will be returned. When combined with a
+    ``delimiter`` query, this enables API users to simulate and
+    traverse the objects in a container as if they were in a directory tree.
   in: query
   required: false
   type: string
+reverse:
+  description: |
+    By default, listings are returned sorted by name, ascending. If you include
+    the ``reverse=true`` query parameter, the listing will be returned sorted
+    by name, descending.
+  in: query
+  required: false
+  type: boolean
 swiftinfo_expires:
   description: |
     The time at which ``swiftinfo_sig`` expires. The time is in

@@ -14,24 +14,26 @@
 # limitations under the License.
 
 import os
-from six import StringIO
+import six
 import time
 import unittest
 from getpass import getuser
 import logging
-from test.unit import tmpfile
+from test.unit import tmpfile, with_tempdir, ConfigAssertMixin
 import mock
 import signal
 from contextlib import contextmanager
 import itertools
 from collections import defaultdict
 import errno
+from textwrap import dedent
 
 from swift.common import daemon, utils
-from test.unit import debug_logger
+from test.debug_logger import debug_logger
 
 
 class MyDaemon(daemon.Daemon):
+    WORKERS_HEALTHCHECK_INTERVAL = 0
 
     def __init__(self, conf):
         self.conf = conf
@@ -67,6 +69,10 @@ class TestDaemon(unittest.TestCase):
 
 class MyWorkerDaemon(MyDaemon):
 
+    def __init__(self, *a, **kw):
+        super(MyWorkerDaemon, self).__init__(*a, **kw)
+        MyWorkerDaemon.post_multiprocess_run_called = False
+
     def get_worker_args(self, once=False, **kwargs):
         return [kwargs for i in range(int(self.conf.get('workers', 0)))]
 
@@ -75,6 +81,9 @@ class MyWorkerDaemon(MyDaemon):
             return getattr(self, 'health_side_effects', []).pop(0)
         except IndexError:
             return True
+
+    def post_multiprocess_run(self):
+        MyWorkerDaemon.post_multiprocess_run_called = True
 
 
 class TestWorkerDaemon(unittest.TestCase):
@@ -98,12 +107,12 @@ class TestWorkerDaemon(unittest.TestCase):
         self.assertTrue(d.is_healthy())
 
 
-class TestRunDaemon(unittest.TestCase):
+class TestRunDaemon(unittest.TestCase, ConfigAssertMixin):
 
     def setUp(self):
         for patcher in [
-            mock.patch.object(utils, 'HASH_PATH_PREFIX', 'startcap'),
-            mock.patch.object(utils, 'HASH_PATH_SUFFIX', 'endcap'),
+            mock.patch.object(utils, 'HASH_PATH_PREFIX', b'startcap'),
+            mock.patch.object(utils, 'HASH_PATH_SUFFIX', b'endcap'),
             mock.patch.object(utils, 'drop_privileges', lambda *args: None),
             mock.patch.object(utils, 'capture_stdio', lambda *args: None),
         ]:
@@ -132,15 +141,19 @@ class TestRunDaemon(unittest.TestCase):
         with mock.patch('swift.common.daemon.os') as mock_os:
             func()
         self.assertEqual(mock_os.method_calls, [
+            mock.call.getpid(),
             mock.call.killpg(0, signal.SIGTERM),
             # hard exit because bare except handlers can trap SystemExit
             mock.call._exit(0)
         ])
 
     def test_run_daemon(self):
+        logging.logThreads = 1  # reset to default
         sample_conf = "[my-daemon]\nuser = %s\n" % getuser()
         with tmpfile(sample_conf) as conf_file, \
-                mock.patch('swift.common.daemon.use_hub') as mock_use_hub:
+                mock.patch('swift.common.utils.eventlet') as _utils_evt, \
+                mock.patch('eventlet.hubs.use_hub') as mock_use_hub, \
+                mock.patch('eventlet.debug') as _debug_evt:
             with mock.patch.dict('os.environ', {'TZ': ''}), \
                     mock.patch('time.tzset') as mock_tzset:
                 daemon.run_daemon(MyDaemon, conf_file)
@@ -150,6 +163,12 @@ class TestRunDaemon(unittest.TestCase):
                 self.assertEqual(mock_use_hub.mock_calls,
                                  [mock.call(utils.get_hub())])
             daemon.run_daemon(MyDaemon, conf_file, once=True)
+            _utils_evt.patcher.monkey_patch.assert_called_with(all=False,
+                                                               socket=True,
+                                                               select=True,
+                                                               thread=True)
+            self.assertEqual(0, logging.logThreads)  # fixed in monkey_patch
+            _debug_evt.hub_exceptions.assert_called_with(False)
             self.assertEqual(MyDaemon.once_called, True)
 
             # test raise in daemon code
@@ -158,7 +177,7 @@ class TestRunDaemon(unittest.TestCase):
                                   conf_file, once=True)
 
             # test user quit
-            sio = StringIO()
+            sio = six.StringIO()
             logger = logging.getLogger('server')
             logger.addHandler(logging.StreamHandler(sio))
             logger = utils.get_logger(None, 'server', log_route='server')
@@ -169,11 +188,11 @@ class TestRunDaemon(unittest.TestCase):
             # test missing section
             sample_conf = "[default]\nuser = %s\n" % getuser()
             with tmpfile(sample_conf) as conf_file:
-                self.assertRaisesRegexp(SystemExit,
-                                        'Unable to find my-daemon '
-                                        'config section in.*',
-                                        daemon.run_daemon, MyDaemon,
-                                        conf_file, once=True)
+                self.assertRaisesRegex(SystemExit,
+                                       'Unable to find my-daemon '
+                                       'config section in.*',
+                                       daemon.run_daemon, MyDaemon,
+                                       conf_file, once=True)
 
     def test_run_daemon_diff_tz(self):
         old_tz = os.environ.get('TZ', '')
@@ -186,7 +205,9 @@ class TestRunDaemon(unittest.TestCase):
 
             sample_conf = "[my-daemon]\nuser = %s\n" % getuser()
             with tmpfile(sample_conf) as conf_file, \
-                    mock.patch('swift.common.daemon.use_hub'):
+                    mock.patch('swift.common.utils.eventlet'), \
+                    mock.patch('eventlet.hubs.use_hub'), \
+                    mock.patch('eventlet.debug'):
                 daemon.run_daemon(MyDaemon, conf_file)
                 self.assertFalse(MyDaemon.once_called)
                 self.assertTrue(MyDaemon.forever_called)
@@ -197,6 +218,107 @@ class TestRunDaemon(unittest.TestCase):
         finally:
             os.environ['TZ'] = old_tz
             time.tzset()
+
+    @with_tempdir
+    def test_run_deamon_from_conf_file(self, tempdir):
+        conf_path = os.path.join(tempdir, 'test-daemon.conf')
+        conf_body = """
+        [DEFAULT]
+        conn_timeout = 5
+        client_timeout = 1
+        [my-daemon]
+        CONN_timeout = 10
+        client_timeout = 2
+        """
+        contents = dedent(conf_body)
+        with open(conf_path, 'w') as f:
+            f.write(contents)
+        with mock.patch('swift.common.utils.eventlet'), \
+                mock.patch('eventlet.hubs.use_hub'), \
+                mock.patch('eventlet.debug'):
+            d = daemon.run_daemon(MyDaemon, conf_path)
+        # my-daemon section takes priority (!?)
+        self.assertEqual('2', d.conf['client_timeout'])
+        self.assertEqual('10', d.conf['CONN_timeout'])
+        self.assertEqual('5', d.conf['conn_timeout'])
+
+    @with_tempdir
+    def test_run_daemon_from_conf_file_with_duplicate_var(self, tempdir):
+        conf_path = os.path.join(tempdir, 'test-daemon.conf')
+        conf_body = """
+        [DEFAULT]
+        client_timeout = 3
+        [my-daemon]
+        CLIENT_TIMEOUT = 2
+        client_timeout = 1
+        conn_timeout = 1.1
+        conn_timeout = 1.2
+        """
+        contents = dedent(conf_body)
+        with open(conf_path, 'w') as f:
+            f.write(contents)
+        with mock.patch('swift.common.utils.eventlet'), \
+                mock.patch('eventlet.hubs.use_hub'), \
+                mock.patch('eventlet.debug'):
+            app_config = lambda: daemon.run_daemon(MyDaemon, tempdir)
+            # N.B. CLIENT_TIMEOUT/client_timeout are unique options
+            self.assertDuplicateOption(app_config, 'conn_timeout', '1.2')
+
+    @with_tempdir
+    def test_run_deamon_from_conf_dir(self, tempdir):
+        conf_files = {
+            'default': """
+            [DEFAULT]
+            conn_timeout = 5
+            client_timeout = 1
+            """,
+            'daemon': """
+            [DEFAULT]
+            CONN_timeout = 3
+            CLIENT_TIMEOUT = 4
+            [my-daemon]
+            CONN_timeout = 10
+            client_timeout = 2
+            """,
+        }
+        for filename, conf_body in conf_files.items():
+            path = os.path.join(tempdir, filename + '.conf')
+            with open(path, 'wt') as fd:
+                fd.write(dedent(conf_body))
+        with mock.patch('swift.common.utils.eventlet'), \
+                mock.patch('eventlet.hubs.use_hub'), \
+                mock.patch('eventlet.debug'):
+            d = daemon.run_daemon(MyDaemon, tempdir)
+        # my-daemon section takes priority (!?)
+        self.assertEqual('2', d.conf['client_timeout'])
+        self.assertEqual('10', d.conf['CONN_timeout'])
+        self.assertEqual('5', d.conf['conn_timeout'])
+
+    @with_tempdir
+    def test_run_daemon_from_conf_dir_with_duplicate_var(self, tempdir):
+        conf_files = {
+            'default': """
+            [DEFAULT]
+            client_timeout = 3
+            """,
+            'daemon': """
+            [my-daemon]
+            client_timeout = 2
+            CLIENT_TIMEOUT = 4
+            conn_timeout = 1.1
+            conn_timeout = 1.2
+            """,
+        }
+        for filename, conf_body in conf_files.items():
+            path = os.path.join(tempdir, filename + '.conf')
+            with open(path, 'wt') as fd:
+                fd.write(dedent(conf_body))
+        with mock.patch('swift.common.utils.eventlet'), \
+                mock.patch('eventlet.hubs.use_hub'), \
+                mock.patch('eventlet.debug'):
+            app_config = lambda: daemon.run_daemon(MyDaemon, tempdir)
+            # N.B. CLIENT_TIMEOUT/client_timeout are unique options
+            self.assertDuplicateOption(app_config, 'conn_timeout', '1.2')
 
     @contextmanager
     def mock_os(self, child_worker_cycles=3):
@@ -219,6 +341,7 @@ class TestRunDaemon(unittest.TestCase):
             yield
 
     def test_fork_workers(self):
+        utils.logging_monkey_patch()  # needed to log at notice
         d = MyWorkerDaemon({'workers': 3})
         strategy = daemon.DaemonStrategy(d, d.logger)
         with self.mock_os():
@@ -231,6 +354,7 @@ class TestRunDaemon(unittest.TestCase):
         })
         self.assertEqual([], self.mock_kill.call_args_list)
         self.assertIn('Finished', d.logger.get_lines_for_level('notice')[-1])
+        self.assertTrue(MyWorkerDaemon.post_multiprocess_run_called)
 
     def test_forked_worker(self):
         d = MyWorkerDaemon({'workers': 3})

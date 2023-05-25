@@ -75,6 +75,8 @@ class GatekeeperMiddleware(object):
         self.outbound_condition = make_exclusion_test(outbound_exclusions)
         self.shunt_x_timestamp = config_true_value(
             conf.get('shunt_inbound_x_timestamp', 'true'))
+        self.allow_reserved_names_header = config_true_value(
+            conf.get('allow_reserved_names_header', 'false'))
 
     def __call__(self, env, start_response):
         req = Request(env)
@@ -89,10 +91,15 @@ class GatekeeperMiddleware(object):
             self.logger.debug('shunted request headers: %s' %
                               [('X-Timestamp', ts)])
 
+        if 'X-Allow-Reserved-Names' in req.headers \
+                and self.allow_reserved_names_header:
+            req.headers['X-Backend-Allow-Reserved-Names'] = \
+                req.headers.pop('X-Allow-Reserved-Names')
+
         def gatekeeper_response(status, response_headers, exc_info=None):
             def fixed_response_headers():
                 def relative_path(value):
-                    parsed = urlsplit(v)
+                    parsed = urlsplit(value)
                     new_path = parsed.path
                     if parsed.query:
                         new_path += ('?%s' % parsed.query)
@@ -109,15 +116,14 @@ class GatekeeperMiddleware(object):
                     ]
 
             response_headers = fixed_response_headers()
-            removed = filter(
-                lambda h: self.outbound_condition(h[0]),
-                response_headers)
+            removed = [(header, value) for header, value in response_headers
+                       if self.outbound_condition(header)]
 
             if removed:
                 self.logger.debug('removed response headers: %s' % removed)
-                new_headers = filter(
-                    lambda h: not self.outbound_condition(h[0]),
-                    response_headers)
+                new_headers = [
+                    (header, value) for header, value in response_headers
+                    if not self.outbound_condition(header)]
                 return start_response(status, new_headers, exc_info)
             return start_response(status, response_headers, exc_info)
         return self.app(env, gatekeeper_response)

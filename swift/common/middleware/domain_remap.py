@@ -99,9 +99,9 @@ storage end points as sync destinations.
 """
 
 from swift.common.middleware import RewriteContext
-from swift.common.swob import Request, HTTPBadRequest
-from swift.common.utils import config_true_value, list_from_csv, \
-    register_swift_info
+from swift.common.swob import Request, HTTPBadRequest, wsgi_quote
+from swift.common.utils import config_true_value, list_from_csv
+from swift.common.registry import register_swift_info
 
 
 class _DomainRemapContext(RewriteContext):
@@ -158,7 +158,7 @@ class DomainRemapMiddleware(object):
                 container, account = None, parts_to_parse[0]
             else:
                 resp = HTTPBadRequest(request=Request(env),
-                                      body='Bad domain in host header',
+                                      body=b'Bad domain in host header',
                                       content_type='text/plain')
                 return resp(env, start_response)
             if len(self.reseller_prefixes) > 0:
@@ -192,7 +192,8 @@ class DomainRemapMiddleware(object):
             new_path = '/'.join(new_path_parts)
             env['PATH_INFO'] = new_path
 
-            context = _DomainRemapContext(self.app, requested_path, new_path)
+            context = _DomainRemapContext(
+                self.app, wsgi_quote(requested_path), wsgi_quote(new_path))
             return context.handle_request(env, start_response)
 
         return self.app(env, start_response)

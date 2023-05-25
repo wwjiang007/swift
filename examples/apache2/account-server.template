@@ -6,7 +6,7 @@
 # Change the debug level as you see fit
 #
 # For example:
-#     Replace %PORT% by 6012
+#     Replace %PORT% by 6212
 #     Replace %SERVICENAME% by account-server-1
 #     Replace %USER% with apache (or remove it for default)
 
@@ -14,7 +14,7 @@ NameVirtualHost *:%PORT%
 Listen %PORT%
 
 <VirtualHost *:%PORT%>
-    WSGIDaemonProcess %SERVICENAME% processes=5 threads=1 user=%USER%
+    WSGIDaemonProcess %SERVICENAME% processes=5 threads=1 user=%USER% display-name=%{GROUP}
     WSGIProcessGroup %SERVICENAME%
     WSGIScriptAlias / /var/www/swift/%SERVICENAME%.wsgi
     WSGIApplicationGroup %{GLOBAL}

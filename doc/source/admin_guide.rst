@@ -120,24 +120,23 @@ out were you need to add capacity or to help tune an :ref:`ring_overload` value.
 Now let's take an example with 1 region, 3 zones and 4 devices. Each device has
 the same weight, and the ``dispersion --verbose`` might show the following::
 
-  Dispersion is 50.000000, Balance is 0.000000, Overload is 0.00%
+  Dispersion is 16.666667, Balance is 0.000000, Overload is 0.00%
   Required overload is 33.333333%
-  Worst tier is 50.000000 (r1z3)
+  Worst tier is 33.333333 (r1z3)
   --------------------------------------------------------------------------
   Tier                           Parts      %    Max     0     1     2     3
   --------------------------------------------------------------------------
-  r1                               256   0.00      3     0     0     0   256
+  r1                               768   0.00      3     0     0     0   256
   r1z1                             192   0.00      1    64   192     0     0
   r1z1-127.0.0.1                   192   0.00      1    64   192     0     0
   r1z1-127.0.0.1/sda               192   0.00      1    64   192     0     0
   r1z2                             192   0.00      1    64   192     0     0
   r1z2-127.0.0.2                   192   0.00      1    64   192     0     0
   r1z2-127.0.0.2/sda               192   0.00      1    64   192     0     0
-  r1z3                             256  50.00      1     0   128   128     0
-  r1z3-127.0.0.3                   256  50.00      1     0   128   128     0
+  r1z3                             384  33.33      1     0   128   128     0
+  r1z3-127.0.0.3                   384  33.33      1     0   128   128     0
   r1z3-127.0.0.3/sda               192   0.00      1    64   192     0     0
   r1z3-127.0.0.3/sdb               192   0.00      1    64   192     0     0
-
 
 The first line reports that there are 256 partitions with 3 copies in region 1;
 and this is an expected output in this case (single region with 3 replicas) as
@@ -299,23 +298,40 @@ Preventing Disk Full Scenarios
 Prevent disk full scenarios by ensuring that the ``proxy-server`` blocks PUT
 requests and rsync prevents replication to the specific drives.
 
-You can prevent `proxy-server` PUT requests to low space disks by ensuring
-``fallocate_reserve`` is set in the ``object-server.conf``. By default,
-``fallocate_reserve`` is set to 1%. This blocks PUT requests that leave the
-free disk space below 1% of the disk.
+You can prevent `proxy-server` PUT requests to low space disks by
+ensuring ``fallocate_reserve`` is set in ``account-server.conf``,
+``container-server.conf``, and ``object-server.conf``. By default,
+``fallocate_reserve`` is set to 1%. In the object server, this blocks
+PUT requests that would leave the free disk space below 1% of the
+disk. In the account and container servers, this blocks operations
+that will increase account or container database size once the free
+disk space falls below 1%.
+
+Setting ``fallocate_reserve`` is highly recommended to avoid filling
+disks to 100%. When Swift's disks are completely full, all requests
+involving those disks will fail, including DELETE requests that would
+otherwise free up space. This is because object deletion includes the
+creation of a zero-byte tombstone (.ts) to record the time of the
+deletion for replication purposes; this happens prior to deletion of
+the object's data. On a completely-full filesystem, that zero-byte .ts
+file cannot be created, so the DELETE request will fail and the disk
+will remain completely full. If ``fallocate_reserve`` is set, then the
+filesystem will have enough space to create the zero-byte .ts file,
+and thus the deletion of the object will succeed and free up some
+space.
 
 In order to prevent rsync replication to specific drives, firstly
 setup ``rsync_module`` per disk in your ``object-replicator``.
 Set this in ``object-server.conf``:
 
-.. code::
+.. code:: cfg
 
     [object-replicator]
     rsync_module = {replication_ip}::object_{device}
 
 Set the individual drives in ``rsync.conf``. For example:
 
-.. code::
+.. code:: cfg
 
     [object_sda]
     max connections = 4
@@ -371,7 +387,7 @@ monitoring solution to achieve this. The following is an example script:
 For the above script to work, ensure ``/etc/rsync.d/`` conf files are
 included, by specifying ``&include`` in your ``rsync.conf`` file:
 
-.. code::
+.. code:: cfg
 
     &include /etc/rsync.d
 
@@ -379,7 +395,7 @@ Use this in conjunction with a cron job to periodically run the script, for exam
 
 .. highlight:: none
 
-.. code::
+.. code:: cfg
 
     # /etc/cron.d/devicecheck
     * * * * * root /some/path/to/disable_rsync.py
@@ -701,7 +717,7 @@ Once the recon middleware is enabled, a GET request for
 "/recon/<metric>" to the backend object server will return a
 JSON-formatted response::
 
-    fhines@ubuntu:~$ curl -i http://localhost:6030/recon/async
+    fhines@ubuntu:~$ curl -i http://localhost:6230/recon/async
     HTTP/1.1 200 OK
     Content-Type: application/json
     Content-Length: 20
@@ -711,7 +727,7 @@ JSON-formatted response::
 
 
 Note that the default port for the object server is 6200, except on a
-Swift All-In-One installation, which uses 6010, 6020, 6030, and 6040.
+Swift All-In-One installation, which uses 6210, 6220, 6230, and 6240.
 
 The following metrics and telemetry are currently exposed:
 
@@ -748,7 +764,7 @@ This information can also be queried via the swift-recon command line utility::
     fhines@ubuntu:~$ swift-recon -h
     Usage:
             usage: swift-recon <server_type> [-v] [--suppress] [-a] [-r] [-u] [-d]
-            [-l] [-T] [--md5] [--auditor] [--updater] [--expirer] [--sockstat]
+            [-R] [-l] [-T] [--md5] [--auditor] [--updater] [--expirer] [--sockstat]
 
             <server_type>   account|container|object
             Defaults to object server.
@@ -762,6 +778,7 @@ This information can also be queried via the swift-recon command line utility::
       --suppress            Suppress most connection related errors
       -a, --async           Get async stats
       -r, --replication     Get replication stats
+      -R, --reconstruction  Get reconstruction stats
       --auditor             Get auditor stats
       --updater             Get updater stats
       --expirer             Get expirer stats
@@ -817,8 +834,8 @@ this is unnecessary since the port is specified separately).  If a hostname
 resolves to an IPv4 address, an IPv4 socket will be used to send StatsD UDP
 packets, even if the hostname would also resolve to an IPv6 address.
 
-.. _StatsD: http://codeascraft.etsy.com/2011/02/15/measure-anything-measure-everything/
-.. _Graphite: http://graphite.wikidot.com/
+.. _StatsD: https://codeascraft.com/2011/02/15/measure-anything-measure-everything/
+.. _Graphite: http://graphiteapp.org/
 .. _Ganglia: http://ganglia.sourceforge.net/
 
 The sample rate is a real number between 0 and 1 which defines the
@@ -1346,20 +1363,29 @@ Swift services are generally managed with ``swift-init``. the general usage is
 ``swift-init <service> <command>``, where service is the Swift service to
 manage (for example object, container, account, proxy) and command is one of:
 
-==========  ===============================================
-Command     Description
-----------  -----------------------------------------------
-start       Start the service
-stop        Stop the service
-restart     Restart the service
-shutdown    Attempt to gracefully shutdown the service
-reload      Attempt to gracefully restart the service
-==========  ===============================================
+===============  ===============================================
+Command          Description
+---------------  -----------------------------------------------
+start            Start the service
+stop             Stop the service
+restart          Restart the service
+shutdown         Attempt to gracefully shutdown the service
+reload           Attempt to gracefully restart the service
+reload-seamless  Attempt to seamlessly restart the service
+===============  ===============================================
 
-A graceful shutdown or reload will finish any current requests before
-completely stopping the old service.  There is also a special case of
-``swift-init all <command>``, which will run the command for all swift
-services.
+A graceful shutdown or reload will allow all server workers to finish any
+current requests before exiting.  The parent server process exits immediately.
+
+A seamless reload will make new configuration settings active, with no window
+where client requests fail due to there being no active listen socket.
+The parent server process will re-exec itself, retaining its existing PID.
+After the re-exec'ed parent server process binds its listen sockets, the old
+listen sockets are closed and old server workers finish any current requests
+before exiting.
+
+There is also a special case of ``swift-init all <command>``, which will run
+the command for all swift services.
 
 In cases where there are multiple configs for a service, a specific config
 can be managed with ``swift-init <service>.<config> <command>``.

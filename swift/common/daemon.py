@@ -20,8 +20,8 @@ import time
 import signal
 from re import sub
 
+import eventlet
 import eventlet.debug
-from eventlet.hubs import use_hub
 
 from swift.common import utils
 
@@ -45,6 +45,7 @@ class Daemon(object):
     multiple daemonized workers, they simply provide the behavior of the daemon
     and context specific knowledge about how workers should be started.
     """
+    WORKERS_HEALTHCHECK_INTERVAL = 5.0
 
     def __init__(self, conf):
         self.conf = conf
@@ -63,6 +64,16 @@ class Daemon(object):
             self.run_once(**kwargs)
         else:
             self.run_forever(**kwargs)
+
+    def post_multiprocess_run(self):
+        """
+        Override this to do something after running using multiple worker
+        processes. This method is called in the parent process.
+
+        This is probably only useful for run-once mode since there is no
+        "after running" in run-forever mode.
+        """
+        pass
 
     def get_worker_args(self, once=False, **kwargs):
         """
@@ -122,17 +133,19 @@ class DaemonStrategy(object):
     def setup(self, **kwargs):
         utils.validate_configuration()
         utils.drop_privileges(self.daemon.conf.get('user', 'swift'))
+        utils.clean_up_daemon_hygiene()
         utils.capture_stdio(self.logger, **kwargs)
 
         def kill_children(*args):
             self.running = False
-            self.logger.info('SIGTERM received')
+            self.logger.notice('SIGTERM received (%s)', os.getpid())
             signal.signal(signal.SIGTERM, signal.SIG_IGN)
             os.killpg(0, signal.SIGTERM)
             os._exit(0)
 
         signal.signal(signal.SIGTERM, kill_children)
         self.running = True
+        utils.systemd_notify(self.logger)
 
     def _run_inline(self, once=False, **kwargs):
         """Run the daemon"""
@@ -173,7 +186,7 @@ class DaemonStrategy(object):
             yield per_worker_options
 
     def spawned_pids(self):
-        return self.options_by_pid.keys()
+        return list(self.options_by_pid.keys())
 
     def register_worker_start(self, pid, per_worker_options):
         self.logger.debug('Spawned worker %s with %r', pid, per_worker_options)
@@ -228,7 +241,8 @@ class DaemonStrategy(object):
                 if not self.spawned_pids():
                     self.logger.notice('Finished %s', os.getpid())
                     break
-            time.sleep(0.1)
+            time.sleep(self.daemon.WORKERS_HEALTHCHECK_INTERVAL)
+        self.daemon.post_multiprocess_run()
         return 0
 
     def cleanup(self):
@@ -256,7 +270,7 @@ def run_daemon(klass, conf_file, section_name='', once=False, **kwargs):
     """
     # very often the config section_name is based on the class name
     # the None singleton will be passed through to readconf as is
-    if section_name is '':
+    if section_name == '':
         section_name = sub(r'([a-z])([A-Z])', r'\1-\2',
                            klass.__name__).lower()
     try:
@@ -267,7 +281,9 @@ def run_daemon(klass, conf_file, section_name='', once=False, **kwargs):
         # and results in an exit code of 1.
         sys.exit(e)
 
-    use_hub(utils.get_hub())
+    # patch eventlet/logging early
+    utils.monkey_patch()
+    eventlet.hubs.use_hub(utils.get_hub())
 
     # once on command line (i.e. daemonize=false) will over-ride config
     once = once or not utils.config_true_value(conf.get('daemonize', 'true'))
@@ -301,7 +317,9 @@ def run_daemon(klass, conf_file, section_name='', once=False, **kwargs):
 
     logger.notice('Starting %s', os.getpid())
     try:
-        DaemonStrategy(klass(conf), logger).run(once=once, **kwargs)
+        d = klass(conf)
+        DaemonStrategy(d, logger).run(once=once, **kwargs)
     except KeyboardInterrupt:
         logger.info('User quit')
     logger.notice('Exited %s', os.getpid())
+    return d

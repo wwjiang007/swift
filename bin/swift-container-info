@@ -16,6 +16,7 @@ import sys
 from optparse import OptionParser
 
 from swift.cli.info import print_info, InfoSystemExit
+from swift.common.exceptions import LockTimeout
 
 
 def run_print_info(args, opts):
@@ -23,7 +24,7 @@ def run_print_info(args, opts):
         print_info('container', *args, **opts)
     except InfoSystemExit:
         sys.exit(1)
-    except sqlite3.OperationalError as e:
+    except (sqlite3.OperationalError, LockTimeout) as e:
         if not opts.get('stale_reads_ok'):
             opts['stale_reads_ok'] = True
             print('Warning: Possibly Stale Data')
@@ -33,11 +34,19 @@ def run_print_info(args, opts):
             print('Container info failed: %s' % e)
             sys.exit(1)
 
+
 if __name__ == '__main__':
     parser = OptionParser('%prog [options] CONTAINER_DB_FILE')
     parser.add_option(
         '-d', '--swift-dir', default='/etc/swift',
         help="Pass location of swift directory")
+    parser.add_option(
+        '--drop-prefixes', default=False, action="store_true",
+        help="When outputting metadata, drop the per-section common prefixes")
+    parser.add_option(
+        '-v', '--verbose', default=False, action="store_true",
+        help="Show all shard ranges. By default, only the number of shard "
+             "ranges is displayed if there are many shards.")
 
     options, args = parser.parse_args()
 

@@ -14,8 +14,8 @@
 # limitations under the License.
 
 import json
-
-from swift.common.utils import urlparse
+import six
+from six.moves.urllib.parse import unquote, urlparse
 
 
 def clean_acl(name, value):
@@ -200,7 +200,7 @@ def parse_acl_v1(acl_string):
             if value.startswith('.r:'):
                 referrers.append(value[len('.r:'):])
             else:
-                groups.append(value)
+                groups.append(unquote(value))
     return referrers, groups
 
 
@@ -217,7 +217,7 @@ def parse_acl_v2(data):
     """
     if data is None:
         return None
-    if data is '':
+    if data == '':
         return {}
     try:
         result = json.loads(data)
@@ -293,8 +293,13 @@ def acls_from_account_info(info):
     readonly_members = acl.get('read-only', [])
     if not any((admin_members, readwrite_members, readonly_members)):
         return None
-    return {
+
+    acls = {
         'admin': admin_members,
         'read-write': readwrite_members,
         'read-only': readonly_members,
     }
+    if six.PY2:
+        for k in ('admin', 'read-write', 'read-only'):
+            acls[k] = [v.encode('utf8') for v in acls[k]]
+    return acls

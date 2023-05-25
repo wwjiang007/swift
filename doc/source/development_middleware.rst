@@ -18,7 +18,7 @@ Middleware can be added to the Swift WSGI servers by modifying their
 `paste`_ configuration file.  The majority of Swift middleware is applied
 to the :ref:`proxy-server`.
 
-.. _paste: http://pythonpaste.org/
+.. _paste: https://pypi.org/project/Paste/
 
 Given the following basic configuration::
 
@@ -77,9 +77,8 @@ presented below::
     from swift.common.http import is_success
     from swift.common.swob import wsgify
     from swift.common.utils import split_path, get_logger
-    from swift.common.request_helper import get_sys_meta_prefix
+    from swift.common.request_helpers import get_sys_meta_prefix
     from swift.proxy.controllers.base import get_container_info
-
     from eventlet import Timeout
     import six
     if six.PY3:
@@ -92,7 +91,6 @@ presented below::
 
 
     class WebhookMiddleware(object):
-
         def __init__(self, app, conf):
             self.app = app
             self.logger = get_logger(conf, log_route='webhook')
@@ -141,8 +139,9 @@ presented below::
     def webhook_factory(global_conf, **local_conf):
         conf = global_conf.copy()
         conf.update(local_conf)
-        def webhook_filter(app, conf):
-            return WebhookMiddleware(app)
+
+        def webhook_filter(app):
+            return WebhookMiddleware(app, conf)
         return webhook_filter
 
 In practice this middleware will call the URL stored on the container as
@@ -173,15 +172,27 @@ documentation for more information about the syntax of the ``use`` option.
 All middleware included with Swift is installed to support the ``egg:swift``
 syntax.
 
-.. _PasteDeploy: http://pythonpaste.org/deploy/#egg-uris
+.. _PasteDeploy: https://pypi.org/project/PasteDeploy/
 
 Middleware may advertize its availability and capabilities via Swift's
 :ref:`discoverability` support by using
 :func:`.register_swift_info`::
 
-    from swift.common.utils import register_swift_info
+    from swift.common.registry import register_swift_info
     def webhook_factory(global_conf, **local_conf):
         register_swift_info('webhook')
+        def webhook_filter(app):
+            return WebhookMiddleware(app)
+        return webhook_filter
+
+If a middleware handles sensitive information in headers or query parameters
+that may need redaction when logging, use the :func:`.register_sensitive_header`
+and :func:`.register_sensitive_param` functions. This should be done in the
+filter factory::
+
+    from swift.common.registry import register_sensitive_header
+    def webhook_factory(global_conf, **local_conf):
+        register_sensitive_header('webhook-api-key')
         def webhook_filter(app):
             return WebhookMiddleware(app)
         return webhook_filter
@@ -220,7 +231,7 @@ client applications.  A perfect example use-case for user metadata is
 object it uploads to implement its ``--changed`` option which will only
 upload files that have changed since the last upload.
 
-.. _python-swiftclient: https://github.com/openstack/python-swiftclient
+.. _python-swiftclient: https://opendev.org/openstack/python-swiftclient
 
 New middleware should avoid storing metadata within the User Metadata
 namespace to avoid potential conflict with existing user metadata when

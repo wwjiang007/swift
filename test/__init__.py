@@ -13,31 +13,36 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# See http://code.google.com/p/python-nose/issues/detail?id=373
-# The code below enables nosetests to work with i18n _() blocks
 from __future__ import print_function
 import sys
-import os
-try:
-    from unittest.util import safe_repr
-except ImportError:
-    # Probably py26
-    _MAX_LENGTH = 80
+from contextlib import contextmanager
 
-    def safe_repr(obj, short=False):
-        try:
-            result = repr(obj)
-        except Exception:
-            result = object.__repr__(obj)
-        if not short or len(result) < _MAX_LENGTH:
-            return result
-        return result[:_MAX_LENGTH] + ' [truncated]...'
+import os
+from six import reraise
+
+from unittest.util import safe_repr
+
+import warnings
+warnings.filterwarnings('ignore', module='cryptography|OpenSSL', message=(
+    'Python 2 is no longer supported by the Python core team. '
+    'Support for it is now deprecated in cryptography, '
+    'and will be removed in a future release.'))
+warnings.filterwarnings('ignore', module='cryptography|OpenSSL', message=(
+    'Python 2 is no longer supported by the Python core team. '
+    'Support for it is now deprecated in cryptography, '
+    'and will be removed in the next release.'))
+warnings.filterwarnings('ignore', message=(
+    'Python 3.6 is no longer supported by the Python core team. '
+    'Therefore, support for it is deprecated in cryptography '
+    'and will be removed in a future release.'))
+
+import unittest
+
+if sys.version_info < (3, 2):
+    unittest.TestCase.assertRaisesRegex = unittest.TestCase.assertRaisesRegexp
+    unittest.TestCase.assertRegex = unittest.TestCase.assertRegexpMatches
 
 from eventlet.green import socket
-
-# make unittests pass on all locale
-import swift
-setattr(swift, 'gettext_', lambda x: x)
 
 from swift.common.utils import readconf
 
@@ -86,3 +91,57 @@ def listen_zero():
     sock.bind(("127.0.0.1", 0))
     sock.listen(50)
     return sock
+
+
+@contextmanager
+def annotate_failure(msg):
+    """
+    Catch AssertionError and annotate it with a message. Useful when making
+    assertions in a loop where the message can indicate the loop index or
+    richer context about the failure.
+
+    :param msg: A message to be prefixed to the AssertionError message.
+    """
+    try:
+        yield
+    except AssertionError as err:
+        err_typ, err_val, err_tb = sys.exc_info()
+        if err_val.args:
+            msg = '%s Failed with %s' % (msg, err_val.args[0])
+            err_val.args = (msg, ) + err_val.args[1:]
+        else:
+            # workaround for some IDE's raising custom AssertionErrors
+            err_val = '%s Failed with %s' % (msg, err)
+            err_typ = AssertionError
+        reraise(err_typ, err_val, err_tb)
+
+
+class BaseTestCase(unittest.TestCase):
+    def _assertDictContainsSubset(self, subset, dictionary, msg=None):
+        """Checks whether dictionary is a superset of subset."""
+        # This is almost identical to the method in python3.4 version of
+        # unitest.case.TestCase.assertDictContainsSubset, reproduced here to
+        # avoid the deprecation warning in the original when using python3.
+        missing = []
+        mismatched = []
+        for key, value in subset.items():
+            if key not in dictionary:
+                missing.append(key)
+            elif value != dictionary[key]:
+                mismatched.append('%s, expected: %s, actual: %s' %
+                                  (safe_repr(key), safe_repr(value),
+                                   safe_repr(dictionary[key])))
+
+        if not (missing or mismatched):
+            return
+
+        standardMsg = ''
+        if missing:
+            standardMsg = 'Missing: %s' % ','.join(safe_repr(m) for m in
+                                                   missing)
+        if mismatched:
+            if standardMsg:
+                standardMsg += '; '
+            standardMsg += 'Mismatched values: %s' % ','.join(mismatched)
+
+        self.fail(self._formatMessage(msg, standardMsg))

@@ -6,18 +6,17 @@ Getting Started
 System Requirements
 -------------------
 
-Swift development currently targets Ubuntu Server 16.04, but should work on
+Swift development currently targets Ubuntu Server 22.04, but should work on
 most Linux platforms.
 
 Swift is written in Python and has these dependencies:
 
-* Python 2.7
-* rsync 3.0
-* The Python packages listed in `the requirements file <https://github.com/openstack/swift/blob/master/requirements.txt>`_
-* Testing additionally requires `the test dependencies <https://github.com/openstack/swift/blob/master/test-requirements.txt>`_
-* Testing requires `these distribution packages <https://github.com/openstack/swift/blob/master/other-requirements.txt>`_
-
-There is no current support for Python 3.
+* Python (2.7 or 3.6-3.10)
+* rsync 3.x
+* `liberasurecode <https://opendev.org/openstack/liberasurecode/>`__
+* The Python packages listed in `the requirements file <https://github.com/openstack/swift/blob/master/requirements.txt>`__
+* Testing additionally requires `the test dependencies <https://github.com/openstack/swift/blob/master/test-requirements.txt>`__
+* Testing requires `these distribution packages <https://github.com/openstack/swift/blob/master/bindep.txt>`__
 
 -----------
 Development
@@ -38,8 +37,8 @@ CLI client and SDK library
 There are many clients in the :ref:`ecosystem <application-bindings>`. The official CLI
 and SDK is python-swiftclient.
 
-* `Source code <https://github.com/openstack/python-swiftclient>`_
-* `Python Package Index <https://pypi.python.org/pypi/python-swiftclient>`_
+* `Source code <https://opendev.org/openstack/python-swiftclient>`__
+* `Python Package Index <https://pypi.org/project/python-swiftclient>`__
 
 ----------
 Production
@@ -48,4 +47,4 @@ Production
 If you want to set up and configure Swift for a production cluster, the
 following doc should be useful:
 
-* :doc:`Multiple Server Swift Installation <howto_installmultinode>`
+* :doc:`install/index`

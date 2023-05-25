@@ -16,6 +16,7 @@
 from __future__ import print_function
 import logging
 
+from collections import defaultdict
 from errno import EEXIST
 from itertools import islice
 from operator import itemgetter
@@ -34,6 +35,7 @@ from six.moves import input
 from swift.common import exceptions
 from swift.common.ring import RingBuilder, Ring, RingData
 from swift.common.ring.builder import MAX_BALANCE
+from swift.common.ring.composite_builder import CompositeRingBuilder
 from swift.common.ring.utils import validate_args, \
     validate_and_normalize_ip, build_dev_from_opts, \
     parse_builder_ring_filename_args, parse_search_value, \
@@ -192,7 +194,11 @@ def check_devs(devs, input_question, opts, abort_msg):
         print('Matched more than one device:')
         for dev in devs:
             print('    %s' % format_device(dev))
-        if not opts.yes and input(input_question) != 'y':
+        try:
+            abort = not opts.yes and input(input_question) != 'y'
+        except (EOFError, KeyboardInterrupt):
+            abort = True
+        if abort:
             print(abort_msg)
             exit(EXIT_ERROR)
 
@@ -208,6 +214,32 @@ def _set_weight_values(devs, weight, opts):
         builder.set_dev_weight(dev['id'], weight)
         print('%s weight set to %s' % (format_device(dev),
                                        dev['weight']))
+
+
+def _set_region_values(devs, region, opts):
+
+    input_question = 'Are you sure you want to update the region for these ' \
+                     '%s devices? (y/N) ' % len(devs)
+    abort_msg = 'Aborting device modifications'
+    check_devs(devs, input_question, opts, abort_msg)
+
+    for dev in devs:
+        builder.set_dev_region(dev['id'], region)
+        print('%s region set to %s' % (format_device(dev),
+                                       dev['region']))
+
+
+def _set_zone_values(devs, zone, opts):
+
+    input_question = 'Are you sure you want to update the zone for these ' \
+                     '%s devices? (y/N) ' % len(devs)
+    abort_msg = 'Aborting device modifications'
+    check_devs(devs, input_question, opts, abort_msg)
+
+    for dev in devs:
+        builder.set_dev_zone(dev['id'], zone)
+        print('%s zone set to %s' % (format_device(dev),
+                                     dev['zone']))
 
 
 def _parse_set_weight_values(argvish):
@@ -299,6 +331,76 @@ def calculate_change_value(change_value, change, v_name, v_name_port):
     return change_value
 
 
+def _parse_set_region_values(argvish):
+
+    new_cmd_format, opts, args = validate_args(argvish)
+
+    # We'll either parse the all-in-one-string format or the
+    # --options format,
+    # but not both. If both are specified, raise an error.
+    try:
+        devs = []
+        if not new_cmd_format:
+            if len(args) % 2 != 0:
+                print(Commands.set_region.__doc__.strip())
+                exit(EXIT_ERROR)
+
+            devs_and_regions = izip(islice(argvish, 0, len(argvish), 2),
+                                    islice(argvish, 1, len(argvish), 2))
+            for devstr, regionstr in devs_and_regions:
+                devs.extend(builder.search_devs(
+                    parse_search_value(devstr)) or [])
+                region = int(regionstr)
+                _set_region_values(devs, region, opts)
+        else:
+            if len(args) != 1:
+                print(Commands.set_region.__doc__.strip())
+                exit(EXIT_ERROR)
+
+            devs.extend(builder.search_devs(
+                parse_search_values_from_opts(opts)) or [])
+            region = int(args[0])
+            _set_region_values(devs, region, opts)
+    except ValueError as e:
+        print(e)
+        exit(EXIT_ERROR)
+
+
+def _parse_set_zone_values(argvish):
+
+    new_cmd_format, opts, args = validate_args(argvish)
+
+    # We'll either parse the all-in-one-string format or the
+    # --options format,
+    # but not both. If both are specified, raise an error.
+    try:
+        devs = []
+        if not new_cmd_format:
+            if len(args) % 2 != 0:
+                print(Commands.set_zone.__doc__.strip())
+                exit(EXIT_ERROR)
+
+            devs_and_zones = izip(islice(argvish, 0, len(argvish), 2),
+                                  islice(argvish, 1, len(argvish), 2))
+            for devstr, zonestr in devs_and_zones:
+                devs.extend(builder.search_devs(
+                    parse_search_value(devstr)) or [])
+                zone = int(zonestr)
+                _set_zone_values(devs, zone, opts)
+        else:
+            if len(args) != 1:
+                print(Commands.set_zone.__doc__.strip())
+                exit(EXIT_ERROR)
+
+            devs.extend(builder.search_devs(
+                parse_search_values_from_opts(opts)) or [])
+            zone = int(args[0])
+            _set_zone_values(devs, zone, opts)
+    except ValueError as e:
+        print(e)
+        exit(EXIT_ERROR)
+
+
 def _parse_set_info_values(argvish):
 
     new_cmd_format, opts, args = validate_args(argvish)
@@ -378,6 +480,7 @@ def _make_display_device_table(builder):
     rep_ip_width = 14
     rep_port_width = 4
     ip_ipv6 = rep_ipv6 = False
+    weight_width = 6
     for dev in builder._iter_devs():
         if is_valid_ipv6(dev['ip']):
             ip_ipv6 = True
@@ -388,6 +491,8 @@ def _make_display_device_table(builder):
         port_width = max(len(str(dev['port'])), port_width)
         rep_port_width = max(len(str(dev['replication_port'])),
                              rep_port_width)
+        weight_width = max(len('%6.02f' % dev['weight']),
+                           weight_width)
     if ip_ipv6:
         ip_width += 2
     if rep_ipv6:
@@ -395,7 +500,7 @@ def _make_display_device_table(builder):
     header_line = ('Devices:%5s %6s %4s %' + str(ip_width)
                    + 's:%-' + str(port_width) + 's %' +
                    str(rep_ip_width) + 's:%-' + str(rep_port_width) +
-                   's %5s %6s %10s %7s %5s %s') % (
+                   's %5s %' + str(weight_width) + 's %10s %7s %5s %s') % (
                        'id', 'region', 'zone', 'ip address',
                        'port', 'replication ip', 'port', 'name',
                        'weight', 'partitions', 'balance', 'flags',
@@ -413,7 +518,8 @@ def _make_display_device_table(builder):
                                  '%', str(ip_width), 's:%-',
                                  str(port_width), 'd ', '%',
                                  str(rep_ip_width), 's', ':%-',
-                                 str(rep_port_width), 'd %5s %6.02f'
+                                 str(rep_port_width), 'd %5s %',
+                                 str(weight_width), '.02f'
                                  ' %10s %7.02f %5s %s'])
         args = (dev['id'], dev['region'], dev['zone'], dev_ip, dev['port'],
                 dev_replication_ip, dev['replication_port'], dev['device'],
@@ -442,7 +548,11 @@ swift-ring-builder <builder_file> create <part_power> <replicas>
         if len(argv) < 6:
             print(Commands.create.__doc__.strip())
             exit(EXIT_ERROR)
-        builder = RingBuilder(int(argv[3]), float(argv[4]), int(argv[5]))
+        try:
+            builder = RingBuilder(int(argv[3]), float(argv[4]), int(argv[5]))
+        except ValueError as e:
+            print(e)
+            exit(EXIT_ERROR)
         backup_dir = pathjoin(dirname(builder_file), 'backups')
         try:
             mkdir(backup_dir)
@@ -471,18 +581,18 @@ swift-ring-builder <builder_file>
             builder_id = "(not assigned)"
         print('%s, build version %d, id %s' %
               (builder_file, builder.version, builder_id))
-        regions = 0
-        zones = 0
         balance = 0
-        dev_count = 0
-        if builder.devs:
-            regions = len(set(d['region'] for d in builder.devs
-                              if d is not None))
-            zones = len(set((d['region'], d['zone']) for d in builder.devs
-                            if d is not None))
-            dev_count = len([dev for dev in builder.devs
-                             if dev is not None])
+        ring_empty_error = None
+        regions = len(set(d['region'] for d in builder.devs
+                          if d is not None))
+        zones = len(set((d['region'], d['zone']) for d in builder.devs
+                        if d is not None))
+        dev_count = len([dev for dev in builder.devs
+                         if dev is not None])
+        try:
             balance = builder.get_balance()
+        except exceptions.EmptyRingError as e:
+            ring_empty_error = str(e)
         dispersion_trailer = '' if builder.dispersion is None else (
             ', %.02f dispersion' % (builder.dispersion))
         print('%d partitions, %.6f replicas, %d regions, %d zones, '
@@ -514,16 +624,18 @@ swift-ring-builder <builder_file>
                 else:
                     print('Ring file %s is obsolete' % ring_file)
 
-        if builder.devs:
+        if ring_empty_error:
+            balance_per_dev = defaultdict(int)
+        else:
             balance_per_dev = builder._build_balance_per_dev()
-            header_line, print_dev_f = _make_display_device_table(builder)
-            print(header_line)
-            for dev in sorted(
-                builder._iter_devs(),
-                key=lambda x: (x['region'], x['zone'], x['ip'], x['device'])
-            ):
-                flags = 'DEL' if dev in builder._remove_devs else ''
-                print_dev_f(dev, balance_per_dev[dev['id']], flags)
+        header_line, print_dev_f = _make_display_device_table(builder)
+        print(header_line)
+        for dev in sorted(
+            builder._iter_devs(),
+            key=lambda x: (x['region'], x['zone'], x['ip'], x['device'])
+        ):
+            flags = 'DEL' if dev in builder._remove_devs else ''
+            print_dev_f(dev, balance_per_dev[dev['id']], flags)
 
         # Print some helpful info if partition power increase in progress
         if (builder.next_part_power and
@@ -542,6 +654,8 @@ swift-ring-builder <builder_file>
             print('Run "swift-object-relinker cleanup" on all nodes before '
                   'moving on to finish_increase_partition_power.')
 
+        if ring_empty_error:
+            print(ring_empty_error)
         exit(EXIT_SUCCESS)
 
     @staticmethod
@@ -675,7 +789,7 @@ swift-ring-builder <builder_file> add
         if builder.next_part_power:
             print('Partition power increase in progress. You need ')
             print('to finish the increase first before adding devices.')
-            exit(EXIT_WARNING)
+            exit(EXIT_ERROR)
 
         try:
             for new_dev in _parse_add_values(argv[3:]):
@@ -735,6 +849,75 @@ swift-ring-builder <builder_file> set_weight
             exit(EXIT_ERROR)
 
         _parse_set_weight_values(argv[3:])
+
+        builder.save(builder_file)
+        exit(EXIT_SUCCESS)
+
+    @staticmethod
+    def set_region():
+        """
+swift-ring-builder <builder_file> set_region <search-value> <region>
+    [<search-value> <region] ...
+
+or
+
+swift-ring-builder <builder_file> set_region
+    --region <region> --zone <zone> --ip <ip or hostname> --port <port>
+    --replication-ip <r_ip or r_hostname> --replication-port <r_port>
+    --device <device_name> --meta <meta> <new region> [--yes]
+
+    Where <r_ip>, <r_hostname> and <r_port> are replication ip, hostname
+    and port.
+    Any of the options are optional in both cases.
+
+    Resets the devices' regions. No partitions will be reassigned to or from
+    the device until after running 'rebalance'. This is so you can make
+    multiple device changes and rebalance them all just once.
+
+    Option --yes assume a yes response to all questions.
+        """
+        if len(argv) < 5:
+            print(Commands.set_region.__doc__.strip())
+            print()
+            print(parse_search_value.__doc__.strip())
+            exit(EXIT_ERROR)
+
+        _parse_set_region_values(argv[3:])
+
+        builder.save(builder_file)
+        exit(EXIT_SUCCESS)
+
+    @staticmethod
+    def set_zone():
+        """
+swift-ring-builder <builder_file> set_zone <search-value> <zone>
+    [<search-value> <zone] ...
+
+or
+
+swift-ring-builder <builder_file> set_zone
+    --region <region> --zone <zone> --ip <ip or hostname> --port <port>
+    --replication-ip <r_ip or r_hostname> --replication-port <r_port>
+    --device <device_name> --meta <meta> <new zone> [--yes]
+
+    Where <r_ip>, <r_hostname> and <r_port> are replication ip, hostname
+    and port.
+    Any of the options are optional in both cases.
+
+    Resets the devices' zones. No partitions will be reassigned to or from
+    the device until after running 'rebalance'. This is so you can make
+    multiple device changes and rebalance them all just once.
+
+    Option --yes assume a yes response to all questions.
+        """
+        # if len(argv) < 5 or len(argv) % 2 != 1:
+        if len(argv) < 5:
+            print(Commands.set_zone.__doc__.strip())
+            print()
+            print(parse_search_value.__doc__.strip())
+            exit(EXIT_ERROR)
+
+        _parse_set_zone_values(argv[3:])
 
         builder.save(builder_file)
         exit(EXIT_SUCCESS)
@@ -825,7 +1008,7 @@ swift-ring-builder <builder_file> remove
         if builder.next_part_power:
             print('Partition power increase in progress. You need ')
             print('to finish the increase first before removing devices.')
-            exit(EXIT_WARNING)
+            exit(EXIT_ERROR)
 
         devs, opts = _parse_remove_values(argv[3:])
 
@@ -892,7 +1075,7 @@ swift-ring-builder <builder_file> rebalance [options]
         if builder.next_part_power:
             print('Partition power increase in progress.')
             print('You need to finish the increase first before rebalancing.')
-            exit(EXIT_WARNING)
+            exit(EXIT_ERROR)
 
         devs_changed = builder.devs_changed
         min_part_seconds_left = builder.min_part_seconds_left
@@ -938,7 +1121,8 @@ swift-ring-builder <builder_file> rebalance [options]
             balance_changed = (
                 abs(last_balance - balance) >= 1 or
                 (last_balance == MAX_BALANCE and balance == MAX_BALANCE))
-            dispersion_changed = abs(last_dispersion - dispersion) >= 1
+            dispersion_changed = last_dispersion is None or (
+                abs(last_dispersion - dispersion) >= 1)
             if balance_changed or dispersion_changed:
                 be_cowardly = False
 
@@ -992,11 +1176,12 @@ swift-ring-builder <builder_file> rebalance [options]
 
     @staticmethod
     def dispersion():
-        """
+        r"""
 swift-ring-builder <builder_file> dispersion <search_filter> [options]
 
     Output report on dispersion.
 
+    --recalculate option will rebuild cached dispersion info and save builder
     --verbose option will display dispersion graph broken down by tier
 
     You can filter which tiers are evaluated to drill down using a regex
@@ -1035,6 +1220,8 @@ swift-ring-builder <builder_file> dispersion <search_filter> [options]
             exit(EXIT_ERROR)
         usage = Commands.dispersion.__doc__.strip()
         parser = optparse.OptionParser(usage)
+        parser.add_option('--recalculate', action='store_true',
+                          help='Rebuild cached dispersion info and save')
         parser.add_option('-v', '--verbose', action='store_true',
                           help='Display dispersion report for tiers')
         options, args = parser.parse_args(argv)
@@ -1042,8 +1229,13 @@ swift-ring-builder <builder_file> dispersion <search_filter> [options]
             search_filter = args[3]
         else:
             search_filter = None
+        orig_version = builder.version
         report = dispersion_report(builder, search_filter=search_filter,
-                                   verbose=options.verbose)
+                                   verbose=options.verbose,
+                                   recalculate=options.recalculate)
+        if builder.version != orig_version:
+            # we've already done the work, better go ahead and save it!
+            builder.save(builder_file)
         print('Dispersion is %.06f, Balance is %.06f, Overload is %0.2f%%' % (
             builder.dispersion, builder.get_balance(), builder.overload * 100))
         print('Required overload is %.6f%%' % (
@@ -1053,7 +1245,7 @@ swift-ring-builder <builder_file> dispersion <search_filter> [options]
             print('Worst tier is %.06f (%s)' % (report['max_dispersion'],
                                                 report['worst_tier']))
         if report['graph']:
-            replica_range = range(int(math.ceil(builder.replicas + 1)))
+            replica_range = list(range(int(math.ceil(builder.replicas + 1))))
             part_count_width = '%%%ds' % max(len(str(builder.parts)), 5)
             replica_counts_tmpl = ' '.join(part_count_width for i in
                                            replica_range)
@@ -1152,7 +1344,7 @@ swift-ring-builder <ring_file> write_builder [min_part_hours]
             'parts': ring.partition_count,
             'devs': ring.devs,
             'devs_changed': False,
-            'version': 0,
+            'version': ring.version or 0,
             '_replica2part2dev': ring._replica2part2dev_id,
             '_last_part_moves_epoch': None,
             '_last_part_moves': None,
@@ -1469,10 +1661,16 @@ def main(arguments=None):
     try:
         builder = RingBuilder.load(builder_file)
     except exceptions.UnPicklingError as e:
-        print(e)
+        msg = str(e)
+        try:
+            CompositeRingBuilder.load(builder_file)
+            msg += ' (it appears to be a composite ring builder file?)'
+        except Exception:  # noqa
+            pass
+        print(msg)
         exit(EXIT_ERROR)
     except (exceptions.FileNotFoundError, exceptions.PermissionError) as e:
-        if len(argv) < 3 or argv[2] not in('create', 'write_builder'):
+        if len(argv) < 3 or argv[2] not in ('create', 'write_builder'):
             print(e)
             exit(EXIT_ERROR)
     except Exception as e:

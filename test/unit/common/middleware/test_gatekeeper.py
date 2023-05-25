@@ -29,7 +29,7 @@ class FakeApp(object):
 
     def __call__(self, env, start_response):
         self.req = Request(env)
-        return Response(request=self.req, body='FAKE APP',
+        return Response(request=self.req, body=b'FAKE APP',
                         headers=self.headers)(env, start_response)
 
 
@@ -104,7 +104,7 @@ class TestGatekeeper(unittest.TestCase):
         app = self.get_app(fake_app, {})
         resp = req.get_response(app)
         self.assertEqual('200 OK', resp.status)
-        self.assertEqual(resp.body, 'FAKE APP')
+        self.assertEqual(resp.body, b'FAKE APP')
         self._assertHeadersEqual(self.allowed_headers, fake_app.req.headers)
 
     def _test_reserved_header_removed_inbound(self, method):
@@ -224,7 +224,7 @@ class TestGatekeeper(unittest.TestCase):
         class SelfishApp(FakeApp):
             def __call__(self, env, start_response):
                 self.req = Request(env)
-                resp = Response(request=self.req, body='FAKE APP',
+                resp = Response(request=self.req, body=b'FAKE APP',
                                 headers=self.headers)
                 # like webob, middlewares in the pipeline may rewrite
                 # location header from relative to absolute
@@ -244,6 +244,39 @@ class TestGatekeeper(unittest.TestCase):
         self._test_location_header('/v/a/c/o2?query=path&query2=doit')
         self._test_location_header('/v/a/c/o2?query=path#test')
         self._test_location_header('/v/a/c/o2;whatisparam?query=path#test')
+
+    def test_allow_reserved_names(self):
+        fake_app = FakeApp()
+        app = self.get_app(fake_app, {})
+        headers = {
+            'X-Allow-Reserved-Names': 'some-value'
+        }
+
+        req = Request.blank('/v/a/c/o', method='GET', headers=headers)
+        resp = req.get_response(app)
+        self.assertEqual('200 OK', resp.status)
+        self.assertNotIn('X-Backend-Allow-Reserved-Names',
+                         fake_app.req.headers)
+        self.assertIn('X-Allow-Reserved-Names',
+                      fake_app.req.headers)
+        self.assertEqual(
+            'some-value',
+            fake_app.req.headers['X-Allow-Reserved-Names'])
+
+        app.allow_reserved_names_header = True
+        req = Request.blank('/v/a/c/o', method='GET', headers=headers)
+        resp = req.get_response(app)
+        self.assertEqual('200 OK', resp.status)
+        self.assertIn('X-Backend-Allow-Reserved-Names',
+                      fake_app.req.headers)
+        self.assertEqual(
+            'some-value',
+            fake_app.req.headers['X-Backend-Allow-Reserved-Names'])
+        self.assertEqual(
+            'some-value',
+            req.headers['X-Backend-Allow-Reserved-Names'])
+        self.assertNotIn('X-Allow-Reserved-Names', fake_app.req.headers)
+        self.assertNotIn('X-Allow-Reserved-Names', req.headers)
 
 
 if __name__ == '__main__':

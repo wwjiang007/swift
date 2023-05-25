@@ -14,6 +14,8 @@
 # limitations under the License.
 
 import array
+import contextlib
+
 import six.moves.cPickle as pickle
 import json
 from collections import defaultdict
@@ -22,32 +24,129 @@ from os.path import getmtime
 import struct
 from time import time
 import os
-from io import BufferedReader
-from hashlib import md5
-from itertools import chain
+from itertools import chain, count
 from tempfile import NamedTemporaryFile
 import sys
+import zlib
 
+import six
 from six.moves import range
 
 from swift.common.exceptions import RingLoadError
-from swift.common.utils import hash_path, validate_configuration
+from swift.common.utils import hash_path, validate_configuration, md5
 from swift.common.ring.utils import tiers_for_dev
+
+
+DEFAULT_RELOAD_TIME = 15
+
+
+def calc_replica_count(replica2part2dev_id):
+    if not replica2part2dev_id:
+        return 0
+    base = len(replica2part2dev_id) - 1
+    extra = 1.0 * len(replica2part2dev_id[-1]) / len(replica2part2dev_id[0])
+    return base + extra
+
+
+def normalize_devices(devs):
+    # NOTE(akscram): Replication parameters like replication_ip
+    #                and replication_port are required for
+    #                replication process. An old replication
+    #                ring doesn't contain this parameters into
+    #                device. Old-style pickled rings won't have
+    #                region information.
+    for dev in devs:
+        if dev is None:
+            continue
+        dev.setdefault('region', 1)
+        if 'ip' in dev:
+            dev.setdefault('replication_ip', dev['ip'])
+        if 'port' in dev:
+            dev.setdefault('replication_port', dev['port'])
+
+
+class RingReader(object):
+    chunk_size = 2 ** 16
+
+    def __init__(self, filename):
+        self.fp = open(filename, 'rb')
+        self._reset()
+
+    def _reset(self):
+        self._buffer = b''
+        self.size = 0
+        self.raw_size = 0
+        self._md5 = md5(usedforsecurity=False)
+        self._decomp = zlib.decompressobj(32 + zlib.MAX_WBITS)
+
+    @property
+    def close(self):
+        return self.fp.close
+
+    def seek(self, pos, ref=0):
+        if (pos, ref) != (0, 0):
+            raise NotImplementedError
+        self._reset()
+        return self.fp.seek(pos, ref)
+
+    def _buffer_chunk(self):
+        chunk = self.fp.read(self.chunk_size)
+        if not chunk:
+            return False
+        self.size += len(chunk)
+        self._md5.update(chunk)
+        chunk = self._decomp.decompress(chunk)
+        self.raw_size += len(chunk)
+        self._buffer += chunk
+        return True
+
+    def read(self, amount=-1):
+        if amount < 0:
+            raise IOError("don't be greedy")
+
+        while amount > len(self._buffer):
+            if not self._buffer_chunk():
+                break
+
+        result, self._buffer = self._buffer[:amount], self._buffer[amount:]
+        return result
+
+    def readline(self):
+        # apparently pickle needs this?
+        while b'\n' not in self._buffer:
+            if not self._buffer_chunk():
+                break
+
+        line, sep, self._buffer = self._buffer.partition(b'\n')
+        return line + sep
+
+    def readinto(self, buffer):
+        chunk = self.read(len(buffer))
+        buffer[:len(chunk)] = chunk
+        return len(chunk)
+
+    @property
+    def md5(self):
+        return self._md5.hexdigest()
 
 
 class RingData(object):
     """Partitioned consistent hashing ring data (used for serialization)."""
 
     def __init__(self, replica2part2dev_id, devs, part_shift,
-                 next_part_power=None):
+                 next_part_power=None, version=None):
+        normalize_devices(devs)
         self.devs = devs
         self._replica2part2dev_id = replica2part2dev_id
         self._part_shift = part_shift
         self.next_part_power = next_part_power
+        self.version = version
+        self.md5 = self.size = self.raw_size = None
 
-        for dev in self.devs:
-            if dev is not None:
-                dev.setdefault("region", 1)
+    @property
+    def replica_count(self):
+        """Number of replicas (full or partial) used in the ring."""
+        return calc_replica_count(self._replica2part2dev_id)
 
     @classmethod
     def deserialize_v1(cls, gz_file, metadata_only=False):
@@ -93,35 +192,37 @@ class RingData(object):
         :param bool metadata_only: If True, only load `devs` and `part_shift`.
         :returns: A RingData instance containing the loaded data.
         """
-        gz_file = GzipFile(filename, 'rb')
-        # Python 2.6 GzipFile doesn't support BufferedIO
-        if hasattr(gz_file, '_checkReadable'):
-            gz_file = BufferedReader(gz_file)
-
-        # See if the file is in the new format
-        magic = gz_file.read(4)
-        if magic == 'R1NG':
-            format_version, = struct.unpack('!H', gz_file.read(2))
-            if format_version == 1:
-                ring_data = cls.deserialize_v1(
-                    gz_file, metadata_only=metadata_only)
+        with contextlib.closing(RingReader(filename)) as gz_file:
+            # See if the file is in the new format
+            magic = gz_file.read(4)
+            if magic == b'R1NG':
+                format_version, = struct.unpack('!H', gz_file.read(2))
+                if format_version == 1:
+                    ring_data = cls.deserialize_v1(
+                        gz_file, metadata_only=metadata_only)
+                else:
+                    raise Exception('Unknown ring format version %d' %
+                                    format_version)
             else:
-                raise Exception('Unknown ring format version %d' %
-                                format_version)
-        else:
-            # Assume old-style pickled ring
-            gz_file.seek(0)
-            ring_data = pickle.load(gz_file)
+                # Assume old-style pickled ring
+                gz_file.seek(0)
+                ring_data = pickle.load(gz_file)
 
-        if not hasattr(ring_data, 'devs'):
+        if hasattr(ring_data, 'devs'):
+            # pickled RingData; make sure we've got region/replication info
+            normalize_devices(ring_data.devs)
+        else:
             ring_data = RingData(ring_data['replica2part2dev_id'],
                                  ring_data['devs'], ring_data['part_shift'],
-                                 ring_data.get('next_part_power'))
+                                 ring_data.get('next_part_power'),
+                                 ring_data.get('version'))
+        for attr in ('md5', 'size', 'raw_size'):
+            setattr(ring_data, attr, getattr(gz_file, attr))
         return ring_data
 
     def serialize_v1(self, file_obj):
         # Write out new-style serialization magic and version:
-        file_obj.write(struct.pack('!4sH', 'R1NG', 1))
+        file_obj.write(struct.pack('!4sH', b'R1NG', 1))
         ring = self.to_dict()
 
         # Only include next_part_power if it is set in the
@@ -130,17 +231,25 @@ class RingData(object):
                  'replica_count': len(ring['replica2part2dev_id']),
                  'byteorder': sys.byteorder}
 
+        if ring['version'] is not None:
+            _text['version'] = ring['version']
+
         next_part_power = ring.get('next_part_power')
         if next_part_power is not None:
             _text['next_part_power'] = next_part_power
 
-        json_encoder = json.JSONEncoder(sort_keys=True)
-        json_text = json_encoder.encode(_text)
+        json_text = json.dumps(_text, sort_keys=True,
+                               ensure_ascii=True).encode('ascii')
         json_len = len(json_text)
         file_obj.write(struct.pack('!I', json_len))
         file_obj.write(json_text)
         for part2dev_id in ring['replica2part2dev_id']:
-            file_obj.write(part2dev_id.tostring())
+            if six.PY2:
+                # Can't just use tofile() because a GzipFile apparently
+                # doesn't count as an 'open file'
+                file_obj.write(part2dev_id.tostring())
+            else:
+                part2dev_id.tofile(file_obj)
 
     def save(self, filename, mtime=1300507380.0):
         """
@@ -167,7 +276,8 @@ class RingData(object):
         return {'devs': self.devs,
                 'replica2part2dev_id': self._replica2part2dev_id,
                 'part_shift': self._part_shift,
-                'next_part_power': self.next_part_power}
+                'next_part_power': self.next_part_power,
+                'version': self.version}
 
 
 class Ring(object):
@@ -182,7 +292,7 @@ class Ring(object):
     :raises RingLoadError: if the loaded ring data violates its constraint
     """
 
-    def __init__(self, serialized_path, reload_time=15, ring_name=None,
+    def __init__(self, serialized_path, reload_time=None, ring_name=None,
                  validation_hook=lambda ring_data: None):
         # can't use the ring unless HASH_PATH_SUFFIX is set
         validate_configuration()
@@ -191,7 +301,8 @@ class Ring(object):
                                                 ring_name + '.ring.gz')
         else:
             self.serialized_path = os.path.join(serialized_path)
-        self.reload_time = reload_time
+        self.reload_time = (DEFAULT_RELOAD_TIME if reload_time is None
+                            else reload_time)
         self._validation_hook = validation_hook
         self._reload(force=True)
 
@@ -212,59 +323,75 @@ class Ring(object):
 
             self._mtime = getmtime(self.serialized_path)
             self._devs = ring_data.devs
-            # NOTE(akscram): Replication parameters like replication_ip
-            #                and replication_port are required for
-            #                replication process. An old replication
-            #                ring doesn't contain this parameters into
-            #                device. Old-style pickled rings won't have
-            #                region information.
-            for dev in self._devs:
-                if dev:
-                    dev.setdefault('region', 1)
-                    if 'ip' in dev:
-                        dev.setdefault('replication_ip', dev['ip'])
-                    if 'port' in dev:
-                        dev.setdefault('replication_port', dev['port'])
-
             self._replica2part2dev_id = ring_data._replica2part2dev_id
             self._part_shift = ring_data._part_shift
             self._rebuild_tier_data()
-
-            # Do this now, when we know the data has changed, rather than
-            # doing it on every call to get_more_nodes().
-            #
-            # Since this is to speed up the finding of handoffs, we only
-            # consider devices with at least one partition assigned. This
-            # way, a region, zone, or server with no partitions assigned
-            # does not count toward our totals, thereby keeping the early
-            # bailouts in get_more_nodes() working.
-            dev_ids_with_parts = set()
-            for part2dev_id in self._replica2part2dev_id:
-                for dev_id in part2dev_id:
-                    dev_ids_with_parts.add(dev_id)
-
-            regions = set()
-            zones = set()
-            ips = set()
-            self._num_devs = 0
-            for dev in self._devs:
-                if dev and dev['id'] in dev_ids_with_parts:
-                    regions.add(dev['region'])
-                    zones.add((dev['region'], dev['zone']))
-                    ips.add((dev['region'], dev['zone'], dev['ip']))
-                    self._num_devs += 1
-            self._num_regions = len(regions)
-            self._num_zones = len(zones)
-            self._num_ips = len(ips)
+            self._update_bookkeeping()
             self._next_part_power = ring_data.next_part_power
+            self._version = ring_data.version
+            self._md5 = ring_data.md5
+            self._size = ring_data.size
+            self._raw_size = ring_data.raw_size
+
+    def _update_bookkeeping(self):
+        # Do this now, when we know the data has changed, rather than
+        # doing it on every call to get_more_nodes().
+        #
+        # Since this is to speed up the finding of handoffs, we only
+        # consider devices with at least one partition assigned. This
+        # way, a region, zone, or server with no partitions assigned
+        # does not count toward our totals, thereby keeping the early
+        # bailouts in get_more_nodes() working.
+        dev_ids_with_parts = set()
+        for part2dev_id in self._replica2part2dev_id:
+            for dev_id in part2dev_id:
+                dev_ids_with_parts.add(dev_id)
+        regions = set()
+        zones = set()
+        ips = set()
+        self._num_devs = 0
+        self._num_assigned_devs = 0
+        self._num_weighted_devs = 0
+        for dev in self._devs:
+            if dev is None:
+                continue
+            self._num_devs += 1
+            if dev.get('weight', 0) > 0:
+                self._num_weighted_devs += 1
+            if dev['id'] in dev_ids_with_parts:
+                regions.add(dev['region'])
+                zones.add((dev['region'], dev['zone']))
+                ips.add((dev['region'], dev['zone'], dev['ip']))
+                self._num_assigned_devs += 1
+        self._num_regions = len(regions)
+        self._num_zones = len(zones)
+        self._num_ips = len(ips)
 
     @property
     def next_part_power(self):
+        if time() > self._rtime:
+            self._reload()
         return self._next_part_power
 
     @property
     def part_power(self):
         return 32 - self._part_shift
+
+    @property
+    def version(self):
+        return self._version
+
+    @property
+    def md5(self):
+        return self._md5
+
+    @property
+    def size(self):
+        return self._size
+
+    @property
+    def raw_size(self):
+        return self._raw_size
 
     def _rebuild_tier_data(self):
         self.tier2devs = defaultdict(list)
@@ -285,12 +412,27 @@ class Ring(object):
     @property
     def replica_count(self):
         """Number of replicas (full or partial) used in the ring."""
-        return len(self._replica2part2dev_id)
+        return calc_replica_count(self._replica2part2dev_id)
 
     @property
     def partition_count(self):
         """Number of partitions in the ring."""
         return len(self._replica2part2dev_id[0])
+
+    @property
+    def device_count(self):
+        """Number of devices in the ring."""
+        return self._num_devs
+
+    @property
+    def weighted_device_count(self):
+        """Number of devices with weight in the ring."""
+        return self._num_weighted_devs
+
+    @property
+    def assigned_device_count(self):
+        """Number of devices with assignments in the ring."""
+        return self._num_assigned_devs
 
     @property
     def devs(self):
@@ -399,16 +541,17 @@ class Ring(object):
         if time() > self._rtime:
             self._reload()
         primary_nodes = self._get_part_nodes(part)
-
         used = set(d['id'] for d in primary_nodes)
+        index = count()
         same_regions = set(d['region'] for d in primary_nodes)
         same_zones = set((d['region'], d['zone']) for d in primary_nodes)
         same_ips = set(
             (d['region'], d['zone'], d['ip']) for d in primary_nodes)
 
         parts = len(self._replica2part2dev_id[0])
-        start = struct.unpack_from(
-            '>I', md5(str(part)).digest())[0] >> self._part_shift
+        part_hash = md5(str(part).encode('ascii'),
+                        usedforsecurity=False).digest()
+        start = struct.unpack_from('>I', part_hash)[0] >> self._part_shift
         inc = int(parts / 65536) or 1
         # Multiple loops for execution speed; the checks and bookkeeping get
         # simpler as you go along
@@ -426,7 +569,7 @@ class Ring(object):
                     dev = self._devs[dev_id]
                     region = dev['region']
                     if dev_id not in used and region not in same_regions:
-                        yield dev
+                        yield dict(dev, handoff_index=next(index))
                         used.add(dev_id)
                         same_regions.add(region)
                         zone = dev['zone']
@@ -451,7 +594,7 @@ class Ring(object):
                     dev = self._devs[dev_id]
                     zone = (dev['region'], dev['zone'])
                     if dev_id not in used and zone not in same_zones:
-                        yield dev
+                        yield dict(dev, handoff_index=next(index))
                         used.add(dev_id)
                         same_zones.add(zone)
                         ip = zone + (dev['ip'],)
@@ -474,14 +617,14 @@ class Ring(object):
                     dev = self._devs[dev_id]
                     ip = (dev['region'], dev['zone'], dev['ip'])
                     if dev_id not in used and ip not in same_ips:
-                        yield dev
+                        yield dict(dev, handoff_index=next(index))
                         used.add(dev_id)
                         same_ips.add(ip)
                         if len(same_ips) == self._num_ips:
                             hit_all_ips = True
                             break
 
-        hit_all_devs = len(used) == self._num_devs
+        hit_all_devs = len(used) == self._num_assigned_devs
         for handoff_part in chain(range(start, parts, inc),
                                   range(inc - ((parts - start) % inc),
                                         start, inc)):
@@ -493,8 +636,9 @@ class Ring(object):
                 if handoff_part < len(part2dev_id):
                     dev_id = part2dev_id[handoff_part]
                     if dev_id not in used:
-                        yield self._devs[dev_id]
+                        dev = self._devs[dev_id]
+                        yield dict(dev, handoff_index=next(index))
                         used.add(dev_id)
-                        if len(used) == self._num_devs:
+                        if len(used) == self._num_assigned_devs:
                             hit_all_devs = True
                             break

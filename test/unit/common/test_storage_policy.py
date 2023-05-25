@@ -22,7 +22,9 @@ from functools import partial
 
 from six.moves.configparser import ConfigParser
 from tempfile import NamedTemporaryFile
-from test.unit import patch_policies, FakeRing, temptree, DEFAULT_TEST_EC_TYPE
+from test.debug_logger import debug_logger
+from test.unit import (
+    patch_policies, FakeRing, temptree, DEFAULT_TEST_EC_TYPE)
 import swift.common.storage_policy
 from swift.common.storage_policy import (
     StoragePolicyCollection, POLICIES, PolicyError, parse_storage_policies,
@@ -70,8 +72,12 @@ class FakeStoragePolicy(BaseStoragePolicy):
 class TestStoragePolicies(unittest.TestCase):
     def _conf(self, conf_str):
         conf_str = "\n".join(line.strip() for line in conf_str.split("\n"))
-        conf = ConfigParser()
-        conf.readfp(six.StringIO(conf_str))
+        if six.PY2:
+            conf = ConfigParser()
+            conf.readfp(six.StringIO(conf_str))
+        else:
+            conf = ConfigParser(strict=False)
+            conf.read_file(six.StringIO(conf_str))
         return conf
 
     def assertRaisesWithMessage(self, exc_class, message, f, *args, **kwargs):
@@ -362,6 +368,25 @@ class TestStoragePolicies(unittest.TestCase):
         for name in ('one', 'ONE', 'oNe', 'OnE'):
             self.assertEqual(pol1, policies.get_by_name(name))
             self.assertEqual(policies.get_by_name(name).name, 'One')
+
+    def test_wacky_int_names(self):
+        # checking duplicate on insert
+        test_policies = [StoragePolicy(0, '1', True, aliases='-1'),
+                         StoragePolicy(1, '0', False)]
+        policies = StoragePolicyCollection(test_policies)
+
+        with self.assertRaises(PolicyError):
+            policies.get_by_name_or_index('0')
+        self.assertEqual(policies.get_by_name('1'), test_policies[0])
+        self.assertEqual(policies.get_by_index(0), test_policies[0])
+
+        with self.assertRaises(PolicyError):
+            policies.get_by_name_or_index('1')
+        self.assertEqual(policies.get_by_name('0'), test_policies[1])
+        self.assertEqual(policies.get_by_index(1), test_policies[1])
+
+        self.assertIsNone(policies.get_by_index(-1))
+        self.assertEqual(policies.get_by_name_or_index('-1'), test_policies[0])
 
     def test_multiple_names(self):
         # checking duplicate on insert
@@ -679,7 +704,7 @@ class TestStoragePolicies(unittest.TestCase):
         with capture_logging('swift.common.storage_policy') as records, \
                 self.assertRaises(PolicyError) as exc_mgr:
             parse_storage_policies(bad_conf)
-        self.assertEqual(exc_mgr.exception.message,
+        self.assertEqual(exc_mgr.exception.args[0],
                          'Storage policy bad-policy uses an EC '
                          'configuration known to harm data durability. This '
                          'policy MUST be deprecated.')
@@ -732,7 +757,7 @@ class TestStoragePolicies(unittest.TestCase):
 
         policies = parse_storage_policies(orig_conf)
         self.assertEqual(policies.default, policies[1])
-        self.assertTrue(policies[0].name, 'Policy-0')
+        self.assertEqual('zero', policies[0].name)
 
         bad_conf = self._conf("""
         [storage-policy:0]
@@ -758,7 +783,7 @@ class TestStoragePolicies(unittest.TestCase):
 
         policies = parse_storage_policies(good_conf)
         self.assertEqual(policies.default, policies[0])
-        self.assertTrue(policies[1].is_deprecated, True)
+        self.assertTrue(policies[1].is_deprecated)
 
     def test_parse_storage_policies(self):
         # ValueError when deprecating policy 0
@@ -1048,7 +1073,7 @@ class TestStoragePolicies(unittest.TestCase):
         [storage-policy:00]
         name = double-zero
         """)
-        with NamedTemporaryFile() as f:
+        with NamedTemporaryFile(mode='w+t') as f:
             conf.write(f)
             f.flush()
             with mock.patch('swift.common.utils.SWIFT_CONF_FILE',
@@ -1081,6 +1106,20 @@ class TestStoragePolicies(unittest.TestCase):
         p503 = test_policies[503]
         self.assertTrue(501 < p503 < 507)
 
+    def test_storage_policies_as_dict_keys(self):
+        # We have tests that expect to be able to map policies
+        # to expected values in a dict; check that we can use
+        # policies as keys.
+        test_policies = [StoragePolicy(0, 'aay', True),
+                         StoragePolicy(1, 'bee', False),
+                         StoragePolicy(2, 'cee', False)]
+        policy_to_name_map = {p: p.name for p in test_policies}
+        self.assertEqual(sorted(policy_to_name_map.keys()), test_policies)
+        self.assertIs(test_policies[0], next(
+            p for p in policy_to_name_map.keys() if p.is_default))
+        for p in test_policies:
+            self.assertEqual(policy_to_name_map[p], p.name)
+
     def test_get_object_ring(self):
         test_policies = [StoragePolicy(0, 'aay', True),
                          StoragePolicy(1, 'bee', False),
@@ -1089,7 +1128,8 @@ class TestStoragePolicies(unittest.TestCase):
 
         class NamedFakeRing(FakeRing):
 
-            def __init__(self, swift_dir, ring_name=None):
+            def __init__(self, swift_dir, reload_time=15, ring_name=None,
+                         validation_hook=None):
                 self.ring_name = ring_name
                 super(NamedFakeRing, self).__init__()
 
@@ -1299,25 +1339,31 @@ class TestStoragePolicies(unittest.TestCase):
                             ec_ndata=4, ec_nparity=2,
                             ec_duplication_factor=2)
         ]
-        actual_load_ring_replicas = [8, 10, 7, 11]
         policies = StoragePolicyCollection(test_policies)
 
         class MockRingData(object):
             def __init__(self, num_replica):
-                self._replica2part2dev_id = [0] * num_replica
+                self.replica_count = num_replica
 
-        for policy, ring_replicas in zip(policies, actual_load_ring_replicas):
-            with mock.patch('swift.common.ring.ring.RingData.load',
-                            return_value=MockRingData(ring_replicas)):
-                necessary_replica_num = \
-                    policy.ec_n_unique_fragments * policy.ec_duplication_factor
-                with mock.patch(
-                        'swift.common.ring.ring.validate_configuration'):
-                    msg = 'EC ring for policy %s needs to be configured with ' \
-                          'exactly %d replicas.' % \
-                          (policy.name, necessary_replica_num)
-                    self.assertRaisesWithMessage(RingLoadError, msg,
-                                                 policy.load_ring, 'mock')
+        def do_test(actual_load_ring_replicas):
+            for policy, ring_replicas in zip(policies,
+                                             actual_load_ring_replicas):
+                with mock.patch('swift.common.ring.ring.RingData.load',
+                                return_value=MockRingData(ring_replicas)):
+                    necessary_replica_num = (policy.ec_n_unique_fragments *
+                                             policy.ec_duplication_factor)
+                    with mock.patch(
+                            'swift.common.ring.ring.validate_configuration'):
+                        msg = 'EC ring for policy %s needs to be configured ' \
+                              'with exactly %d replicas.' % \
+                              (policy.name, necessary_replica_num)
+                        self.assertRaisesWithMessage(RingLoadError, msg,
+                                                     policy.load_ring, 'mock')
+
+        # first, do somethign completely different
+        do_test([8, 10, 7, 11])
+        # then again, closer to true, but fractional
+        do_test([9.9, 14.1, 5.99999, 12.000000001])
 
     def test_storage_policy_get_info(self):
         test_policies = [
@@ -1339,6 +1385,7 @@ class TestStoragePolicies(unittest.TestCase):
                 'aliases': 'zero',
                 'default': True,
                 'deprecated': False,
+                'diskfile_module': 'egg:swift#replication.fs',
                 'policy_type': REPL_POLICY
             },
             (0, False): {
@@ -1352,6 +1399,7 @@ class TestStoragePolicies(unittest.TestCase):
                 'aliases': 'one, tahi, uno',
                 'default': False,
                 'deprecated': True,
+                'diskfile_module': 'egg:swift#replication.fs',
                 'policy_type': REPL_POLICY
             },
             (1, False): {
@@ -1365,6 +1413,7 @@ class TestStoragePolicies(unittest.TestCase):
                 'aliases': 'ten',
                 'default': False,
                 'deprecated': False,
+                'diskfile_module': 'egg:swift#erasure_coding.fs',
                 'policy_type': EC_POLICY,
                 'ec_type': DEFAULT_TEST_EC_TYPE,
                 'ec_num_data_fragments': 10,
@@ -1382,6 +1431,7 @@ class TestStoragePolicies(unittest.TestCase):
                 'aliases': 'done',
                 'default': False,
                 'deprecated': True,
+                'diskfile_module': 'egg:swift#erasure_coding.fs',
                 'policy_type': EC_POLICY,
                 'ec_type': DEFAULT_TEST_EC_TYPE,
                 'ec_num_data_fragments': 10,
@@ -1400,6 +1450,7 @@ class TestStoragePolicies(unittest.TestCase):
                 'aliases': 'twelve',
                 'default': False,
                 'deprecated': False,
+                'diskfile_module': 'egg:swift#erasure_coding.fs',
                 'policy_type': EC_POLICY,
                 'ec_type': DEFAULT_TEST_EC_TYPE,
                 'ec_num_data_fragments': 10,
@@ -1441,6 +1492,84 @@ class TestStoragePolicies(unittest.TestCase):
                                  policy.fragment_size)
                 # pyeclib_driver.get_segment_info is called only once
                 self.assertEqual(1, fake.call_count)
+
+    def test_get_diskfile_manager(self):
+        # verify unique diskfile manager instances are returned
+        policy = StoragePolicy(0, name='zero', is_default=True,
+                               diskfile_module='replication.fs')
+
+        dfm = policy.get_diskfile_manager({'devices': 'sdb1'}, debug_logger())
+        self.assertEqual('sdb1', dfm.devices)
+        dfm = policy.get_diskfile_manager({'devices': 'sdb2'}, debug_logger())
+        self.assertEqual('sdb2', dfm.devices)
+        dfm2 = policy.get_diskfile_manager({'devices': 'sdb2'}, debug_logger())
+        self.assertEqual('sdb2', dfm2.devices)
+        self.assertIsNot(dfm, dfm2)
+
+    def test_get_diskfile_manager_custom_diskfile(self):
+        calls = []
+        is_policy_ok = True
+
+        class DFM(object):
+            def __init__(self, *args, **kwargs):
+                calls.append((args, kwargs))
+
+            @classmethod
+            def check_policy(cls, policy):
+                if not is_policy_ok:
+                    raise ValueError("I am not ok")
+
+        policy = StoragePolicy(0, name='zero', is_default=True,
+                               diskfile_module='thin_air.fs')
+        with mock.patch(
+                'swift.common.storage_policy.load_pkg_resource',
+                side_effect=lambda *a, **kw: DFM) as mock_load_pkg_resource:
+            dfm = policy.get_diskfile_manager('arg', kwarg='kwarg')
+        self.assertIsInstance(dfm, DFM)
+        mock_load_pkg_resource.assert_called_with(
+            'swift.diskfile', 'thin_air.fs')
+        self.assertEqual([(('arg',), {'kwarg': 'kwarg'})], calls)
+
+        calls = []
+        is_policy_ok = False
+
+        with mock.patch(
+                'swift.common.storage_policy.load_pkg_resource',
+                side_effect=lambda *a, **kw: DFM) as mock_load_pkg_resource:
+            with self.assertRaises(PolicyError) as cm:
+                policy.get_diskfile_manager('arg', kwarg='kwarg')
+        mock_load_pkg_resource.assert_called_with(
+            'swift.diskfile', 'thin_air.fs')
+        self.assertIn('Invalid diskfile_module thin_air.fs', str(cm.exception))
+
+    def test_get_diskfile_manager_invalid_policy_config(self):
+        bad_policy = StoragePolicy(0, name='zero', is_default=True,
+                                   diskfile_module='erasure_coding.fs')
+
+        with self.assertRaises(PolicyError) as cm:
+            bad_policy.get_diskfile_manager()
+        self.assertIn('Invalid diskfile_module erasure_coding.fs',
+                      str(cm.exception))
+
+        bad_policy = ECStoragePolicy(0, name='one', is_default=True,
+                                     ec_type=DEFAULT_TEST_EC_TYPE,
+                                     ec_ndata=10, ec_nparity=4,
+                                     diskfile_module='replication.fs')
+
+        with self.assertRaises(PolicyError) as cm:
+            bad_policy.get_diskfile_manager()
+
+        self.assertIn('Invalid diskfile_module replication.fs',
+                      str(cm.exception))
+
+        bad_policy = StoragePolicy(0, name='zero', is_default=True,
+                                   diskfile_module='thin_air.fs')
+
+        with self.assertRaises(PolicyError) as cm:
+            bad_policy.get_diskfile_manager()
+
+        self.assertIn('Unable to load diskfile_module thin_air.fs',
+                      str(cm.exception))
 
 
 if __name__ == '__main__':

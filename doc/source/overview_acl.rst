@@ -75,17 +75,17 @@ of ``.rlistings``, an error will occur if used with
 ============================== ================================================
 Element                        Description
 ============================== ================================================
-``.r:*``                       Any user has access to objects. No token is
+.r:*                           Any user has access to objects. No token is
                                required in the request.
-``.r:<referrer>``              The referrer is granted access to objects. The
+.r:<referrer>                  The referrer is granted access to objects. The
                                referrer is identified by the ``Referer``
                                request header in the request. No token is
                                required.
-``.r:-<referrer>``             This syntax (with "-" prepended to the
+.r:-<referrer>                 This syntax (with "-" prepended to the
                                referrer) is supported. However, it does not
                                deny access if another element (e.g., ``.r:*``)
                                grants access.
-``.rlistings``                 Any user can perform a HEAD or GET operation
+.rlistings                     Any user can perform a HEAD or GET operation
                                on the container provided the user also has
                                read access on objects (e.g., also has ``.r:*``
                                or ``.r:<referrer>``. No token is required.
@@ -106,22 +106,22 @@ to take effect.
 ============================== ================================================
 Element                        Description
 ============================== ================================================
-``<project-id>:<user-id>``     The specified user, provided a token
+<project-id>:<user-id>         The specified user, provided a token
                                scoped to the project is included
                                in the request, is granted access.
                                Access to the container is also granted
                                when used in ``X-Container-Read``.
-``<project-id>:*``             Any user with a role in the specified Keystone
+<project-id>:\*                Any user with a role in the specified Keystone
                                project has access. A token scoped to the
                                project must be included in the request.
                                Access to the container is also granted
                                when used in ``X-Container-Read``.
-``*:<user-id>``                The specified user has access. A token
+\*:<user-id>                   The specified user has access. A token
                                for the user (scoped to any
                                project) must be included in the request.
                                Access to the container is also granted
                                when used in ``X-Container-Read``.
-``*:*``                        Any user has access.
+\*:\*                          Any user has access.
                                Access to the container is also granted
                                when used in ``X-Container-Read``.
                                The ``*:*`` element differs from the ``.r:*``
@@ -131,7 +131,7 @@ Element                        Description
                                does not require a token. In addition,
                                ``.r:*`` does not grant access to the
                                container listing.
-``<role_name>``                A user with the specified role *name* on the
+<role_name>                    A user with the specified role *name* on the
                                project within which the container is stored is
                                granted access. A user token scoped to the
                                project must be included in the request. Access
@@ -142,7 +142,7 @@ Element                        Description
 .. note::
 
     Keystone project (tenant) or user *names* (i.e.,
-    ``<project-name>:<user-name``) must no longer be
+    ``<project-name>:<user-name>``) must no longer be
     used because with the introduction
     of domains in Keystone, names are not globally unique. You should
     use user and project *ids* instead.
@@ -167,7 +167,7 @@ the elements described in :ref:`acl_common_elements`.
 ============================== ================================================
 Element                        Description
 ============================== ================================================
-``<user-name>``                The named user is granted access. The
+<user-name>                    The named user is granted access. The
                                wildcard ("*") character is not supported.
                                A token from the user must be included in the
                                request.
@@ -247,6 +247,98 @@ However, the request from the user **must** contain the appropriate
     The `Referer` header is included in requests by many browsers. However,
     since it is easy to create a request with any desired value in the
     `Referer` header, the referrer ACL has very weak security.
+
+
+Example: Sharing a Container with Another User
+----------------------------------------------
+
+Sharing a Container with another user requires the knowledge of few
+parameters regarding the users.
+
+The sharing user must know:
+
+- the ``OpenStack user id`` of the other user
+
+The sharing user must communicate to the other user:
+
+- the name of the shared container
+- the ``OS_STORAGE_URL``
+
+Usually the ``OS_STORAGE_URL`` is not exposed directly to the user
+because the ``swift client`` by default automatically construct the
+``OS_STORAGE_URL`` based on the User credential.
+
+We assume that in the current directory there are the two client
+environment script for the two users ``sharing.openrc`` and
+``other.openrc``.
+
+The ``sharing.openrc`` should be similar to the following:
+
+.. code-block:: bash
+
+    export OS_USERNAME=sharing
+    # WARNING: Save the password in clear text only for testing purposes
+    export OS_PASSWORD=password
+    export OS_TENANT_NAME=projectName
+    export OS_AUTH_URL=https://identityHost:portNumber/v2.0
+    # The following lines can be omitted
+    export OS_TENANT_ID=tenantIDString
+    export OS_REGION_NAME=regionName
+    export OS_CACERT=/path/to/cacertFile
+
+The ``other.openrc`` should be similar to the following:
+
+.. code-block:: bash
+
+    export OS_USERNAME=other
+    # WARNING: Save the password in clear text only for testing purposes
+    export OS_PASSWORD=otherPassword
+    export OS_TENANT_NAME=otherProjectName
+    export OS_AUTH_URL=https://identityHost:portNumber/v2.0
+    # The following lines can be omitted
+    export OS_TENANT_ID=tenantIDString
+    export OS_REGION_NAME=regionName
+    export OS_CACERT=/path/to/cacertFile
+
+For more information see `using the OpenStack RC file
+<https://docs.openstack.org/user-guide/common/cli-set-environment-variables-using-openstack-rc.html>`_
+
+First we figure out the other user id::
+
+    . other.openrc
+    OUID="$(openstack user show --format json "${OS_USERNAME}" | jq -r .id)"
+
+or alternatively::
+
+    . other.openrc
+    OUID="$(openstack token issue -f json | jq -r .user_id)"
+
+Then we figure out the storage url of the sharing user::
+
+    sharing.openrc
+    SURL="$(swift auth | awk -F = '/OS_STORAGE_URL/ {print $2}')"
+
+Running as the sharing user create a shared container named ``shared``
+in read-only mode with the other user using the proper acl::
+
+    sharing.openrc
+    swift post --read-acl "*:${OUID}" shared
+
+Running as the sharing user create and upload a test file::
+
+    touch void
+    swift upload shared void
+
+Running as the other user list the files in the ``shared`` container::
+
+    other.openrc
+    swift --os-storage-url="${SURL}" list shared
+
+Running as the other user download the ``shared`` container in the
+``/tmp`` directory::
+
+    cd /tmp
+    swift --os-storage-url="${SURL}" download shared
 
 
 .. _account_acls:

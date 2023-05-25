@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from eventlet import sleep, Timeout
+from eventlet import sleep, Timeout, spawn
 from eventlet.green import httplib, socket
 import json
 import six
@@ -22,15 +22,17 @@ from six.moves import urllib
 import struct
 from sys import exc_info, exit
 import zlib
-from swift import gettext_ as _
 from time import gmtime, strftime, time
 from zlib import compressobj
 
 from swift.common.exceptions import ClientException
-from swift.common.http import HTTP_NOT_FOUND, HTTP_MULTIPLE_CHOICES
-from swift.common.swob import Request
-from swift.common.utils import quote
-from swift.common.wsgi import loadapp, pipeline_property
+from swift.common.http import (HTTP_NOT_FOUND, HTTP_MULTIPLE_CHOICES,
+                               is_client_error, is_server_error)
+from swift.common.middleware.gatekeeper import GatekeeperMiddleware
+from swift.common.request_helpers import USE_REPLICATION_NETWORK_HEADER
+from swift.common.swob import Request, bytes_to_wsgi
+from swift.common.utils import quote, close_if_possible, drain_and_close
+from swift.common.wsgi import loadapp
 
 if six.PY3:
     from eventlet.green.urllib import request as urllib2
@@ -95,7 +97,7 @@ class CompressingFileReader(object):
         """
 
         if self.done:
-            return ''
+            return b''
         x = self._f.read(*a, **kw)
         if x:
             self.crc32 = zlib.crc32(x, self.crc32) & 0xffffffff
@@ -112,18 +114,20 @@ class CompressingFileReader(object):
             self.done = True
         if self.first:
             self.first = False
-            header = '\037\213\010\000\000\000\000\000\002\377'
+            header = b'\037\213\010\000\000\000\000\000\002\377'
             compressed = header + compressed
         return compressed
 
     def __iter__(self):
         return self
 
-    def next(self):
+    def __next__(self):
         chunk = self.read(self.chunk_size)
         if chunk:
             return chunk
         raise StopIteration
+
+    next = __next__
 
     def seek(self, offset, whence=0):
         if not (offset == 0 and whence == 0):
@@ -141,20 +145,48 @@ class InternalClient(object):
     :param user_agent: User agent to be sent to requests to Swift.
     :param request_tries: Number of tries before InternalClient.make_request()
                           gives up.
+    :param use_replication_network: Force the client to use the replication
+        network over the cluster.
+    :param global_conf: a dict of options to update the loaded proxy config.
+        Options in ``global_conf`` will override those in ``conf_path`` except
+        where the ``conf_path`` option is preceded by ``set``.
+    :param app: Optionally provide a WSGI app for the internal client to use.
     """
 
     def __init__(self, conf_path, user_agent, request_tries,
-                 allow_modify_pipeline=False):
-        self.app = loadapp(conf_path,
-                           allow_modify_pipeline=allow_modify_pipeline)
-        self.user_agent = user_agent
+                 use_replication_network=False, global_conf=None, app=None,
+                 **kwargs):
+        if request_tries < 1:
+            raise ValueError('request_tries must be positive')
+        # Internal clients don't use the gatekeeper and the pipeline remains
+        # static so we never allow anything to modify the proxy pipeline.
+        if kwargs.get('allow_modify_pipeline'):
+            raise ValueError("'allow_modify_pipeline' is no longer supported")
+        self.app = app or loadapp(conf_path, global_conf=global_conf,
+                                  allow_modify_pipeline=False,)
+        self.check_gatekeeper_not_loaded(self.app)
+        self.user_agent = \
+            self.app._pipeline_final_app.backend_user_agent = user_agent
         self.request_tries = request_tries
+        self.use_replication_network = use_replication_network
+        self.get_object_ring = self.app._pipeline_final_app.get_object_ring
+        self.container_ring = self.app._pipeline_final_app.container_ring
+        self.account_ring = self.app._pipeline_final_app.account_ring
+        self.auto_create_account_prefix = \
+            self.app._pipeline_final_app.auto_create_account_prefix
 
-    get_object_ring = pipeline_property('get_object_ring')
-    container_ring = pipeline_property('container_ring')
-    account_ring = pipeline_property('account_ring')
-    auto_create_account_prefix = pipeline_property(
-        'auto_create_account_prefix', default='.')
+    @staticmethod
+    def check_gatekeeper_not_loaded(app):
+        # the Gatekeeper middleware would prevent an InternalClient passing
+        # X-Backend-* headers to the proxy app, so ensure it's not present
+        try:
+            for app in app._pipeline:
+                if isinstance(app, GatekeeperMiddleware):
+                    raise ValueError(
+                        "Gatekeeper middleware is not allowed in the "
+                        "InternalClient proxy pipeline")
+        except AttributeError:
+            pass
 
     def make_request(
             self, method, path, headers, acceptable_statuses, body_file=None,
@@ -180,8 +212,12 @@ class InternalClient(object):
 
         headers = dict(headers)
         headers['user-agent'] = self.user_agent
-        resp = exc_type = exc_value = exc_traceback = None
+        headers.setdefault('x-backend-allow-reserved-names', 'true')
+        if self.use_replication_network:
+            headers.setdefault(USE_REPLICATION_NETWORK_HEADER, 'true')
+
         for attempt in range(self.request_tries):
+            resp = exc_type = exc_value = exc_traceback = None
             req = Request.blank(
                 path, environ={'REQUEST_METHOD': method}, headers=headers)
             if body_file is not None:
@@ -191,25 +227,48 @@ class InternalClient(object):
             if params:
                 req.params = params
             try:
-                resp = req.get_response(self.app)
+                # execute in a separate greenthread to not polute corolocals
+                resp = spawn(req.get_response, self.app).wait()
+            except (Exception, Timeout):
+                exc_type, exc_value, exc_traceback = exc_info()
+            else:
                 if resp.status_int in acceptable_statuses or \
                         resp.status_int // 100 in acceptable_statuses:
                     return resp
-            except (Exception, Timeout):
-                exc_type, exc_value, exc_traceback = exc_info()
+                elif not is_server_error(resp.status_int):
+                    # No sense retrying when we expect the same result
+                    break
             # sleep only between tries, not after each one
             if attempt < self.request_tries - 1:
+                if resp:
+                    # for non 2XX requests it's safe and useful to drain
+                    # the response body so we log the correct status code
+                    if resp.status_int // 100 != 2:
+                        drain_and_close(resp)
+                    else:
+                        # Just close; the 499 is appropriate
+                        close_if_possible(resp.app_iter)
                 sleep(2 ** (attempt + 1))
         if resp:
-            raise UnexpectedResponse(
-                _('Unexpected response: %s') % resp.status, resp)
+            msg = 'Unexpected response: %s' % resp.status
+            if resp.status_int // 100 != 2 and resp.body:
+                # provide additional context (and drain the response body) for
+                # non 2XX responses
+                msg += ' (%s)' % resp.body
+            raise UnexpectedResponse(msg, resp)
         if exc_type:
             # To make pep8 tool happy, in place of raise t, v, tb:
-            six.reraise(exc_type(*exc_value.args), None, exc_traceback)
+            six.reraise(exc_type, exc_value, exc_traceback)
+
+    def handle_request(self, *args, **kwargs):
+        resp = self.make_request(*args, **kwargs)
+        # Drain the response body to prevent unexpected disconnect
+        # in proxy-server
+        drain_and_close(resp)
 
     def _get_metadata(
             self, path, metadata_prefix='', acceptable_statuses=(2,),
-            headers=None):
+            headers=None, params=None):
         """
         Gets metadata by doing a HEAD on a path and using the metadata_prefix
         to get values from the headers returned.
@@ -232,7 +291,8 @@ class InternalClient(object):
         """
 
         headers = headers or {}
-        resp = self.make_request('HEAD', path, headers, acceptable_statuses)
+        resp = self.make_request('HEAD', path, headers, acceptable_statuses,
+                                 params=params)
         metadata_prefix = metadata_prefix.lower()
         metadata = {}
         for k, v in resp.headers.items():
@@ -241,7 +301,7 @@ class InternalClient(object):
         return metadata
 
     def _iter_items(
-            self, path, marker='', end_marker='',
+            self, path, marker='', end_marker='', prefix='',
             acceptable_statuses=(2, HTTP_NOT_FOUND)):
         """
         Returns an iterator of items from a json listing.  Assumes listing has
@@ -251,6 +311,7 @@ class InternalClient(object):
         :param marker: Prefix of first desired item, defaults to ''.
         :param end_marker: Last item returned will be 'less' than this,
                            defaults to ''.
+        :param prefix: Prefix of items
         :param acceptable_statuses: List of status for valid responses,
                                     defaults to (2, HTTP_NOT_FOUND).
 
@@ -259,15 +320,23 @@ class InternalClient(object):
         :raises Exception: Exception is raised when code fails in an
                            unexpected way.
         """
+        if not isinstance(marker, bytes):
+            marker = marker.encode('utf8')
+        if not isinstance(end_marker, bytes):
+            end_marker = end_marker.encode('utf8')
+        if not isinstance(prefix, bytes):
+            prefix = prefix.encode('utf8')
 
         while True:
             resp = self.make_request(
-                'GET', '%s?format=json&marker=%s&end_marker=%s' %
-                (path, quote(marker), quote(end_marker)),
+                'GET', '%s?format=json&marker=%s&end_marker=%s&prefix=%s' %
+                (path, bytes_to_wsgi(quote(marker)),
+                 bytes_to_wsgi(quote(end_marker)),
+                 bytes_to_wsgi(quote(prefix))),
                 {}, acceptable_statuses)
             if not resp.status_int == 200:
                 if resp.status_int >= HTTP_MULTIPLE_CHOICES:
-                    ''.join(resp.app_iter)
+                    b''.join(resp.app_iter)
                 break
             data = json.loads(resp.body)
             if not data:
@@ -326,12 +395,12 @@ class InternalClient(object):
                 headers[k] = v
             else:
                 headers['%s%s' % (metadata_prefix, k)] = v
-        self.make_request('POST', path, headers, acceptable_statuses)
+        self.handle_request('POST', path, headers, acceptable_statuses)
 
     # account methods
 
     def iter_containers(
-            self, account, marker='', end_marker='',
+            self, account, marker='', end_marker='', prefix='',
             acceptable_statuses=(2, HTTP_NOT_FOUND)):
         """
         Returns an iterator of containers dicts from an account.
@@ -340,6 +409,7 @@ class InternalClient(object):
         :param marker: Prefix of first desired item, defaults to ''.
         :param end_marker: Last item returned will be 'less' than this,
                            defaults to ''.
+        :param prefix: Prefix of containers
         :param acceptable_statuses: List of status for valid responses,
                                     defaults to (2, HTTP_NOT_FOUND).
 
@@ -350,7 +420,36 @@ class InternalClient(object):
         """
 
         path = self.make_path(account)
-        return self._iter_items(path, marker, end_marker, acceptable_statuses)
+        return self._iter_items(path, marker, end_marker, prefix,
+                                acceptable_statuses)
+
+    def create_account(self, account):
+        """
+        Creates an account.
+
+        :param account: Account to create.
+        :raises UnexpectedResponse: Exception raised when requests fail
+                                    to get a response with an acceptable status
+        :raises Exception: Exception is raised when code fails in an
+                           unexpected way.
+        """
+        path = self.make_path(account)
+        self.handle_request('PUT', path, {}, (201, 202))
+
+    def delete_account(self, account, acceptable_statuses=(2, HTTP_NOT_FOUND)):
+        """
+        Deletes an account.
+
+        :param account: Account to delete.
+        :param acceptable_statuses: List of status for valid responses,
+                                    defaults to (2, HTTP_NOT_FOUND).
+        :raises UnexpectedResponse: Exception raised when requests fail
+                                    to get a response with an acceptable status
+        :raises Exception: Exception is raised when code fails in an
+                           unexpected way.
+        """
+        path = self.make_path(account)
+        self.handle_request('DELETE', path, {}, acceptable_statuses)
 
     def get_account_info(
             self, account, acceptable_statuses=(2, HTTP_NOT_FOUND)):
@@ -375,7 +474,8 @@ class InternalClient(object):
                 int(resp.headers.get('x-account-object-count', 0)))
 
     def get_account_metadata(
-            self, account, metadata_prefix='', acceptable_statuses=(2,)):
+            self, account, metadata_prefix='', acceptable_statuses=(2,),
+            params=None):
         """Gets account metadata.
 
         :param account: Account on which to get the metadata.
@@ -394,7 +494,8 @@ class InternalClient(object):
         """
 
         path = self.make_path(account)
-        return self._get_metadata(path, metadata_prefix, acceptable_statuses)
+        return self._get_metadata(path, metadata_prefix, acceptable_statuses,
+                                  headers=None, params=params)
 
     def set_account_metadata(
             self, account, metadata, metadata_prefix='',
@@ -462,10 +563,11 @@ class InternalClient(object):
 
         headers = headers or {}
         path = self.make_path(account, container)
-        self.make_request('PUT', path, headers, acceptable_statuses)
+        self.handle_request('PUT', path, headers, acceptable_statuses)
 
     def delete_container(
-            self, account, container, acceptable_statuses=(2, HTTP_NOT_FOUND)):
+            self, account, container, headers=None,
+            acceptable_statuses=(2, HTTP_NOT_FOUND)):
         """
         Deletes a container.
 
@@ -480,12 +582,13 @@ class InternalClient(object):
                            unexpected way.
         """
 
+        headers = headers or {}
         path = self.make_path(account, container)
-        self.make_request('DELETE', path, {}, acceptable_statuses)
+        self.handle_request('DELETE', path, headers, acceptable_statuses)
 
     def get_container_metadata(
             self, account, container, metadata_prefix='',
-            acceptable_statuses=(2,)):
+            acceptable_statuses=(2,), params=None):
         """Gets container metadata.
 
         :param account: The container's account.
@@ -505,10 +608,11 @@ class InternalClient(object):
         """
 
         path = self.make_path(account, container)
-        return self._get_metadata(path, metadata_prefix, acceptable_statuses)
+        return self._get_metadata(path, metadata_prefix, acceptable_statuses,
+                                  params=params)
 
     def iter_objects(
-            self, account, container, marker='', end_marker='',
+            self, account, container, marker='', end_marker='', prefix='',
             acceptable_statuses=(2, HTTP_NOT_FOUND)):
         """
         Returns an iterator of object dicts from a container.
@@ -518,6 +622,7 @@ class InternalClient(object):
         :param marker: Prefix of first desired item, defaults to ''.
         :param end_marker: Last item returned will be 'less' than this,
                            defaults to ''.
+        :param prefix: Prefix of objects
         :param acceptable_statuses: List of status for valid responses,
                                     defaults to (2, HTTP_NOT_FOUND).
 
@@ -528,7 +633,8 @@ class InternalClient(object):
         """
 
         path = self.make_path(account, container)
-        return self._iter_items(path, marker, end_marker, acceptable_statuses)
+        return self._iter_items(path, marker, end_marker, prefix,
+                                acceptable_statuses)
 
     def set_container_metadata(
             self, account, container, metadata, metadata_prefix='',
@@ -581,11 +687,12 @@ class InternalClient(object):
         """
 
         path = self.make_path(account, container, obj)
-        self.make_request('DELETE', path, (headers or {}), acceptable_statuses)
+        self.handle_request('DELETE', path, (headers or {}),
+                            acceptable_statuses)
 
     def get_object_metadata(
             self, account, container, obj, metadata_prefix='',
-            acceptable_statuses=(2,), headers=None):
+            acceptable_statuses=(2,), headers=None, params=None):
         """Gets object metadata.
 
         :param account: The object's account.
@@ -608,9 +715,9 @@ class InternalClient(object):
 
         path = self.make_path(account, container, obj)
         return self._get_metadata(path, metadata_prefix, acceptable_statuses,
-                                  headers=headers)
+                                  headers=headers, params=params)
 
-    def get_object(self, account, container, obj, headers,
+    def get_object(self, account, container, obj, headers=None,
                    acceptable_statuses=(2,), params=None):
         """
         Gets an object.
@@ -664,7 +771,7 @@ class InternalClient(object):
         if not resp.status_int // 100 == 2:
             return
 
-        last_part = ''
+        last_part = b''
         compressed = obj.endswith('.gz')
         # magic in the following zlib.decompressobj argument is courtesy of
         # Python decompressing gzip chunk-by-chunk
@@ -673,7 +780,7 @@ class InternalClient(object):
         for chunk in resp.app_iter:
             if compressed:
                 chunk = d.decompress(chunk)
-            parts = chunk.split('\n')
+            parts = chunk.split(b'\n')
             if len(parts) == 1:
                 last_part = last_part + parts[0]
             else:
@@ -712,13 +819,17 @@ class InternalClient(object):
             path, metadata, metadata_prefix, acceptable_statuses)
 
     def upload_object(
-            self, fobj, account, container, obj, headers=None):
+            self, fobj, account, container, obj, headers=None,
+            acceptable_statuses=(2,), params=None):
         """
         :param fobj: File object to read object's content from.
         :param account: The object's account.
         :param container: The object's container.
         :param obj: The object.
         :param headers: Headers to send with request, defaults to empty dict.
+        :param acceptable_statuses: List of acceptable statuses for request.
+        :param params: A dict of params to be set in request query string,
+                       defaults to None.
 
         :raises UnexpectedResponse: Exception raised when requests fail
                                     to get a response with an acceptable status
@@ -730,7 +841,8 @@ class InternalClient(object):
         if 'Content-Length' not in headers:
             headers['Transfer-Encoding'] = 'chunked'
         path = self.make_path(account, container, obj)
-        self.make_request('PUT', path, headers, (2,), fobj)
+        self.handle_request('PUT', path, headers, acceptable_statuses, fobj,
+                            params=params)
 
 
 def get_auth(url, user, key, auth_version='1.0', **kwargs):
@@ -849,14 +961,16 @@ class SimpleClient(object):
             self.attempts += 1
             try:
                 return self.base_request(method, **kwargs)
-            except (socket.error, httplib.HTTPException, urllib2.URLError) \
-                    as err:
+            except urllib2.HTTPError as err:
+                if is_client_error(err.getcode() or 500):
+                    raise ClientException('Client error',
+                                          http_status=err.getcode())
+                elif self.attempts > retries:
+                    raise ClientException('Raise too many retries',
+                                          http_status=err.getcode())
+            except (socket.error, httplib.HTTPException, urllib2.URLError):
                 if self.attempts > retries:
-                    if isinstance(err, urllib2.HTTPError):
-                        raise ClientException('Raise too many retries',
-                                              http_status=err.getcode())
-                    else:
-                        raise
+                    raise
             sleep(backoff)
             backoff = min(backoff * 2, self.max_backoff)
 

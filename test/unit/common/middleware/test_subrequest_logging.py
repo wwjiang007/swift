@@ -18,7 +18,7 @@ from swift.common.middleware import copy, proxy_logging
 from swift.common.swob import Request, HTTPOk
 from swift.common.utils import close_if_possible
 from swift.common.wsgi import make_subrequest
-from test.unit import FakeLogger
+from test.debug_logger import debug_logger
 from test.unit.common.middleware.helpers import FakeSwift
 
 
@@ -57,7 +57,7 @@ class FakeFilter(object):
 
 class FakeApp(object):
     def __init__(self, conf):
-        self.fake_logger = FakeLogger()
+        self.fake_logger = debug_logger()
         self.fake_swift = self.app = FakeSwift()
         self.register = self.fake_swift.register
         for filter in reversed([
@@ -98,17 +98,16 @@ class TestSubRequestLogging(unittest.TestCase):
 
         req.get_response(app)
         info_log_lines = app.fake_logger.get_lines_for_level('info')
-        self.assertEqual(len(info_log_lines), 5)
-        self.assertTrue(info_log_lines[0].startswith('Copying object'))
+        self.assertEqual(len(info_log_lines), 4)
         subreq_get = '%s %s' % (subrequest_type, SUB_GET_PATH)
         subreq_put = '%s %s' % (subrequest_type, SUB_PUT_POST_PATH)
         origput = 'PUT %s' % self.path
         copyget = 'GET %s' % '/v1/a/test/obj'
         # expect GET subreq, copy GET, PUT subreq, orig PUT
-        self.assertTrue(subreq_get in info_log_lines[1])
-        self.assertTrue(copyget in info_log_lines[2])
-        self.assertTrue(subreq_put in info_log_lines[3])
-        self.assertTrue(origput in info_log_lines[4])
+        self.assertTrue(subreq_get in info_log_lines[0])
+        self.assertTrue(copyget in info_log_lines[1])
+        self.assertTrue(subreq_put in info_log_lines[2])
+        self.assertTrue(origput in info_log_lines[3])
 
     def test_subrequest_logged_x_copy_from(self):
         self._test_subrequest_logged('HEAD')

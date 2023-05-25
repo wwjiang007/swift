@@ -52,9 +52,9 @@ of endpoints having the same form as described above, and a key 'headers' that
 maps to a dictionary of headers that should be sent with a request made to
 the endpoints, e.g.::
 
-    { "endpoints": {"http://10.1.1.1:6010/sda1/2/a/c3/o1",
-                    "http://10.1.1.1:6030/sda3/2/a/c3/o1",
-                    "http://10.1.1.1:6040/sda4/2/a/c3/o1"},
+    { "endpoints": {"http://10.1.1.1:6210/sda1/2/a/c3/o1",
+                    "http://10.1.1.1:6230/sda3/2/a/c3/o1",
+                    "http://10.1.1.1:6240/sda4/2/a/c3/o1"},
       "headers": {"X-Backend-Storage-Policy-Index": "1"}}
 
 In this example, the 'headers' dictionary indicates that requests to the
@@ -142,10 +142,10 @@ class ListEndpointsMiddleware(object):
     def _parse_path(self, request):
         """
         Parse path parts of request into a tuple of version, account,
-        container, obj.  Unspecified path parts are filled in as None,
-        except version which is always returned as a float using the
-        configured default response version if not specified in the
-        request.
+        container, obj.  Unspecified container or obj is filled in as
+        None; account is required; version is always returned as a
+        float using the configured default response version if not
+        specified in the request.
 
         :param request: the swob request
 
@@ -163,7 +163,7 @@ class ListEndpointsMiddleware(object):
             version = self._parse_version(raw_version)
         except ValueError:
             if raw_version.startswith('v') and '_' not in raw_version:
-                # looks more like a invalid version than an account
+                # looks more like an invalid version than an account
                 raise
             # probably no version specified, but if the client really
             # said /endpoints/v_3/account they'll probably be sorta
@@ -208,8 +208,7 @@ class ListEndpointsMiddleware(object):
         except ValueError as err:
             return HTTPBadRequest(str(err))(env, start_response)
 
-        if account is not None:
-            account = unquote(account)
+        account = unquote(account)
         if container is not None:
             container = unquote(container)
         if obj is not None:

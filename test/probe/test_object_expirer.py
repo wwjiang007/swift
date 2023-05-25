@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import random
 import time
 import uuid
@@ -103,7 +104,7 @@ class TestObjectExpirer(ReplProbeTest):
 
         # clear proxy cache
         client.post_container(self.url, self.token, self.container_name, {})
-        # run the expirier again after replication
+        # run the expirer again after replication
         self.expirer.once()
 
         # object is not in the listing
@@ -125,6 +126,52 @@ class TestObjectExpirer(ReplProbeTest):
                 self.assertIn('x-backend-timestamp', metadata)
                 self.assertGreater(Timestamp(metadata['x-backend-timestamp']),
                                    create_timestamp)
+
+    def test_expirer_doesnt_make_async_pendings(self):
+        # The object expirer cleans up its own queue. The inner loop
+        # basically looks like this:
+        #
+        #    for obj in stuff_to_delete:
+        #        delete_the_object(obj)
+        #        remove_the_queue_entry(obj)
+        #
+        # By default, upon receipt of a DELETE request for an expiring
+        # object, the object servers will create async_pending records to
+        # clean the expirer queue. Since the expirer cleans its own queue,
+        # this is unnecessary. The expirer can make requests in such a way
+        # tha the object server does not write out any async pendings; this
+        # test asserts that this is the case.
+
+        # Make an expiring object in each policy
+        for policy in ENABLED_POLICIES:
+            container_name = "expirer-test-%d" % policy.idx
+            container_headers = {'X-Storage-Policy': policy.name}
+            client.put_container(self.url, self.token, container_name,
+                                 headers=container_headers)
+
+            now = time.time()
+            delete_at = int(now + 2.0)
+            client.put_object(
+                self.url, self.token, container_name, "some-object",
+                headers={'X-Delete-At': str(delete_at),
+                         'X-Timestamp': Timestamp(now).normal},
+                contents='dontcare')
+
+        time.sleep(2.0)
+        # make sure auto-created expirer-queue containers get in the account
+        # listing so the expirer can find them
+        Manager(['container-updater']).once()
+
+        # Make sure there's no async_pendings anywhere. Probe tests only run
+        # on single-node installs anyway, so this set should be small enough
+        # that an exhaustive check doesn't take too long.
+        all_obj_nodes = self.get_all_object_nodes()
+        pendings_before = self.gather_async_pendings(all_obj_nodes)
+
+        # expire the objects
+        Manager(['object-expirer']).once()
+        pendings_after = self.gather_async_pendings(all_obj_nodes)
+        self.assertEqual(pendings_after, pendings_before)
 
     def test_expirer_object_should_not_be_expired(self):
 
@@ -282,9 +329,6 @@ class TestObjectExpirer(ReplProbeTest):
         # run expirer again, delete should now succeed
         self.expirer.once()
 
-        # this is mainly to paper over lp bug #1652323
-        self.get_to_final_state()
-
         # verify the deletion by checking the container listing
         self.assertFalse(self._check_obj_in_container_listing(),
                          msg='Found listing for %s' % self.object_name)
@@ -294,6 +338,69 @@ class TestObjectExpirer(ReplProbeTest):
 
     def test_expirer_delete_returns_outdated_412(self):
         self._test_expirer_delete_outdated_object_version(object_exists=True)
+
+    def test_slo_async_delete(self):
+        if not self.cluster_info.get('slo', {}).get('allow_async_delete'):
+            raise unittest.SkipTest('allow_async_delete not enabled')
+
+        segment_container = self.container_name + '_segments'
+        client.put_container(self.url, self.token, self.container_name, {})
+        client.put_container(self.url, self.token, segment_container, {})
+        client.put_object(self.url, self.token,
+                          segment_container, 'segment_1', b'1234')
+        client.put_object(self.url, self.token,
+                          segment_container, 'segment_2', b'5678')
+        client.put_object(
+            self.url, self.token, self.container_name, 'slo', json.dumps([
+                {'path': segment_container + '/segment_1'},
+                {'data': 'Cg=='},
+                {'path': segment_container + '/segment_2'},
+            ]), query_string='multipart-manifest=put')
+        _, body = client.get_object(self.url, self.token,
+                                    self.container_name, 'slo')
+        self.assertEqual(body, b'1234\n5678')
+
+        client.delete_object(
+            self.url, self.token, self.container_name, 'slo',
+            query_string='multipart-manifest=delete&async=true')
+
+        # Object's deleted
+        _, objects = client.get_container(self.url, self.token,
+                                          self.container_name)
+        self.assertEqual(objects, [])
+        with self.assertRaises(client.ClientException) as caught:
+            client.get_object(self.url, self.token, self.container_name, 'slo')
+        self.assertEqual(404, caught.exception.http_status)
+
+        # But segments are still around and accessible
+        _, objects = client.get_container(self.url, self.token,
+                                          segment_container)
+        self.assertEqual([o['name'] for o in objects],
+                         ['segment_1', 'segment_2'])
+        _, body = client.get_object(self.url, self.token,
+                                    segment_container, 'segment_1')
+        self.assertEqual(body, b'1234')
+        _, body = client.get_object(self.url, self.token,
+                                    segment_container, 'segment_2')
+        self.assertEqual(body, b'5678')
+
+        # make sure auto-created expirer-queue containers get in the account
+        # listing so the expirer can find them
+        Manager(['container-updater']).once()
+        self.expirer.once()
+
+        # Now the expirer has cleaned up the segments
+        _, objects = client.get_container(self.url, self.token,
+                                          segment_container)
+        self.assertEqual(objects, [])
+        with self.assertRaises(client.ClientException) as caught:
+            client.get_object(self.url, self.token,
+                              segment_container, 'segment_1')
+        self.assertEqual(404, caught.exception.http_status)
+        with self.assertRaises(client.ClientException) as caught:
+            client.get_object(self.url, self.token,
+                              segment_container, 'segment_2')
+        self.assertEqual(404, caught.exception.http_status)
 
 
 if __name__ == "__main__":

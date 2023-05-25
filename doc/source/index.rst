@@ -33,7 +33,7 @@ be found on the `OpenStack wiki`_ and at http://docs.openstack.org.
 
 
 .. toctree::
-    :maxdepth: 1
+    :maxdepth: 2
 
     getting_started
 
@@ -53,7 +53,6 @@ Overview and Concepts
     overview_replication
     ratelimit
     overview_large_objects
-    overview_object_versioning
     overview_global_cluster
     overview_container_sync
     overview_expiring_objects
@@ -62,9 +61,19 @@ Overview and Concepts
     overview_erasure_code
     overview_encryption
     overview_backing_store
+    overview_container_sharding
     ring_background
     ring_partpower
     associated_projects
+
+Contributor Documentation
+=========================
+
+.. toctree::
+    :maxdepth: 2
+
+    contributor/contributing
+    contributor/review_guidelines
 
 Developer Documentation
 =======================
@@ -79,6 +88,7 @@ Developer Documentation
     development_auth
     development_middleware
     development_ondisk_backends
+    development_watchers
 
 Administrator Documentation
 ===========================
@@ -86,7 +96,6 @@ Administrator Documentation
 .. toctree::
     :maxdepth: 1
 
-    howto_installmultinode
     deployment_guide
     apache_deployment_guide
     admin_guide
@@ -95,11 +104,13 @@ Administrator Documentation
     ops_runbook/index
     admin/index
     install/index
+    config/index
+
 
 Object Storage v1 REST API Documentation
 ========================================
 
-See `Complete Reference for the Object Storage REST API <http://developer.openstack.org/api-ref/object-storage/>`_
+See `Complete Reference for the Object Storage REST API <https://docs.openstack.org/api-ref/object-store/>`_
 
 The following provides supporting information for the REST API:
 
@@ -116,6 +127,20 @@ The following provides supporting information for the REST API:
     api/form_post_middleware.rst
     api/use_content-encoding_metadata.rst
     api/use_the_content-disposition_metadata.rst
+    api/pseudo-hierarchical-folders-directories.rst
+    api/pagination.rst
+    api/serialized-response-formats.rst
+    api/static-website.rst
+    api/object-expiration.rst
+    api/bulk-delete.rst
+
+S3 Compatibility Info
+=====================
+
+.. toctree::
+    :maxdepth: 1
+
+    s3_compat
 
 OpenStack End User Guide
 ========================
@@ -140,6 +165,7 @@ Source Documentation
     object
     misc
     middleware
+    audit_watchers
 
 
 Indices and tables

@@ -4,10 +4,108 @@
 Middleware
 **********
 
+.. _account-quotas:
+
 Account Quotas
 ==============
 
 .. automodule:: swift.common.middleware.account_quotas
+    :members:
+    :show-inheritance:
+
+.. _s3api:
+
+AWS S3 Api
+==========
+
+.. automodule:: swift.common.middleware.s3api.s3api
+    :members:
+    :show-inheritance:
+
+.. automodule:: swift.common.middleware.s3api.s3token
+    :members:
+    :show-inheritance:
+
+.. automodule:: swift.common.middleware.s3api.s3request
+    :members:
+    :show-inheritance:
+
+.. automodule:: swift.common.middleware.s3api.s3response
+    :members:
+    :show-inheritance:
+
+.. automodule:: swift.common.middleware.s3api.exception
+    :members:
+    :show-inheritance:
+
+.. automodule:: swift.common.middleware.s3api.etree
+    :members: _Element
+    :show-inheritance:
+
+.. automodule:: swift.common.middleware.s3api.utils
+    :members:
+    :show-inheritance:
+
+.. automodule:: swift.common.middleware.s3api.subresource
+    :members:
+    :show-inheritance:
+
+.. automodule:: swift.common.middleware.s3api.acl_handlers
+    :members:
+    :show-inheritance:
+
+.. automodule:: swift.common.middleware.s3api.acl_utils
+    :members:
+    :show-inheritance:
+
+.. automodule:: swift.common.middleware.s3api.controllers.base
+    :members:
+    :show-inheritance:
+
+.. automodule:: swift.common.middleware.s3api.controllers.service
+    :members:
+    :show-inheritance:
+
+.. automodule:: swift.common.middleware.s3api.controllers.bucket
+    :members:
+    :show-inheritance:
+
+.. automodule:: swift.common.middleware.s3api.controllers.obj
+    :members:
+    :show-inheritance:
+
+.. automodule:: swift.common.middleware.s3api.controllers.acl
+    :members:
+    :show-inheritance:
+
+.. automodule:: swift.common.middleware.s3api.controllers.s3_acl
+    :members:
+    :show-inheritance:
+
+.. automodule:: swift.common.middleware.s3api.controllers.multi_upload
+    :members:
+    :show-inheritance:
+
+.. automodule:: swift.common.middleware.s3api.controllers.multi_delete
+    :members:
+    :show-inheritance:
+
+.. automodule:: swift.common.middleware.s3api.controllers.versioning
+    :members:
+    :show-inheritance:
+
+.. automodule:: swift.common.middleware.s3api.controllers.location
+    :members:
+    :show-inheritance:
+
+.. automodule:: swift.common.middleware.s3api.controllers.logging
+    :members:
+    :show-inheritance:
+
+Backend Ratelimit
+=================
+
+.. automodule:: swift.common.middleware.backend_ratelimit
     :members:
     :show-inheritance:
 
@@ -116,6 +214,15 @@ Encryption middleware should be deployed in conjunction with the
     :members:
     :show-inheritance:
 
+.. _etag_quoter:
+
+Etag Quoter
+===========
+
+.. automodule:: swift.common.middleware.etag_quoter
+    :members:
+    :show-inheritance:
+
 .. _formpost:
 
 FormPost
@@ -187,12 +294,12 @@ Name Check (Forbidden Character Filter)
     :members:
     :show-inheritance:
 
-.. _versioned_writes:
+.. _object_versioning:
 
 Object Versioning
 =================
 
-.. automodule:: swift.common.middleware.versioned_writes
+.. automodule:: swift.common.middleware.versioned_writes.object_versioning
     :members:
     :show-inheritance:
 
@@ -210,10 +317,19 @@ Ratelimit
     :members:
     :show-inheritance:
 
+.. _read_only:
+
+Read Only
+=========
+
+.. automodule:: swift.common.middleware.read_only
+    :members:
+    :show-inheritance:
+
 .. _recon:
 
 Recon
-===========
+=====
 
 .. automodule:: swift.common.middleware.recon
     :members:
@@ -268,6 +384,15 @@ TempURL
 =======
 
 .. automodule:: swift.common.middleware.tempurl
+    :members:
+    :show-inheritance:
+
+.. _versioned_writes:
+
+Versioned Writes
+=================
+
+.. automodule:: swift.common.middleware.versioned_writes.legacy
     :members:
     :show-inheritance:
 

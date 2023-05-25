@@ -5,7 +5,7 @@ Object Storage monitoring
 .. note::
 
    This section was excerpted from a `blog post by Darrell
-   Bishop <http://swiftstack.com/blog/2012/04/11/swift-monitoring-with-statsd>`_ and
+   Bishop <https://swiftstack.com/blog/2012/04/11/swift-monitoring-with-statsd>`_ and
    has since been edited.
 
 An OpenStack Object Storage cluster is a collection of many daemons that
@@ -113,7 +113,7 @@ Swift StatsD logging
 ~~~~~~~~~~~~~~~~~~~~
 
 StatsD (see `Measure Anything, Measure Everything
-<http://codeascraft.etsy.com/2011/02/15/measure-anything-measure-everything/>`_)
+<https://codeascraft.com/2011/02/15/measure-anything-measure-everything/>`_)
 was designed for application code to be deeply instrumented. Meters are
 sent in real-time by the code that just noticed or did something. The
 overhead of sending a meter is extremely low: a ``sendto`` of one UDP
@@ -123,10 +123,8 @@ actual number when flushing meters upstream.
 
 To avoid the problems inherent with middleware-based monitoring and
 after-the-fact log processing, the sending of StatsD meters is
-integrated into Object Storage itself. The submitted change set (see
-`<https://review.openstack.org/#change,6058>`_) currently reports 124 meters
-across 15 Object Storage daemons and the tempauth middleware. Details of
-the meters tracked are in the :doc:`/admin_guide`.
+integrated into Object Storage itself. Details of the meters tracked
+are in the :doc:`/admin_guide`.
 
 The sending of meters is integrated with the logging framework. To
 enable, configure ``log_statsd_host`` in the relevant config file. You
@@ -146,14 +144,6 @@ require accuracy (``sample_rate=1``) while others may not.
 
 Then the LogAdapter object returned by ``get_logger()``, usually stored
 in ``self.logger``, has these new methods:
-
--  ``set_statsd_prefix(self, prefix)`` Sets the client library stat
-   prefix value which gets prefixed to every meter. The default prefix
-   is the ``name`` of the logger such as ``object-server``,
-   ``container-auditor``, and so on. This is currently used to turn
-   ``proxy-server`` into one of ``proxy-server.Account``,
-   ``proxy-server.Container``, or ``proxy-server.Object`` as soon as the
-   Controller object is determined and instantiated for the request.
 
 -  ``update_stats(self, metric, amount, sample_rate=1)`` Increments
    the supplied meter by the given amount. This is used when you need

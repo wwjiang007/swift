@@ -16,27 +16,26 @@ from collections import defaultdict
 
 import mock
 import os
-import time
 import unittest
 
 import eventlet
-import itertools
 from six.moves import urllib
 
 from swift.common.exceptions import DiskFileNotExist, DiskFileError, \
     DiskFileDeleted, DiskFileExpired
+from swift.common import swob
 from swift.common import utils
 from swift.common.storage_policy import POLICIES, EC_POLICY
-from swift.common.utils import Timestamp
-from swift.obj import ssync_sender, server
+from swift.obj import ssync_sender, server, diskfile
 from swift.obj.reconstructor import RebuildingECDiskFileStream, \
     ObjectReconstructor
 from swift.obj.replicator import ObjectReplicator
 
 from test import listen_zero
+from test.debug_logger import debug_logger
 from test.unit.obj.common import BaseTest
-from test.unit import patch_policies, debug_logger, \
-    encode_frag_archive_bodies, skip_if_no_xattrs
+from test.unit import patch_policies, encode_frag_archive_bodies, \
+    skip_if_no_xattrs, quiet_eventlet_exceptions, make_timestamp_iter
 
 
 class TestBaseSsync(BaseTest):
@@ -58,10 +57,9 @@ class TestBaseSsync(BaseTest):
             'mount_check': 'false',
             'replication_concurrency_per_device': '0',
             'log_requests': 'false'}
-        self.rx_logger = debug_logger()
+        self.rx_logger = debug_logger(name='test-ssync-receiver')
         self.rx_controller = server.ObjectController(conf, self.rx_logger)
-        self.ts_iter = (Timestamp(t)
-                        for t in itertools.count(int(time.time())))
+        self.ts_iter = make_timestamp_iter()
         self.rx_ip = '127.0.0.1'
         sock = listen_zero()
         self.rx_server = eventlet.spawn(
@@ -92,15 +90,15 @@ class TestBaseSsync(BaseTest):
 
         def make_send_wrapper(send):
             def wrapped_send(msg):
-                _msg = msg.split('\r\n', 1)[1]
-                _msg = _msg.rsplit('\r\n', 1)[0]
+                _msg = msg.split(b'\r\n', 1)[1]
+                _msg = _msg.rsplit(b'\r\n', 1)[0]
                 add_trace('tx', _msg)
                 send(msg)
             return wrapped_send
 
         def make_readline_wrapper(readline):
-            def wrapped_readline():
-                data = readline()
+            def wrapped_readline(size=1024):
+                data = readline(size=size)
                 add_trace('rx', data)
                 bytes_read = trace.setdefault('readline_bytes', 0)
                 trace['readline_bytes'] = bytes_read + len(data)
@@ -108,20 +106,21 @@ class TestBaseSsync(BaseTest):
             return wrapped_readline
 
         def wrapped_connect():
-            orig_connect()
-            sender.connection.send = make_send_wrapper(
-                sender.connection.send)
-            sender.readline = make_readline_wrapper(sender.readline)
+            connection, response = orig_connect()
+            connection.send = make_send_wrapper(
+                connection.send)
+            response.readline = make_readline_wrapper(response.readline)
+            return connection, response
         return wrapped_connect, trace
 
     def _get_object_data(self, path, **kwargs):
         # return data for given path
         if path not in self.obj_data:
-            self.obj_data[path] = '%s___data' % path
+            self.obj_data[path] = b'%s___data' % path.encode('ascii')
         return self.obj_data[path]
 
     def _create_ondisk_files(self, df_mgr, obj_name, policy, timestamp,
-                             frag_indexes=None, commit=True):
+                             frag_indexes=None, commit=True, **kwargs):
         frag_indexes = frag_indexes or [None]
         metadata = {'Content-Type': 'plain/text'}
         diskfiles = []
@@ -130,26 +129,27 @@ class TestBaseSsync(BaseTest):
                                                 frag_index=frag_index)
             if policy.policy_type == EC_POLICY:
                 metadata['X-Object-Sysmeta-Ec-Frag-Index'] = str(frag_index)
+                metadata['X-Object-Sysmeta-Ec-Etag'] = 'fake-etag'
             df = self._make_diskfile(
                 device=self.device, partition=self.partition, account='a',
                 container='c', obj=obj_name, body=object_data,
                 extra_metadata=metadata, timestamp=timestamp, policy=policy,
-                frag_index=frag_index, df_mgr=df_mgr, commit=commit)
+                frag_index=frag_index, df_mgr=df_mgr, commit=commit, **kwargs)
             diskfiles.append(df)
         return diskfiles
 
-    def _open_tx_diskfile(self, obj_name, policy, frag_index=None):
+    def _open_tx_diskfile(self, obj_name, policy, frag_index=None, **kwargs):
         df_mgr = self.daemon._df_router[policy]
         df = df_mgr.get_diskfile(
             self.device, self.partition, account='a', container='c',
-            obj=obj_name, policy=policy, frag_index=frag_index)
+            obj=obj_name, policy=policy, frag_index=frag_index, **kwargs)
         df.open()
         return df
 
-    def _open_rx_diskfile(self, obj_name, policy, frag_index=None):
+    def _open_rx_diskfile(self, obj_name, policy, frag_index=None, **kwargs):
         df = self.rx_controller.get_diskfile(
             self.device, self.partition, 'a', 'c', obj_name, policy=policy,
-            frag_index=frag_index, open_expired=True)
+            frag_index=frag_index, open_expired=True, **kwargs)
         df.open()
         return df
 
@@ -161,7 +161,7 @@ class TestBaseSsync(BaseTest):
         for k, v in tx_df.get_metadata().items():
             if k == 'X-Object-Sysmeta-Ec-Frag-Index':
                 # if tx_df had a frag_index then rx_df should also have one
-                self.assertTrue(k in rx_metadata)
+                self.assertIn(k, rx_metadata)
                 self.assertEqual(frag_index, int(rx_metadata.pop(k)))
             elif k == 'ETag' and not same_etag:
                 self.assertNotEqual(v, rx_metadata.pop(k, None))
@@ -173,7 +173,7 @@ class TestBaseSsync(BaseTest):
         self.assertFalse(rx_metadata)
         expected_body = self._get_object_data(tx_df._name,
                                               frag_index=frag_index)
-        actual_body = ''.join([chunk for chunk in rx_df.reader()])
+        actual_body = b''.join([chunk for chunk in rx_df.reader()])
         self.assertEqual(expected_body, actual_body)
 
     def _analyze_trace(self, trace):
@@ -193,22 +193,22 @@ class TestBaseSsync(BaseTest):
 
         def rx_missing(results, line):
             self.assertEqual('rx', line[0])
-            parts = line[1].split('\r\n')
+            parts = line[1].split(b'\r\n')
             for part in parts:
                 results['rx_missing'].append(part)
 
         def tx_updates(results, line):
             self.assertEqual('tx', line[0])
             subrequests = results['tx_updates']
-            if line[1].startswith(('PUT', 'DELETE', 'POST')):
-                parts = line[1].split('\r\n')
+            if line[1].startswith((b'PUT', b'DELETE', b'POST')):
+                parts = [swob.bytes_to_wsgi(l) for l in line[1].split(b'\r\n')]
                 method, path = parts[0].split()
                 subreq = {'method': method, 'path': path, 'req': line[1],
                           'headers': parts[1:]}
                 subrequests.append(subreq)
             else:
                 self.assertTrue(subrequests)
-                body = (subrequests[-1]).setdefault('body', '')
+                body = (subrequests[-1]).setdefault('body', b'')
                 body += line[1]
                 subrequests[-1]['body'] = body
 
@@ -220,14 +220,14 @@ class TestBaseSsync(BaseTest):
             results.setdefault('unexpected', []).append(line)
 
         # each trace line is a tuple of ([tx|rx], msg)
-        handshakes = iter([(('tx', ':MISSING_CHECK: START'), tx_missing),
-                           (('tx', ':MISSING_CHECK: END'), unexpected),
-                           (('rx', ':MISSING_CHECK: START'), rx_missing),
-                           (('rx', ':MISSING_CHECK: END'), unexpected),
-                           (('tx', ':UPDATES: START'), tx_updates),
-                           (('tx', ':UPDATES: END'), unexpected),
-                           (('rx', ':UPDATES: START'), rx_updates),
-                           (('rx', ':UPDATES: END'), unexpected)])
+        handshakes = iter([(('tx', b':MISSING_CHECK: START'), tx_missing),
+                           (('tx', b':MISSING_CHECK: END'), unexpected),
+                           (('rx', b':MISSING_CHECK: START'), rx_missing),
+                           (('rx', b':MISSING_CHECK: END'), unexpected),
+                           (('tx', b':UPDATES: START'), tx_updates),
+                           (('tx', b':UPDATES: END'), unexpected),
+                           (('rx', b':UPDATES: START'), rx_updates),
+                           (('rx', b':UPDATES: END'), unexpected)])
         expect_handshake = next(handshakes)
         phases = ('tx_missing', 'rx_missing', 'tx_updates', 'rx_updates')
         results = dict((k, []) for k in phases)
@@ -259,7 +259,7 @@ class TestBaseSsync(BaseTest):
         return results
 
     def _verify_ondisk_files(self, tx_objs, policy, tx_frag_index=None,
-                             rx_frag_index=None):
+                             rx_frag_index=None, **kwargs):
         """
         Verify tx and rx files that should be in sync.
         :param tx_objs: sender diskfiles
@@ -276,7 +276,7 @@ class TestBaseSsync(BaseTest):
                     # this diskfile should have been sync'd,
                     # check rx file is ok
                     rx_df = self._open_rx_diskfile(
-                        o_name, policy, rx_frag_index)
+                        o_name, policy, rx_frag_index, **kwargs)
                     # for EC revert job or replication etags should match
                     match_etag = (tx_frag_index == rx_frag_index)
                     self._verify_diskfile_sync(
@@ -309,15 +309,17 @@ class TestBaseSsyncEC(TestBaseSsync):
     def setUp(self):
         super(TestBaseSsyncEC, self).setUp()
         self.policy = POLICIES.default
-        self.daemon = ObjectReconstructor(self.daemon_conf,
-                                          debug_logger('test-ssync-sender'))
+        self.logger = debug_logger('test-ssync-sender')
+        self.daemon = ObjectReconstructor(self.daemon_conf, self.logger)
+        self.rx_node['backend_index'] = 0
 
     def _get_object_data(self, path, frag_index=None, **kwargs):
         # return a frag archive for given object name and frag index.
         # for EC policies obj_data maps obj path -> list of frag archives
         if path not in self.obj_data:
             # make unique frag archives for each object name
-            data = path * 2 * (self.policy.ec_ndata + self.policy.ec_nparity)
+            data = path.encode('ascii') * 2 * (
+                self.policy.ec_ndata + self.policy.ec_nparity)
             self.obj_data[path] = encode_frag_archive_bodies(
                 self.policy, data)
         return self.obj_data[path][frag_index]
@@ -377,7 +379,6 @@ class TestSsyncEC(TestBaseSsyncEC):
                'policy': policy,
                'frag_index': frag_index}
         node = dict(self.rx_node)
-        node.update({'index': rx_node_index})
         sender = ssync_sender.Sender(self.daemon, node, job, suffixes)
         # wrap connection from tx to rx to capture ssync messages...
         sender.connect, trace = self.make_connect_wrapper(sender)
@@ -450,7 +451,7 @@ class TestSsyncEC(TestBaseSsyncEC):
             rx_df_mgr, obj_name, policy, t2, (12, 13), commit=False)
         expected_subreqs['PUT'].append(obj_name)
 
-        # o3 on rx has frag at other time and non-durable - PUT required
+        # o3 on rx has frag at newer time and non-durable - PUT required
         t3 = next(self.ts_iter)
         obj_name = 'o3'
         tx_objs[obj_name] = self._create_ondisk_files(
@@ -484,7 +485,6 @@ class TestSsyncEC(TestBaseSsyncEC):
                'policy': policy,
                'frag_index': frag_index}
         node = dict(self.rx_node)
-        node.update({'index': rx_node_index})
         sender = ssync_sender.Sender(self.daemon, node, job, suffixes)
         # wrap connection from tx to rx to capture ssync messages...
         sender.connect, trace = self.make_connect_wrapper(sender)
@@ -517,6 +517,91 @@ class TestSsyncEC(TestBaseSsyncEC):
         tx_objs.pop('o4')  # o4 should not have been sync'd
         self._verify_ondisk_files(
             tx_objs, policy, frag_index, rx_node_index)
+
+    def test_handoff_non_durable_fragment(self):
+        # test that a sync_revert type job does PUT when the tx is non-durable
+        policy = POLICIES.default
+        rx_node_index = frag_index = 0
+        tx_node_index = 1
+
+        # create sender side diskfiles...
+        tx_objs = {}
+        rx_objs = {}
+        tx_df_mgr = self.daemon._df_router[policy]
+        rx_df_mgr = self.rx_controller._diskfile_router[policy]
+
+        expected_subreqs = defaultdict(list)
+
+        # o1 non-durable on tx and missing on rx
+        t1 = next(self.ts_iter)  # newer non-durable tx .data
+        obj_name = 'o1'
+        tx_objs[obj_name] = self._create_ondisk_files(
+            tx_df_mgr, obj_name, policy, t1, (tx_node_index, rx_node_index,),
+            commit=False, frag_prefs=[])
+        expected_subreqs['PUT'].append(obj_name)
+
+        # o2 non-durable on tx and rx
+        t2 = next(self.ts_iter)
+        obj_name = 'o2'
+        tx_objs[obj_name] = self._create_ondisk_files(
+            tx_df_mgr, obj_name, policy, t2, (tx_node_index, rx_node_index,),
+            commit=False, frag_prefs=[])
+        rx_objs[obj_name] = self._create_ondisk_files(
+            rx_df_mgr, obj_name, policy, t2, (rx_node_index,), commit=False,
+            frag_prefs=[])
+
+        # o3 durable on tx and missing on rx, to check the include_non_durable
+        # does not exclude durables
+        t3 = next(self.ts_iter)
+        obj_name = 'o3'
+        tx_objs[obj_name] = self._create_ondisk_files(
+            tx_df_mgr, obj_name, policy, t3, (tx_node_index, rx_node_index,))
+        expected_subreqs['PUT'].append(obj_name)
+
+        suffixes = set()
+        for diskfiles in tx_objs.values():
+            for df in diskfiles:
+                suffixes.add(os.path.basename(os.path.dirname(df._datadir)))
+
+        # create ssync sender instance...with include_non_durable
+        job = {'device': self.device,
+               'partition': self.partition,
+               'policy': policy,
+               'frag_index': frag_index}
+        node = dict(self.rx_node)
+        sender = ssync_sender.Sender(self.daemon, node, job, suffixes,
+                                     include_non_durable=True)
+        # wrap connection from tx to rx to capture ssync messages...
+        sender.connect, trace = self.make_connect_wrapper(sender)
+
+        # run the sync protocol...
+        sender()
+
+        # verify protocol
+        results = self._analyze_trace(trace)
+        self.assertEqual(3, len(results['tx_missing']))
+        self.assertEqual(2, len(results['rx_missing']))
+        self.assertEqual(2, len(results['tx_updates']))
+        self.assertFalse(results['rx_updates'])
+        for subreq in results.get('tx_updates'):
+            obj = subreq['path'].split('/')[3]
+            method = subreq['method']
+            self.assertTrue(obj in expected_subreqs[method],
+                            'Unexpected %s subreq for object %s, expected %s'
+                            % (method, obj, expected_subreqs[method]))
+            expected_subreqs[method].remove(obj)
+            if method == 'PUT':
+                expected_body = self._get_object_data(
+                    subreq['path'], frag_index=rx_node_index)
+                self.assertEqual(expected_body, subreq['body'])
+        # verify all expected subreqs consumed
+        for _method, expected in expected_subreqs.items():
+            self.assertFalse(expected)
+
+        # verify on disk files...
+        # tx_objs.pop('o4')  # o4 should not have been sync'd
+        self._verify_ondisk_files(
+            tx_objs, policy, frag_index, rx_node_index, frag_prefs=[])
 
     def test_fragment_sync(self):
         # check that a sync_only type job does call reconstructor to build a
@@ -565,11 +650,12 @@ class TestSsyncEC(TestBaseSsyncEC):
 
         reconstruct_fa_calls = []
 
-        def fake_reconstruct_fa(job, node, metadata):
-            reconstruct_fa_calls.append((job, node, policy, metadata))
+        def fake_reconstruct_fa(job, node, df):
+            reconstruct_fa_calls.append((job, node, policy, df))
             if len(reconstruct_fa_calls) == 2:
                 # simulate second reconstruct failing
                 raise DiskFileError
+            metadata = df.get_datafile_metadata()
             content = self._get_object_data(metadata['name'],
                                             frag_index=rx_node_index)
             return RebuildingECDiskFileStream(
@@ -582,7 +668,6 @@ class TestSsyncEC(TestBaseSsyncEC):
                'frag_index': frag_index,
                'sync_diskfile_builder': fake_reconstruct_fa}
         node = dict(self.rx_node)
-        node.update({'index': rx_node_index})
         sender = ssync_sender.Sender(self.daemon, node, job, suffixes)
         # wrap connection from tx to rx to capture ssync messages...
         sender.connect, trace = self.make_connect_wrapper(sender)
@@ -615,7 +700,8 @@ class TestSsyncEC(TestBaseSsyncEC):
 
         # remove the failed df from expected synced df's
         expect_sync_paths = ['/a/c/o1', '/a/c/o2', '/a/c/o3', '/a/c/o5']
-        failed_path = reconstruct_fa_calls[1][3]['name']
+        failed_df = reconstruct_fa_calls[1][3]
+        failed_path = failed_df.get_datafile_metadata()['name']
         expect_sync_paths.remove(failed_path)
         failed_obj = None
         for obj, diskfiles in tx_objs.items():
@@ -666,15 +752,16 @@ class TestSsyncEC(TestBaseSsyncEC):
 
     def test_send_invalid_frag_index(self):
         policy = POLICIES.default
-        job = {'frag_index': 'Not a number',
+        job = {'frag_index': 'No one cares',
                'device': self.device,
                'partition': self.partition,
                'policy': policy}
+        self.rx_node['backend_index'] = 'Not a number'
         sender = ssync_sender.Sender(
             self.daemon, self.rx_node, job, ['abc'])
         success, _ = sender()
         self.assertFalse(success)
-        error_log_lines = self.daemon.logger.get_lines_for_level('error')
+        error_log_lines = self.logger.get_lines_for_level('error')
         self.assertEqual(1, len(error_log_lines))
         error_msg = error_log_lines[0]
         self.assertIn("Expected status 200; got 400", error_msg)
@@ -712,7 +799,6 @@ class TestSsyncEC(TestBaseSsyncEC):
                'policy': policy,
                'frag_index': frag_index}
         node = dict(self.rx_node)
-        node.update({'index': rx_node_index})
         sender = ssync_sender.Sender(self.daemon, node, job, suffixes)
         # wrap connection from tx to rx to capture ssync messages...
         sender.connect, trace = self.make_connect_wrapper(sender)
@@ -741,7 +827,7 @@ class TestSsyncEC(TestBaseSsyncEC):
             self.device, self.partition, suffixes, policy)
         rx_hashes = rx_df_mgr.get_hashes(
             self.device, self.partition, suffixes, policy)
-        self.assertEqual(suffixes, tx_hashes.keys())  # sanity
+        self.assertEqual(suffixes, list(tx_hashes.keys()))  # sanity
         self.assertEqual(tx_hashes, rx_hashes)
 
         # sanity check - run ssync again and expect no sync activity
@@ -756,31 +842,32 @@ class TestSsyncEC(TestBaseSsyncEC):
 
 
 class FakeResponse(object):
-    def __init__(self, frag_index, obj_data, length=None):
-        self.headers = {
-            'X-Object-Sysmeta-Ec-Frag-Index': str(frag_index),
-            'X-Object-Sysmeta-Ec-Etag': 'the etag',
-            'X-Backend-Timestamp': '1234567890.12345'
-        }
+    def __init__(self, frag_index, obj_data, length=None, status=200):
         self.frag_index = frag_index
         self.obj_data = obj_data
-        self.data = ''
+        self.data = b''
         self.length = length
+        self.status = status
 
-    def init(self, path):
+    def init(self, path, conf):
         if isinstance(self.obj_data, Exception):
             self.data = self.obj_data
         else:
             self.data = self.obj_data[path][self.frag_index]
+        self.conf = conf
 
     def getheaders(self):
-        return self.headers
+        return {
+            'X-Object-Sysmeta-Ec-Frag-Index': str(self.frag_index),
+            'X-Object-Sysmeta-Ec-Etag': 'the etag',
+            'X-Backend-Timestamp': self.conf['timestamp'].internal
+        }
 
     def read(self, length):
         if isinstance(self.data, Exception):
             raise self.data
         val = self.data
-        self.data = ''
+        self.data = b''
         return val if self.length is None else val[:self.length]
 
 
@@ -790,7 +877,9 @@ class TestSsyncECReconstructorSyncJob(TestBaseSsyncEC):
         self.rx_node_index = 0
         self.tx_node_index = 1
 
-        # create sender side diskfiles...
+        # create sender side diskfiles...ensure their timestamps are in the
+        # past so that tests that set reclaim_age=0 succeed in reclaiming
+        self.ts_iter = make_timestamp_iter(offset=-1000)
         self.tx_objs = {}
         tx_df_mgr = self.daemon._df_router[self.policy]
         t1 = next(self.ts_iter)
@@ -799,6 +888,8 @@ class TestSsyncECReconstructorSyncJob(TestBaseSsyncEC):
         t2 = next(self.ts_iter)
         self.tx_objs['o2'] = self._create_ondisk_files(
             tx_df_mgr, 'o2', self.policy, t2, (self.tx_node_index,))
+        self.response_confs = {'/a/c/o1': {'timestamp': t1},
+                               '/a/c/o2': {'timestamp': t2}}
 
         self.suffixes = set()
         for diskfiles in list(self.tx_objs.values()):
@@ -807,12 +898,12 @@ class TestSsyncECReconstructorSyncJob(TestBaseSsyncEC):
                     os.path.basename(os.path.dirname(df._datadir)))
 
         self.job_node = dict(self.rx_node)
-        self.job_node['index'] = self.rx_node_index
+        self.job_node['id'] = 0
 
         self.frag_length = int(
             self.tx_objs['o1'][0].get_metadata()['Content-Length'])
 
-    def _test_reconstructor_sync_job(self, frag_responses):
+    def _test_reconstructor_sync_job(self, frag_responses, custom_conf=None):
         # Helper method to mock reconstructor to consume given lists of fake
         # responses while reconstructing a fragment for a sync type job. The
         # tests verify that when the reconstructed fragment iter fails in some
@@ -820,25 +911,31 @@ class TestSsyncECReconstructorSyncJob(TestBaseSsyncEC):
         # node which have incorrect data.
         # See https://bugs.launchpad.net/swift/+bug/1631144
 
+        custom_conf = custom_conf if custom_conf else {}
         # frag_responses is a list of two lists of responses to each
         # reconstructor GET request for a fragment archive. The two items in
         # the outer list are lists of responses for each of the two fragments
-        # to be reconstructed. Items in the inner lists are responses for each
-        # of the other fragments fetched during the reconstructor rebuild.
+        # to be reconstructed, and are used in the order that ssync syncs the
+        # fragments. Items in the inner lists are responses for each of the
+        # other fragments fetched during the reconstructor rebuild.
         path_to_responses = {}
         fake_get_response_calls = []
 
-        def fake_get_response(recon, node, part, path, headers, policy):
+        def fake_get_response(recon, node, policy, part, path, headers):
             # select a list of fake responses for this path and return the next
-            # from the list
+            # from the list: we don't know the order in which paths will show
+            # up but we do want frag_responses[0] to be used first, so the
+            # frag_responses aren't bound to a path until this point
             if path not in path_to_responses:
                 path_to_responses[path] = frag_responses.pop(0)
             response = path_to_responses[path].pop()
-            # the frag_responses list is in ssync task order, we only know the
+            # the frag_responses list is in ssync task order: we only know the
             # path when consuming the responses so initialise the path in the
             # response now
             if response:
-                response.init(path)
+                response.init(path, self.response_confs[path])
+                # should be full path but just used for logging...
+                response.full_path = path
             fake_get_response_calls.append(path)
             return response
 
@@ -856,17 +953,19 @@ class TestSsyncECReconstructorSyncJob(TestBaseSsyncEC):
                 mock.patch.object(
                     self.policy.object_ring, 'get_part_nodes',
                     fake_get_part_nodes):
-            self.reconstructor = ObjectReconstructor(
-                {}, logger=debug_logger('test_reconstructor'))
+            conf = self.daemon_conf
+            conf.update(custom_conf)
+            self.reconstructor = ObjectReconstructor(conf, logger=self.logger)
             job = {
                 'device': self.device,
                 'partition': self.partition,
                 'policy': self.policy,
+                'frag_index': self.tx_node_index,
                 'sync_diskfile_builder':
                     self.reconstructor.reconstruct_fa
             }
             sender = ssync_sender.Sender(
-                self.daemon, self.job_node, job, self.suffixes)
+                self.reconstructor, self.job_node, job, self.suffixes)
             sender.connect, trace = self.make_connect_wrapper(sender)
             sender()
         return trace
@@ -887,18 +986,19 @@ class TestSsyncECReconstructorSyncJob(TestBaseSsyncEC):
                 df = self._open_rx_diskfile(
                     obj_name, self.policy, self.rx_node_index)
                 msgs.append('Unexpected rx diskfile for %r with content %r' %
-                            (obj_name, ''.join([d for d in df.reader()])))
+                            (obj_name, b''.join([d for d in df.reader()])))
             except DiskFileNotExist:
                 pass  # expected outcome
         if msgs:
             self.fail('Failed with:\n%s' % '\n'.join(msgs))
-        log_lines = self.daemon.logger.get_lines_for_level('error')
+        log_lines = self.logger.get_lines_for_level('error')
         self.assertIn('Sent data length does not match content-length',
                       log_lines[0])
         self.assertFalse(log_lines[1:])
         # trampoline for the receiver to write a log
         eventlet.sleep(0)
         log_lines = self.rx_logger.get_lines_for_level('warning')
+        self.assertEqual(1, len(log_lines), self.rx_logger.all_log_lines())
         self.assertIn('ssync subrequest failed with 499',
                       log_lines[0])
         self.assertFalse(log_lines[1:])
@@ -921,12 +1021,12 @@ class TestSsyncECReconstructorSyncJob(TestBaseSsyncEC):
                 df = self._open_rx_diskfile(
                     obj_name, self.policy, self.rx_node_index)
                 msgs.append('Unexpected rx diskfile for %r with content %r' %
-                            (obj_name, ''.join([d for d in df.reader()])))
+                            (obj_name, b''.join([d for d in df.reader()])))
             except DiskFileNotExist:
                 pass  # expected outcome
         if msgs:
             self.fail('Failed with:\n%s' % '\n'.join(msgs))
-        log_lines = self.daemon.logger.get_lines_for_level('error')
+        log_lines = self.logger.get_lines_for_level('error')
         self.assertIn('Sent data length does not match content-length',
                       log_lines[0])
         self.assertFalse(log_lines[1:])
@@ -956,25 +1056,26 @@ class TestSsyncECReconstructorSyncJob(TestBaseSsyncEC):
             [FakeResponse(i, self.obj_data)
              for i in range(self.policy.ec_ndata + self.policy.ec_nparity)]]
 
-        self._test_reconstructor_sync_job(frag_responses)
+        with quiet_eventlet_exceptions():
+            self._test_reconstructor_sync_job(frag_responses)
+
         msgs = []
         for obj_name in ('o1', 'o2'):
             try:
                 df = self._open_rx_diskfile(
                     obj_name, self.policy, self.rx_node_index)
                 msgs.append('Unexpected rx diskfile for %r with content %r' %
-                            (obj_name, ''.join([d for d in df.reader()])))
+                            (obj_name, b''.join([d for d in df.reader()])))
             except DiskFileNotExist:
                 pass  # expected outcome
         if msgs:
             self.fail('Failed with:\n%s' % '\n'.join(msgs))
 
-        log_lines = self.reconstructor.logger.get_lines_for_level('error')
+        log_lines = self.logger.get_lines_for_level('error')
         self.assertIn('Error trying to rebuild', log_lines[0])
-        log_lines = self.daemon.logger.get_lines_for_level('error')
         self.assertIn('Sent data length does not match content-length',
-                      log_lines[0])
-        self.assertFalse(log_lines[1:])
+                      log_lines[1])
+        self.assertFalse(log_lines[2:])
         # trampoline for the receiver to write a log
         eventlet.sleep(0)
         log_lines = self.rx_logger.get_lines_for_level('warning')
@@ -1011,7 +1112,7 @@ class TestSsyncECReconstructorSyncJob(TestBaseSsyncEC):
             self.assertEqual(
                 self._get_object_data(synced_obj_path,
                                       frag_index=self.rx_node_index),
-                ''.join([d for d in df.reader()]))
+                b''.join([d for d in df.reader()]))
         except DiskFileNotExist:
             msgs.append('Missing rx diskfile for %r' % obj_name)
 
@@ -1022,14 +1123,116 @@ class TestSsyncECReconstructorSyncJob(TestBaseSsyncEC):
             df = self._open_rx_diskfile(
                 obj_name, self.policy, self.rx_node_index)
             msgs.append('Unexpected rx diskfile for %r with content %r' %
-                        (obj_name, ''.join([d for d in df.reader()])))
+                        (obj_name, b''.join([d for d in df.reader()])))
         except DiskFileNotExist:
             pass  # expected outcome
         if msgs:
             self.fail('Failed with:\n%s' % '\n'.join(msgs))
-        self.assertFalse(self.daemon.logger.get_lines_for_level('error'))
-        log_lines = self.reconstructor.logger.get_lines_for_level('error')
+        log_lines = self.logger.get_lines_for_level('error')
         self.assertIn('Unable to get enough responses', log_lines[0])
+        # trampoline for the receiver to write a log
+        eventlet.sleep(0)
+        self.assertFalse(self.rx_logger.get_lines_for_level('warning'))
+        self.assertFalse(self.rx_logger.get_lines_for_level('error'))
+
+    def test_sync_reconstructor_quarantines_lonely_frag(self):
+        # First fragment to sync gets only one response for reconstructor to
+        # rebuild with, and that response is for the tx_node frag index: it
+        # should be quarantined, but after that the ssync session should still
+        # proceeed with rebuilding the second frag.
+        lonely_frag_responses = [
+            FakeResponse(i, self.obj_data, status=404)
+            for i in range(self.policy.ec_ndata + self.policy.ec_nparity)]
+        lonely_frag_responses[self.tx_node_index].status = 200
+        frag_responses = [
+            lonely_frag_responses,
+            [FakeResponse(i, self.obj_data)
+             for i in range(self.policy.ec_ndata + self.policy.ec_nparity)]]
+
+        # configure reconstructor to quarantine the lonely frag
+        custom_conf = {'reclaim_age': 0, 'quarantine_threshold': 1}
+        trace = self._test_reconstructor_sync_job(frag_responses, custom_conf)
+        results = self._analyze_trace(trace)
+        self.assertEqual(2, len(results['tx_missing']))
+        self.assertEqual(2, len(results['rx_missing']))
+        self.assertEqual(1, len(results['tx_updates']))
+        self.assertFalse(results['rx_updates'])
+        self.assertEqual('PUT', results['tx_updates'][0].get('method'))
+        synced_obj_path = results['tx_updates'][0].get('path')
+        synced_obj_name = synced_obj_path[-2:]
+
+        # verify that the second frag was rebuilt on rx node...
+        msgs = []
+        try:
+            df = self._open_rx_diskfile(
+                synced_obj_name, self.policy, self.rx_node_index)
+            self.assertEqual(
+                self._get_object_data(synced_obj_path,
+                                      frag_index=self.rx_node_index),
+                b''.join([d for d in df.reader()]))
+        except DiskFileNotExist:
+            msgs.append('Missing rx diskfile for %r' % synced_obj_name)
+        # ...and it is still on tx node...
+        try:
+            df = self._open_tx_diskfile(
+                synced_obj_name, self.policy, self.tx_node_index)
+            self.assertEqual(
+                self._get_object_data(df._name,
+                                      frag_index=self.tx_node_index),
+                b''.join([d for d in df.reader()]))
+        except DiskFileNotExist:
+            msgs.append('Missing tx diskfile for %r' % synced_obj_name)
+
+        # verify that the lonely frag was not rebuilt on rx node and was
+        # removed on tx node
+        obj_names = list(self.tx_objs)
+        obj_names.remove(synced_obj_name)
+        quarantined_obj_name = obj_names[0]
+        try:
+            df = self._open_rx_diskfile(
+                quarantined_obj_name, self.policy, self.rx_node_index)
+            msgs.append(
+                'Unexpected rx diskfile for %r with content %r' %
+                (quarantined_obj_name, b''.join([d for d in df.reader()])))
+        except DiskFileNotExist:
+            pass  # expected outcome
+        try:
+            df = self._open_tx_diskfile(
+                quarantined_obj_name, self.policy, self.tx_node_index)
+            msgs.append(
+                'Unexpected tx diskfile for %r with content %r' %
+                (quarantined_obj_name, b''.join([d for d in df.reader()])))
+        except DiskFileNotExist:
+            pass  # expected outcome
+
+        if msgs:
+            self.fail('Failed with:\n%s' % '\n'.join(msgs))
+        error_lines = self.logger.get_lines_for_level('error')
+        self.assertEqual(2, len(error_lines), error_lines)
+        self.assertIn('Unable to get enough responses', error_lines[0])
+        self.assertIn('Unable to get enough responses', error_lines[1])
+        warning_lines = self.logger.get_lines_for_level('warning')
+        self.assertEqual(1, len(warning_lines), warning_lines)
+        self.assertIn('Quarantined object', warning_lines[0])
+
+        # check we have a quarantined data file
+        df_mgr = self.daemon._df_router[self.policy]
+        quarantined_df = df_mgr.get_diskfile(
+            self.device, self.partition, account='a', container='c',
+            obj=quarantined_obj_name, policy=self.policy,
+            frag_index=self.tx_node_index)
+        df_hash = os.path.basename(quarantined_df._datadir)
+        quarantine_dir = os.path.join(
+            quarantined_df._device_path, 'quarantined',
+            diskfile.get_data_dir(self.policy), df_hash)
+        self.assertTrue(os.path.isdir(quarantine_dir))
+        data_file = os.listdir(quarantine_dir)[0]
+        with open(os.path.join(quarantine_dir, data_file), 'rb') as fd:
+            self.assertEqual(
+                self._get_object_data(quarantined_df._name,
+                                      frag_index=self.tx_node_index),
+                fd.read())
+
         # trampoline for the receiver to write a log
         eventlet.sleep(0)
         self.assertFalse(self.rx_logger.get_lines_for_level('warning'))
@@ -1058,14 +1261,14 @@ class TestSsyncECReconstructorSyncJob(TestBaseSsyncEC):
                 self.assertEqual(
                     self._get_object_data(df._name,
                                           frag_index=self.rx_node_index),
-                    ''.join([d for d in df.reader()]))
+                    b''.join([d for d in df.reader()]))
             except DiskFileNotExist:
                 msgs.append('Missing rx diskfile for %r' % obj_name)
         if msgs:
             self.fail('Failed with:\n%s' % '\n'.join(msgs))
-        self.assertFalse(self.daemon.logger.get_lines_for_level('error'))
+        self.assertFalse(self.logger.get_lines_for_level('error'))
         self.assertFalse(
-            self.reconstructor.logger.get_lines_for_level('error'))
+            self.logger.get_lines_for_level('error'))
         # trampoline for the receiver to write a log
         eventlet.sleep(0)
         self.assertFalse(self.rx_logger.get_lines_for_level('warning'))
@@ -1076,12 +1279,11 @@ class TestSsyncECReconstructorSyncJob(TestBaseSsyncEC):
 class TestSsyncReplication(TestBaseSsync):
     def setUp(self):
         super(TestSsyncReplication, self).setUp()
-        self.daemon = ObjectReplicator(self.daemon_conf,
-                                       debug_logger('test-ssync-sender'))
+        self.logger = debug_logger('test-ssync-sender')
+        self.daemon = ObjectReplicator(self.daemon_conf, self.logger)
 
     def test_sync(self):
         policy = POLICIES.default
-        rx_node_index = 0
 
         # create sender side diskfiles...
         tx_objs = {}
@@ -1135,7 +1337,6 @@ class TestSsyncReplication(TestBaseSsync):
                'partition': self.partition,
                'policy': policy}
         node = dict(self.rx_node)
-        node.update({'index': rx_node_index})
         sender = ssync_sender.Sender(self.daemon, node, job, suffixes)
         # wrap connection from tx to rx to capture ssync messages...
         sender.connect, trace = self.make_connect_wrapper(sender)
@@ -1203,7 +1404,6 @@ class TestSsyncReplication(TestBaseSsync):
 
     def test_meta_file_sync(self):
         policy = POLICIES.default
-        rx_node_index = 0
 
         # create diskfiles...
         tx_objs = {}
@@ -1237,19 +1437,21 @@ class TestSsyncReplication(TestBaseSsync):
         rx_objs['o2'] = self._create_ondisk_files(rx_df_mgr, 'o2', policy, t2)
         expected_subreqs['POST'].append('o2')
 
-        # o3 is on tx with meta, rx has newer data but no meta
+        # o3 is on tx with meta, rx has newer data but no meta,
+        # meta timestamp has an offset
         t3a = next(self.ts_iter)
         tx_objs['o3'] = self._create_ondisk_files(tx_df_mgr, 'o3', policy, t3a)
         t3b = next(self.ts_iter)
         rx_objs['o3'] = self._create_ondisk_files(rx_df_mgr, 'o3', policy, t3b)
         t3_meta = next(self.ts_iter)
+        t3_meta = utils.Timestamp(t3_meta, offset=2)
         metadata = {'X-Timestamp': t3_meta.internal,
                     'X-Object-Meta-Test': 'o3',
                     'X-Object-Sysmeta-Test': 'sys_o3'}
         tx_objs['o3'][0].write_metadata(metadata)
         expected_subreqs['POST'].append('o3')
 
-        # o4 is on tx with meta, rx has older data and up to date meta
+        # o4 is on tx with meta, rx has older data and up to date meta,
         t4a = next(self.ts_iter)
         rx_objs['o4'] = self._create_ondisk_files(rx_df_mgr, 'o4', policy, t4a)
         t4b = next(self.ts_iter)
@@ -1264,6 +1466,7 @@ class TestSsyncReplication(TestBaseSsync):
 
         # o5 is on tx with meta, rx is in sync with data and meta
         t5 = next(self.ts_iter)
+        t5 = utils.Timestamp(t5, offset=1)  # note: use an offset for this test
         rx_objs['o5'] = self._create_ondisk_files(rx_df_mgr, 'o5', policy, t5)
         tx_objs['o5'] = self._create_ondisk_files(tx_df_mgr, 'o5', policy, t5)
         t5_meta = next(self.ts_iter)
@@ -1298,6 +1501,25 @@ class TestSsyncReplication(TestBaseSsync):
         tx_objs['o7'][0].write_metadata(metadata)
         rx_tombstones['o7'][0].delete(next(self.ts_iter))
 
+        # o8 is on tx with meta, rx has in sync data but meta with different
+        # offset
+        t8 = next(self.ts_iter)
+        rx_objs['o8'] = self._create_ondisk_files(rx_df_mgr, 'o8', policy, t8)
+        tx_objs['o8'] = self._create_ondisk_files(tx_df_mgr, 'o8', policy, t8)
+        t8_meta = next(self.ts_iter)
+        t8_meta_offset = utils.Timestamp(t8_meta, offset=4)
+        metadata = {'X-Timestamp': t8_meta_offset.internal,
+                    'X-Object-Meta-Test': 'o8',
+                    'X-Object-Sysmeta-Test': 'sys_o8'}
+        tx_objs['o8'][0].write_metadata(metadata)
+        # different ts_meta offset on rx
+        t8_meta_offset = utils.Timestamp(t8_meta, offset=3)
+        metadata = {'X-Timestamp': t8_meta_offset.internal,
+                    'X-Object-Meta-Test': 'o8',
+                    'X-Object-Sysmeta-Test': 'sys_o8'}
+        rx_objs['o8'][0].write_metadata(metadata)
+        expected_subreqs['POST'].append('o8')
+
         suffixes = set()
         for diskfiles in list(tx_objs.values()) + list(tx_tombstones.values()):
             for df in diskfiles:
@@ -1308,7 +1530,6 @@ class TestSsyncReplication(TestBaseSsync):
                'partition': self.partition,
                'policy': policy}
         node = dict(self.rx_node)
-        node.update({'index': rx_node_index})
         sender = ssync_sender.Sender(self.daemon, node, job, suffixes)
         # wrap connection from tx to rx to capture ssync messages...
         sender.connect, trace = self.make_connect_wrapper(sender)
@@ -1316,13 +1537,13 @@ class TestSsyncReplication(TestBaseSsync):
         # run the sync protocol...
         success, in_sync_objs = sender()
 
-        self.assertEqual(7, len(in_sync_objs))
+        self.assertEqual(8, len(in_sync_objs))
         self.assertTrue(success)
 
         # verify protocol
         results = self._analyze_trace(trace)
-        self.assertEqual(7, len(results['tx_missing']))
-        self.assertEqual(5, len(results['rx_missing']))
+        self.assertEqual(8, len(results['tx_missing']))
+        self.assertEqual(6, len(results['rx_missing']))
         for subreq in results.get('tx_updates'):
             obj = subreq['path'].split('/')[3]
             method = subreq['method']
@@ -1351,7 +1572,6 @@ class TestSsyncReplication(TestBaseSsync):
     def test_expired_object(self):
         # verify that expired objects sync
         policy = POLICIES.default
-        rx_node_index = 0
         tx_df_mgr = self.daemon._df_router[policy]
         t1 = next(self.ts_iter)
         obj_name = 'o1'
@@ -1369,7 +1589,6 @@ class TestSsyncReplication(TestBaseSsync):
                'partition': self.partition,
                'policy': policy}
         node = dict(self.rx_node)
-        node.update({'index': rx_node_index})
         sender = ssync_sender.Sender(self.daemon, node, job, suffixes)
         # wrap connection from tx to rx to capture ssync messages...
         sender.connect, trace = self.make_connect_wrapper(sender)
@@ -1386,7 +1605,6 @@ class TestSsyncReplication(TestBaseSsync):
     def _check_no_longer_expired_object(self, obj_name, df, policy):
         # verify that objects with x-delete-at metadata that are not expired
         # can be sync'd
-        rx_node_index = 0
 
         def do_ssync():
             # create ssync sender instance...
@@ -1395,7 +1613,6 @@ class TestSsyncReplication(TestBaseSsync):
                    'partition': self.partition,
                    'policy': policy}
             node = dict(self.rx_node)
-            node.update({'index': rx_node_index})
             sender = ssync_sender.Sender(self.daemon, node, job, suffixes)
             # wrap connection from tx to rx to capture ssync messages...
             sender.connect, trace = self.make_connect_wrapper(sender)
@@ -1479,7 +1696,6 @@ class TestSsyncReplication(TestBaseSsync):
         # verify that the sender does sync a data file to a legacy receiver,
         # but does not PUT meta file content to a legacy receiver
         policy = POLICIES.default
-        rx_node_index = 0
 
         # create diskfiles...
         tx_df_mgr = self.daemon._df_router[policy]
@@ -1503,14 +1719,13 @@ class TestSsyncReplication(TestBaseSsync):
                'partition': self.partition,
                'policy': policy}
         node = dict(self.rx_node)
-        node.update({'index': rx_node_index})
         sender = ssync_sender.Sender(self.daemon, node, job, suffixes)
         # wrap connection from tx to rx to capture ssync messages...
         sender.connect, trace = self.make_connect_wrapper(sender)
 
         def _legacy_check_missing(self, line):
             # reproduces behavior of 'legacy' ssync receiver missing_checks()
-            parts = line.split()
+            parts = line.decode('ascii').split()
             object_hash = urllib.parse.unquote(parts[0])
             timestamp = urllib.parse.unquote(parts[1])
             want = False
@@ -1562,7 +1777,6 @@ class TestSsyncReplication(TestBaseSsync):
 
     def test_content_type_sync(self):
         policy = POLICIES.default
-        rx_node_index = 0
 
         # create diskfiles...
         tx_objs = {}
@@ -1574,14 +1788,14 @@ class TestSsyncReplication(TestBaseSsync):
 
         # o1 on tx only with two meta files
         name = 'o1'
-        t1 = self.ts_iter.next()
+        t1 = next(self.ts_iter)
         tx_objs[name] = self._create_ondisk_files(tx_df_mgr, name, policy, t1)
-        t1_type = self.ts_iter.next()
+        t1_type = next(self.ts_iter)
         metadata_1 = {'X-Timestamp': t1_type.internal,
                       'Content-Type': 'text/test',
                       'Content-Type-Timestamp': t1_type.internal}
         tx_objs[name][0].write_metadata(metadata_1)
-        t1_meta = self.ts_iter.next()
+        t1_meta = next(self.ts_iter)
         metadata_2 = {'X-Timestamp': t1_meta.internal,
                       'X-Object-Meta-Test': name}
         tx_objs[name][0].write_metadata(metadata_2)
@@ -1591,14 +1805,14 @@ class TestSsyncReplication(TestBaseSsync):
         # o2 on tx with two meta files, rx has .data and newest .meta but is
         # missing latest content-type
         name = 'o2'
-        t2 = self.ts_iter.next()
+        t2 = next(self.ts_iter)
         tx_objs[name] = self._create_ondisk_files(tx_df_mgr, name, policy, t2)
-        t2_type = self.ts_iter.next()
+        t2_type = next(self.ts_iter)
         metadata_1 = {'X-Timestamp': t2_type.internal,
                       'Content-Type': 'text/test',
                       'Content-Type-Timestamp': t2_type.internal}
         tx_objs[name][0].write_metadata(metadata_1)
-        t2_meta = self.ts_iter.next()
+        t2_meta = next(self.ts_iter)
         metadata_2 = {'X-Timestamp': t2_meta.internal,
                       'X-Object-Meta-Test': name}
         tx_objs[name][0].write_metadata(metadata_2)
@@ -1609,14 +1823,14 @@ class TestSsyncReplication(TestBaseSsync):
         # o3 on tx with two meta files, rx has .data and one .meta but does
         # have latest content-type so nothing to sync
         name = 'o3'
-        t3 = self.ts_iter.next()
+        t3 = next(self.ts_iter)
         tx_objs[name] = self._create_ondisk_files(tx_df_mgr, name, policy, t3)
-        t3_type = self.ts_iter.next()
+        t3_type = next(self.ts_iter)
         metadata_1 = {'X-Timestamp': t3_type.internal,
                       'Content-Type': 'text/test',
                       'Content-Type-Timestamp': t3_type.internal}
         tx_objs[name][0].write_metadata(metadata_1)
-        t3_meta = self.ts_iter.next()
+        t3_meta = next(self.ts_iter)
         metadata_2 = {'X-Timestamp': t3_meta.internal,
                       'X-Object-Meta-Test': name}
         tx_objs[name][0].write_metadata(metadata_2)
@@ -1631,10 +1845,10 @@ class TestSsyncReplication(TestBaseSsync):
         # .data and two .meta having latest content-type so nothing to sync
         # i.e. o4 is the reverse of o3 scenario
         name = 'o4'
-        t4 = self.ts_iter.next()
+        t4 = next(self.ts_iter)
         tx_objs[name] = self._create_ondisk_files(tx_df_mgr, name, policy, t4)
-        t4_type = self.ts_iter.next()
-        t4_meta = self.ts_iter.next()
+        t4_type = next(self.ts_iter)
+        t4_meta = next(self.ts_iter)
         metadata_2b = {'X-Timestamp': t4_meta.internal,
                        'X-Object-Meta-Test': name,
                        'Content-Type': 'text/test',
@@ -1652,10 +1866,10 @@ class TestSsyncReplication(TestBaseSsync):
         # o5 on tx with one meta file having latest content-type, rx has
         # .data and no .meta
         name = 'o5'
-        t5 = self.ts_iter.next()
+        t5 = next(self.ts_iter)
         tx_objs[name] = self._create_ondisk_files(tx_df_mgr, name, policy, t5)
-        t5_type = self.ts_iter.next()
-        t5_meta = self.ts_iter.next()
+        t5_type = next(self.ts_iter)
+        t5_meta = next(self.ts_iter)
         metadata = {'X-Timestamp': t5_meta.internal,
                     'X-Object-Meta-Test': name,
                     'Content-Type': 'text/test',
@@ -1674,7 +1888,6 @@ class TestSsyncReplication(TestBaseSsync):
                'partition': self.partition,
                'policy': policy}
         node = dict(self.rx_node)
-        node.update({'index': rx_node_index})
         sender = ssync_sender.Sender(self.daemon, node, job, suffixes)
         # wrap connection from tx to rx to capture ssync messages...
         sender.connect, trace = self.make_connect_wrapper(sender)
@@ -1719,6 +1932,7 @@ class TestSsyncReplication(TestBaseSsync):
         rx_hashes = rx_df_mgr.get_hashes(
             self.device, self.partition, suffixes, policy)
         self.assertEqual(tx_hashes, rx_hashes)
+
 
 if __name__ == '__main__':
     unittest.main()

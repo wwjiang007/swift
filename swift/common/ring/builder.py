@@ -33,9 +33,9 @@ from six.moves import range
 from time import time
 
 from swift.common import exceptions
-from swift.common.ring import RingData
+from swift.common.ring.ring import RingData
 from swift.common.ring.utils import tiers_for_dev, build_tier_tree, \
-    validate_and_normalize_address, pretty_dev
+    validate_and_normalize_address, validate_replicas_by_tier, pretty_dev
 
 # we can't store None's in the replica2part2dev array, so we high-jack
 # the max value for magic to represent the part is not currently
@@ -47,16 +47,6 @@ MAX_BALANCE_GATHER_COUNT = 3
 
 class RingValidationWarning(Warning):
     pass
-
-
-try:
-    # python 2.7+
-    from logging import NullHandler
-except ImportError:
-    # python 2.6
-    class NullHandler(logging.Handler):
-        def emit(self, *a, **kw):
-            pass
 
 
 @contextlib.contextmanager
@@ -96,6 +86,9 @@ class RingBuilder(object):
     def __init__(self, part_power, replicas, min_part_hours):
         if part_power > 32:
             raise ValueError("part_power must be at most 32 (was %d)"
+                             % (part_power,))
+        if part_power < 0:
+            raise ValueError("part_power must be at least 0 (was %d)"
                              % (part_power,))
         if replicas < 1:
             raise ValueError("replicas must be at least 1 (was %.6f)"
@@ -148,7 +141,7 @@ class RingBuilder(object):
         if not self.logger.handlers:
             self.logger.disabled = True
             # silence "no handler for X" error messages
-            self.logger.addHandler(NullHandler())
+            self.logger.addHandler(logging.NullHandler())
 
     @property
     def id(self):
@@ -188,16 +181,16 @@ class RingBuilder(object):
     @contextmanager
     def debug(self):
         """
-        Temporarily enables debug logging, useful in tests, e.g.
+        Temporarily enables debug logging, useful in tests, e.g.::
 
             with rb.debug():
                 rb.rebalance()
         """
-        self.logger.disabled = False
+        old_val, self.logger.disabled = self.logger.disabled, False
         try:
             yield
         finally:
-            self.logger.disabled = True
+            self.logger.disabled = old_val
 
     @property
     def min_part_seconds_left(self):
@@ -247,7 +240,11 @@ class RingBuilder(object):
             self.version = builder.version
             self._replica2part2dev = builder._replica2part2dev
             self._last_part_moves_epoch = builder._last_part_moves_epoch
-            self._last_part_moves = builder._last_part_moves
+            if builder._last_part_moves is None:
+                self._last_part_moves = array(
+                    'B', itertools.repeat(0, self.parts))
+            else:
+                self._last_part_moves = builder._last_part_moves
             self._last_part_gather_start = builder._last_part_gather_start
             self._remove_devs = builder._remove_devs
             self._id = getattr(builder, '_id', None)
@@ -263,7 +260,11 @@ class RingBuilder(object):
             self.version = builder['version']
             self._replica2part2dev = builder['_replica2part2dev']
             self._last_part_moves_epoch = builder['_last_part_moves_epoch']
-            self._last_part_moves = builder['_last_part_moves']
+            if builder['_last_part_moves'] is None:
+                self._last_part_moves = array(
+                    'B', itertools.repeat(0, self.parts))
+            else:
+                self._last_part_moves = builder['_last_part_moves']
             self._last_part_gather_start = builder['_last_part_gather_start']
             self._dispersion_graph = builder.get('_dispersion_graph', {})
             self.dispersion = builder.get('dispersion')
@@ -366,13 +367,15 @@ class RingBuilder(object):
             # shift an unsigned int >I right to obtain the partition for the
             # int).
             if not self._replica2part2dev:
-                self._ring = RingData([], devs, self.part_shift)
+                self._ring = RingData([], devs, self.part_shift,
+                                      version=self.version)
             else:
                 self._ring = \
                     RingData([array('H', p2d) for p2d in
                               self._replica2part2dev],
                              devs, self.part_shift,
-                             self.next_part_power)
+                             self.next_part_power,
+                             self.version)
         return self._ring
 
     def add_dev(self, dev):
@@ -419,11 +422,11 @@ class RingBuilder(object):
         # Add holes to self.devs to ensure self.devs[dev['id']] will be the dev
         while dev['id'] >= len(self.devs):
             self.devs.append(None)
-        required_keys = ('ip', 'port', 'weight')
-        if any(required not in dev for required in required_keys):
-            raise ValueError(
-                '%r is missing at least one the required key %r' % (
-                    dev, required_keys))
+        required_keys = ('region', 'zone', 'ip', 'port', 'device', 'weight')
+        missing = tuple(key for key in required_keys if key not in dev)
+        if missing:
+            raise ValueError('%r is missing required key(s): %s' % (
+                dev, ', '.join(missing)))
         dev['weight'] = float(dev['weight'])
         dev['parts'] = 0
         dev.setdefault('meta', '')
@@ -449,6 +452,46 @@ class RingBuilder(object):
             raise ValueError("Can not set weight of dev_id %s because it "
                              "is marked for removal" % (dev_id,))
         self.devs[dev_id]['weight'] = weight
+        self.devs_changed = True
+        self.version += 1
+
+    def set_dev_region(self, dev_id, region):
+        """
+        Set the region of a device. This should be called rather than just
+        altering the region key in the device dict directly, as the builder
+        will need to rebuild some internal state to reflect the change.
+
+        .. note::
+            This will not rebalance the ring immediately as you may want to
+            make multiple changes for a single rebalance.
+
+        :param dev_id: device id
+        :param region: new region for device
+        """
+        if any(dev_id == d['id'] for d in self._remove_devs):
+            raise ValueError("Can not set region of dev_id %s because it "
+                             "is marked for removal" % (dev_id,))
+        self.devs[dev_id]['region'] = region
+        self.devs_changed = True
+        self.version += 1
+
+    def set_dev_zone(self, dev_id, zone):
+        """
+        Set the zone of a device. This should be called rather than just
+        altering the zone key in the device dict directly, as the builder
+        will need to rebuild some internal state to reflect the change.
+
+        .. note::
+            This will not rebalance the ring immediately as you may want to
+            make multiple changes for a single rebalance.
+
+        :param dev_id: device id
+        :param zone: new zone for device
+        """
+        if any(dev_id == d['id'] for d in self._remove_devs):
+            raise ValueError("Can not set zone of dev_id %s because it "
+                             "is marked for removal" % (dev_id,))
+        self.devs[dev_id]['zone'] = zone
         self.devs_changed = True
         self.version += 1
 
@@ -555,7 +598,6 @@ class RingBuilder(object):
                 {'status': finish_status, 'count': gather_count + 1})
 
         self.devs_changed = False
-        self.version += 1
         changed_parts = self._build_dispersion_graph(old_replica2part2dev)
 
         # clean up the cache
@@ -623,22 +665,23 @@ class RingBuilder(object):
 
                 if old_device != dev['id']:
                     changed_parts += 1
-            part_at_risk = False
             # update running totals for each tiers' number of parts with a
             # given replica count
+            part_risk_depth = defaultdict(int)
+            part_risk_depth[0] = 0
             for tier, replicas in replicas_at_tier.items():
                 if tier not in dispersion_graph:
                     dispersion_graph[tier] = [self.parts] + [0] * int_replicas
                 dispersion_graph[tier][0] -= 1
                 dispersion_graph[tier][replicas] += 1
                 if replicas > max_allowed_replicas[tier]:
-                    part_at_risk = True
-            # this part may be at risk in multiple tiers, but we only count it
-            # as at_risk once
-            if part_at_risk:
-                parts_at_risk += 1
+                    part_risk_depth[len(tier)] += (
+                        replicas - max_allowed_replicas[tier])
+            # count each part-replica once at tier where dispersion is worst
+            parts_at_risk += max(part_risk_depth.values())
         self._dispersion_graph = dispersion_graph
-        self.dispersion = 100.0 * parts_at_risk / self.parts
+        self.dispersion = 100.0 * parts_at_risk / (self.parts * self.replicas)
+        self.version += 1
         return changed_parts
 
     def validate(self, stats=False):
@@ -688,7 +731,7 @@ class RingBuilder(object):
                     (dev['id'], dev['port']))
 
         int_replicas = int(math.ceil(self.replicas))
-        rep2part_len = map(len, self._replica2part2dev)
+        rep2part_len = list(map(len, self._replica2part2dev))
         # check the assignments of each part's replicas
         for part in range(self.parts):
             devs_for_part = []
@@ -864,7 +907,7 @@ class RingBuilder(object):
         device is "overweight" and wishes to give partitions away if possible.
 
         :param replica_plan: a dict of dicts, as returned from
-                             _build_replica_plan, that that maps
+                             _build_replica_plan, that maps
                              each tier to it's target replicanths.
         """
         tier2children = self._build_tier2children()
@@ -924,7 +967,7 @@ class RingBuilder(object):
         more recently than min_part_hours.
         """
         self._part_moved_bitmap = bytearray(max(2 ** (self.part_power - 3), 1))
-        elapsed_hours = int(time() - self._last_part_moves_epoch) / 3600
+        elapsed_hours = int(time() - self._last_part_moves_epoch) // 3600
         if elapsed_hours <= 0:
             return
         for part in range(self.parts):
@@ -1174,7 +1217,7 @@ class RingBuilder(object):
         """
         # pick a random starting point on the other side of the ring
         quarter_turn = (self.parts // 4)
-        random_half = random.randint(0, self.parts / 2)
+        random_half = random.randint(0, self.parts // 2)
         start = (self._last_part_gather_start + quarter_turn +
                  random_half) % self.parts
         self.logger.debug('Gather start is %(start)s '
@@ -1397,17 +1440,17 @@ class RingBuilder(object):
             {(): 3.0,
             (1,): 3.0,
             (1, 1): 1.0,
-            (1, 1, '127.0.0.1:6010'): 1.0,
-            (1, 1, '127.0.0.1:6010', 0): 1.0,
+            (1, 1, '127.0.0.1:6210'): 1.0,
+            (1, 1, '127.0.0.1:6210', 0): 1.0,
             (1, 2): 1.0,
-            (1, 2, '127.0.0.1:6020'): 1.0,
-            (1, 2, '127.0.0.1:6020', 1): 1.0,
+            (1, 2, '127.0.0.1:6220'): 1.0,
+            (1, 2, '127.0.0.1:6220', 1): 1.0,
             (1, 3): 1.0,
-            (1, 3, '127.0.0.1:6030'): 1.0,
-            (1, 3, '127.0.0.1:6030', 2): 1.0,
+            (1, 3, '127.0.0.1:6230'): 1.0,
+            (1, 3, '127.0.0.1:6230', 2): 1.0,
             (1, 4): 1.0,
-            (1, 4, '127.0.0.1:6040'): 1.0,
-            (1, 4, '127.0.0.1:6040', 3): 1.0}
+            (1, 4, '127.0.0.1:6240'): 1.0,
+            (1, 4, '127.0.0.1:6240', 3): 1.0}
 
         """
         # Used by walk_tree to know what entries to create for each recursive
@@ -1475,14 +1518,7 @@ class RingBuilder(object):
         # belts & suspenders/paranoia -  at every level, the sum of
         # weighted_replicas should be very close to the total number of
         # replicas for the ring
-        tiers = ['cluster', 'regions', 'zones', 'servers', 'devices']
-        for i, tier_name in enumerate(tiers):
-            replicas_at_tier = sum(weighted_replicas_by_tier[t] for t in
-                                   weighted_replicas_by_tier if len(t) == i)
-            if abs(self.replicas - replicas_at_tier) > 1e-10:
-                raise exceptions.RingValidationError(
-                    '%s != %s at tier %s' % (
-                        replicas_at_tier, self.replicas, tier_name))
+        validate_replicas_by_tier(self.replicas, weighted_replicas_by_tier)
 
         return weighted_replicas_by_tier
 
@@ -1585,14 +1621,7 @@ class RingBuilder(object):
         # belts & suspenders/paranoia -  at every level, the sum of
         # wanted_replicas should be very close to the total number of
         # replicas for the ring
-        tiers = ['cluster', 'regions', 'zones', 'servers', 'devices']
-        for i, tier_name in enumerate(tiers):
-            replicas_at_tier = sum(wanted_replicas[t] for t in
-                                   wanted_replicas if len(t) == i)
-            if abs(self.replicas - replicas_at_tier) > 1e-10:
-                raise exceptions.RingValidationError(
-                    '%s != %s at tier %s' % (
-                        replicas_at_tier, self.replicas, tier_name))
+        validate_replicas_by_tier(self.replicas, wanted_replicas)
 
         return wanted_replicas
 
@@ -1621,14 +1650,7 @@ class RingBuilder(object):
         # belts & suspenders/paranoia -  at every level, the sum of
         # target_replicas should be very close to the total number
         # of replicas for the ring
-        tiers = ['cluster', 'regions', 'zones', 'servers', 'devices']
-        for i, tier_name in enumerate(tiers):
-            replicas_at_tier = sum(target_replicas[t] for t in
-                                   target_replicas if len(t) == i)
-            if abs(self.replicas - replicas_at_tier) > 1e-10:
-                raise exceptions.RingValidationError(
-                    '%s != %s at tier %s' % (
-                        replicas_at_tier, self.replicas, tier_name))
+        validate_replicas_by_tier(self.replicas, target_replicas)
 
         return target_replicas
 
