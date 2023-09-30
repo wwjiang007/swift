@@ -101,6 +101,11 @@ class ObjectVersioningBaseTestCase(unittest.TestCase):
         self.cache_version_off.set(
             get_cache_key('a', self.build_container_name('c')),
             {'status': 200})
+
+        self.cache_version_never_on = FakeMemcache()
+        self.cache_version_never_on.set(get_cache_key('a'), {'status': 200})
+        self.cache_version_never_on.set(get_cache_key('a', 'c'),
+                                        {'status': 200})
         self.expected_unread_requests = {}
 
     def tearDown(self):
@@ -109,6 +114,7 @@ class ObjectVersioningBaseTestCase(unittest.TestCase):
                          self.expected_unread_requests)
 
     def call_ov(self, req):
+        # authorized gets reset everytime
         self.authorized = []
 
         def authorize(req):
@@ -547,6 +553,20 @@ class ObjectVersioningTestCase(ObjectVersioningBaseTestCase):
         self.assertIn(
             ('X-Symlink-Target', 'c/o?version-id=0000001234.00000'),
             headers)
+        self.assertEqual(body, b'')
+        # N.B. HEAD req already works with existing registered GET response
+        req = Request.blank(
+            '/v1/a/c/o?symlink=get', method='HEAD',
+            environ={'swift.cache': self.cache_version_on})
+        status, headers, body = self.call_ov(req)
+        self.assertEqual(status, '200 OK')
+        self.assertEqual(len(self.authorized), 1)
+        self.assertRequestEqual(req, self.authorized[0])
+        self.assertIn(('X-Object-Version-Id', '0000001234.00000'), headers)
+        self.assertIn(
+            ('X-Symlink-Target', 'c/o?version-id=0000001234.00000'),
+            headers)
+        self.assertEqual(body, b'')
 
     def test_put_object_no_versioning(self):
         self.app.register(
@@ -1884,7 +1904,7 @@ class ObjectVersioningTestVersionAPI(ObjectVersioningBaseTestCase):
         status, headers, body = self.call_ov(req)
         self.assertEqual(status, '400 Bad Request')
 
-    def test_GET(self):
+    def test_GET_and_HEAD(self):
         self.app.register(
             'GET',
             self.build_versions_path(obj='o', version='9999999939.99999'),
@@ -1898,6 +1918,16 @@ class ObjectVersioningTestVersionAPI(ObjectVersioningBaseTestCase):
         self.assertIn(('X-Object-Version-Id', '0000000060.00000'),
                       headers)
         self.assertEqual(b'foobar', body)
+        # HEAD with same params find same registered GET
+        req = Request.blank(
+            '/v1/a/c/o', method='HEAD',
+            environ={'swift.cache': self.cache_version_on},
+            params={'version-id': '0000000060.00000'})
+        status, headers, body = self.call_ov(req)
+        self.assertEqual(status, '200 OK')
+        self.assertIn(('X-Object-Version-Id', '0000000060.00000'),
+                      headers)
+        self.assertEqual(b'', body)
 
     def test_GET_404(self):
         self.app.register(
@@ -1938,12 +1968,25 @@ class ObjectVersioningTestVersionAPI(ObjectVersioningBaseTestCase):
             '/v1/a/c/o', method='GET',
             environ={'swift.cache': self.cache_version_on},
             params={'version-id': 'null'})
+        # N.B. GET w/ query param found registered raw_path GET
         status, headers, body = self.call_ov(req)
         self.assertEqual(status, '200 OK')
         self.assertEqual(1, len(self.authorized))
+        self.assertRequestEqual(req, self.authorized[0])
         self.assertEqual(1, len(self.app.calls))
         self.assertIn(('X-Object-Version-Id', 'null'), headers)
         self.assertEqual(b'foobar', body)
+        # and HEAD w/ same params finds same registered GET
+        req = Request.blank(
+            '/v1/a/c/o?version-id=null', method='HEAD',
+            environ={'swift.cache': self.cache_version_on})
+        status, headers, body = self.call_ov(req)
+        self.assertEqual(status, '200 OK')
+        self.assertEqual(len(self.authorized), 1)
+        self.assertRequestEqual(req, self.authorized[0])
+        self.assertEqual(2, len(self.app.calls))
+        self.assertIn(('X-Object-Version-Id', 'null'), headers)
+        self.assertEqual(b'', body)
 
     def test_GET_null_id_versioned_obj(self):
         self.app.register(
@@ -1974,7 +2017,21 @@ class ObjectVersioningTestVersionAPI(ObjectVersioningBaseTestCase):
         status, headers, body = self.call_ov(req)
         self.assertEqual(status, '404 Not Found')
         self.assertEqual(1, len(self.authorized))
+        self.assertRequestEqual(req, self.authorized[0])
         self.assertEqual(1, len(self.app.calls))
+        self.assertNotIn(('X-Object-Version-Id', 'null'), headers)
+        # and HEAD w/ same params finds same registered GET
+        # we have test_HEAD_null_id, the following test is meant to illustrate
+        # that FakeSwift works for HEADs even if only GETs are registered.
+        req = Request.blank(
+            '/v1/a/c/o', method='HEAD',
+            environ={'swift.cache': self.cache_version_on},
+            params={'version-id': 'null'})
+        status, headers, body = self.call_ov(req)
+        self.assertEqual(status, '404 Not Found')
+        self.assertEqual(1, len(self.authorized))
+        self.assertRequestEqual(req, self.authorized[0])
+        self.assertEqual(2, len(self.app.calls))
         self.assertNotIn(('X-Object-Version-Id', 'null'), headers)
 
     def test_HEAD_null_id(self):
@@ -1990,6 +2047,13 @@ class ObjectVersioningTestVersionAPI(ObjectVersioningBaseTestCase):
         self.assertEqual(1, len(self.app.calls))
         self.assertIn(('X-Object-Version-Id', 'null'), headers)
         self.assertIn(('X-Object-Meta-Foo', 'bar'), headers)
+        # N.B. GET on explicitly registered HEAD raised KeyError
+        req = Request.blank(
+            '/v1/a/c/o', method='GET',
+            environ={'swift.cache': self.cache_version_on},
+            params={'version-id': 'null'})
+        with self.assertRaises(KeyError):
+            status, headers, body = self.call_ov(req)
 
     def test_HEAD_delete_marker(self):
         self.app.register(
@@ -2998,6 +3062,73 @@ class ObjectVersioningTestContainerOperations(ObjectVersioningBaseTestCase):
             'is_latest': True,
         }]
         self.assertEqual(expected, json.loads(body))
+
+    def test_list_versions_never_enabled(self):
+        listing_body = [{
+            'bytes': 8,
+            'name': 'my-other-object',
+            'hash': 'ebdd8d46ecb4a07f6c433d67eb05d5f3',
+            'last_modified': '1970-01-01T00:00:05.000000',
+            'content_type': 'application/bar',
+        }, {
+            'bytes': 9,
+            'name': 'obj',
+            'hash': 'e55cedc11adb39c404b7365f7d6291fa',
+            'last_modified': '1970-01-01T00:00:20.000000',
+            'content_type': 'text/plain',
+        }]
+
+        self.app.register(
+            'GET', self.build_versions_path(), swob.HTTPNotFound, {}, '')
+        self.app.register(
+            'GET', '/v1/a/c', swob.HTTPOk, {},
+            json.dumps(listing_body).encode('utf8'))
+        req = Request.blank(
+            '/v1/a/c?versions',
+            environ={'REQUEST_METHOD': 'GET',
+                     'swift.cache': self.cache_version_never_on})
+        status, headers, body = self.call_ov(req)
+        self.assertEqual(status, '200 OK')
+        self.assertNotIn('x-versions-enabled', [h.lower() for h, _ in headers])
+        self.assertEqual(len(self.authorized), 1)
+        self.assertRequestEqual(req, self.authorized[0])
+        expected = [{
+            'bytes': 8,
+            'name': 'my-other-object',
+            'version_id': 'null',
+            'hash': 'ebdd8d46ecb4a07f6c433d67eb05d5f3',
+            'last_modified': '1970-01-01T00:00:05.000000',
+            'content_type': 'application/bar',
+            'is_latest': True,
+        }, {
+            'bytes': 9,
+            'name': 'obj',
+            'version_id': 'null',
+            'hash': 'e55cedc11adb39c404b7365f7d6291fa',
+            'last_modified': '1970-01-01T00:00:20.000000',
+            'content_type': 'text/plain',
+            'is_latest': True,
+        }]
+        self.assertEqual(expected, json.loads(body))
+        self.assertEqual(self.app.calls, [
+            ('GET', '/v1/a/c?format=json'),
+            ('HEAD', self.build_versions_path()),
+        ])
+
+        # if it's in cache, we won't even get the HEAD
+        self.app._calls = []
+        self.cache_version_never_on.set(
+            get_cache_key('a', self.build_container_name('c')),
+            {'status': 404})
+        req = Request.blank(
+            '/v1/a/c?versions',
+            environ={'REQUEST_METHOD': 'GET',
+                     'swift.cache': self.cache_version_never_on})
+        status, headers, body = self.call_ov(req)
+        self.assertEqual(status, '200 OK')
+        self.assertNotIn('x-versions-enabled', [h.lower() for h, _ in headers])
+        self.assertEqual(expected, json.loads(body))
+        self.assertEqual(self.app.calls, [('GET', '/v1/a/c?format=json')])
 
     def test_bytes_count(self):
         self.app.register(

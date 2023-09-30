@@ -403,8 +403,9 @@ class TestContainerController(TestRingBase):
             def __iter__(self):
                 return iter([])
 
-        with mocked_http_conn(), mock.patch.object(self.app, 'iter_nodes',
-                                                   return_value=FakeIter()):
+        with mocked_http_conn(), mock.patch(
+                'swift.proxy.controllers.container.NodeIter',
+                return_value=FakeIter()):
             req = Request.blank('/v1/a/c')
             resp = req.get_response(self.app)
             self.assertEqual(resp.status_int, 503)
@@ -2767,7 +2768,8 @@ class TestContainerController(TestRingBase):
         self.assertEqual(self.ns_bound_list,
                          req.environ['swift.infocache'][cache_key])
         self.assertEqual(
-            [x[0][0] for x in self.logger.logger.log_dict['increment']],
+            [x[0][0] for x in
+             self.logger.logger.statsd_client.calls['increment']],
             ['container.info.cache.miss',
              'container.shard_listing.cache.bypass.200'])
 
@@ -2805,7 +2807,8 @@ class TestContainerController(TestRingBase):
         self.assertEqual(self.ns_bound_list,
                          req.environ['swift.infocache'][cache_key])
         self.assertEqual(
-            [x[0][0] for x in self.logger.logger.log_dict['increment']],
+            [x[0][0] for x in
+             self.logger.logger.statsd_client.calls['increment']],
             ['container.info.cache.hit',
              'container.shard_listing.cache.miss.200'])
 
@@ -2829,7 +2832,8 @@ class TestContainerController(TestRingBase):
         self.assertEqual(self.ns_bound_list,
                          req.environ['swift.infocache'][cache_key])
         self.assertEqual(
-            [x[0][0] for x in self.logger.logger.log_dict['increment']],
+            [x[0][0] for x in
+             self.logger.logger.statsd_client.calls['increment']],
             ['container.info.cache.hit',
              'container.shard_listing.cache.hit'])
 
@@ -2866,7 +2870,8 @@ class TestContainerController(TestRingBase):
         self.assertEqual(self.ns_bound_list,
                          req.environ['swift.infocache'][cache_key])
         self.assertEqual(
-            [x[0][0] for x in self.logger.logger.log_dict['increment']],
+            [x[0][0] for x in
+             self.logger.logger.statsd_client.calls['increment']],
             ['container.info.cache.hit',
              'container.shard_listing.cache.skip.200'])
 
@@ -2890,7 +2895,8 @@ class TestContainerController(TestRingBase):
         self.assertEqual(self.ns_bound_list,
                          req.environ['swift.infocache'][cache_key])
         self.assertEqual(
-            [x[0][0] for x in self.logger.logger.log_dict['increment']],
+            [x[0][0] for x in
+             self.logger.logger.statsd_client.calls['increment']],
             ['container.info.cache.hit',
              'container.shard_listing.cache.hit'])
 
@@ -2913,8 +2919,10 @@ class TestContainerController(TestRingBase):
         self.assertEqual(self.ns_bound_list,
                          req.environ['swift.infocache'][cache_key])
         self.assertEqual(
-            [x[0][0] for x in self.logger.logger.log_dict['increment']],
-            ['container.shard_listing.infocache.hit'])
+            [x[0][0] for x in
+             self.logger.logger.statsd_client.calls['increment']],
+            ['container.info.infocache.hit',
+             'container.shard_listing.infocache.hit'])
 
         # put this back the way we found it for later subtests
         self.app.container_listing_shard_ranges_skip_cache = 0.0
@@ -3067,7 +3075,7 @@ class TestContainerController(TestRingBase):
         self.assertEqual(404, resp.status_int)
         self.assertEqual({'container.info.cache.hit': 1,
                           'container.shard_listing.cache.miss.404': 1},
-                         self.logger.get_increment_counts())
+                         self.logger.statsd_client.get_increment_counts())
 
     def test_GET_shard_ranges_read_from_cache_error(self):
         self._setup_shard_range_stubs()
@@ -3100,7 +3108,7 @@ class TestContainerController(TestRingBase):
         self.assertEqual(404, resp.status_int)
         self.assertEqual({'container.info.cache.hit': 1,
                           'container.shard_listing.cache.error.404': 1},
-                         self.logger.get_increment_counts())
+                         self.logger.statsd_client.get_increment_counts())
 
     def _do_test_GET_shard_ranges_read_from_cache(self, params, record_type):
         # pre-warm cache with container metadata and shard ranges and verify
@@ -3123,7 +3131,7 @@ class TestContainerController(TestRingBase):
             self.memcache.calls)
         self.assertEqual({'container.info.cache.hit': 1,
                           'container.shard_listing.cache.hit': 1},
-                         self.logger.get_increment_counts())
+                         self.logger.statsd_client.get_increment_counts())
         return resp
 
     def test_GET_shard_ranges_read_from_cache(self):
@@ -3210,12 +3218,16 @@ class TestContainerController(TestRingBase):
                  'shard-listing-v2/a/c', self.ns_bound_list.bounds, time=600),
              mock.call.set('container/a/c', mock.ANY, time=60)],
             self.memcache.calls)
+        info_lines = self.logger.get_lines_for_level('info')
+        self.assertIn(
+            'Caching listing shards for shard-listing-v2/a/c (3 shards)',
+            info_lines)
         # shards were cached
         self.assertEqual('sharded',
                          self.memcache.calls[2][1][1]['sharding_state'])
         self.assertEqual({'container.info.cache.miss': 1,
                           'container.shard_listing.cache.bypass.200': 1},
-                         self.logger.get_increment_counts())
+                         self.logger.statsd_client.get_increment_counts())
         return resp
 
     def test_GET_shard_ranges_write_to_cache(self):
@@ -3310,7 +3322,7 @@ class TestContainerController(TestRingBase):
                          self.memcache.calls[2][1][1]['sharding_state'])
         self.assertEqual({'container.info.cache.miss': 1,
                           'container.shard_listing.cache.force_skip.200': 1},
-                         self.logger.get_increment_counts())
+                         self.logger.statsd_client.get_increment_counts())
 
     def _do_test_GET_shard_ranges_no_cache_write(self, resp_hdrs):
         # verify that there is a cache lookup to check container info but then
@@ -3483,7 +3495,7 @@ class TestContainerController(TestRingBase):
                          self.memcache.calls[1][1][1]['sharding_state'])
         self.assertEqual({'container.info.cache.miss': 1,
                           'container.shard_listing.cache.bypass.200': 1},
-                         self.logger.get_increment_counts())
+                         self.logger.statsd_client.get_increment_counts())
         self.memcache.delete_all()
 
     def test_GET_shard_ranges_bad_response_body(self):

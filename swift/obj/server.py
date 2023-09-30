@@ -42,7 +42,7 @@ from swift.common.exceptions import ConnectionTimeout, DiskFileQuarantined, \
     DiskFileNotExist, DiskFileCollision, DiskFileNoSpace, DiskFileDeleted, \
     DiskFileDeviceUnavailable, DiskFileExpired, ChunkReadTimeout, \
     ChunkReadError, DiskFileXattrNotSupported
-from swift.common.request_helpers import \
+from swift.common.request_helpers import resolve_ignore_range_header, \
     OBJECT_SYSMETA_CONTAINER_UPDATE_OVERRIDE_PREFIX
 from swift.obj import ssync_receiver
 from swift.common.http import is_success, HTTP_MOVED_PERMANENTLY
@@ -56,7 +56,7 @@ from swift.common.swob import HTTPAccepted, HTTPBadRequest, HTTPCreated, \
     HTTPPreconditionFailed, HTTPRequestTimeout, HTTPUnprocessableEntity, \
     HTTPClientDisconnect, HTTPMethodNotAllowed, Request, Response, \
     HTTPInsufficientStorage, HTTPForbidden, HTTPException, HTTPConflict, \
-    HTTPServerError, wsgi_to_bytes, wsgi_to_str, normalize_etag
+    HTTPServerError, bytes_to_wsgi, wsgi_to_bytes, wsgi_to_str, normalize_etag
 from swift.obj.diskfile import RESERVED_DATAFILE_META, DiskFileRouter
 from swift.obj.expirer import build_task_obj
 
@@ -150,6 +150,8 @@ class ObjectController(BaseStorageServer):
         self.slow = int(conf.get('slow', 0))
         self.keep_cache_private = \
             config_true_value(conf.get('keep_cache_private', 'false'))
+        self.keep_cache_slo_manifest = \
+            config_true_value(conf.get('keep_cache_slo_manifest', 'false'))
 
         default_allowed_headers = '''
             content-disposition,
@@ -678,7 +680,8 @@ class ObjectController(BaseStorageServer):
                 list(self.allowed_headers))
             for header_key in headers_to_copy:
                 if header_key in request.headers:
-                    header_caps = header_key.title()
+                    header_caps = bytes_to_wsgi(
+                        wsgi_to_bytes(header_key).title())
                     metadata[header_caps] = request.headers[header_key]
             orig_delete_at = int(orig_metadata.get('X-Delete-At') or 0)
             if orig_delete_at != new_delete_at:
@@ -927,7 +930,8 @@ class ObjectController(BaseStorageServer):
             list(self.allowed_headers))
         for header_key in headers_to_copy:
             if header_key in request.headers:
-                header_caps = header_key.title()
+                header_caps = bytes_to_wsgi(
+                    wsgi_to_bytes(header_key).title())
                 metadata[header_caps] = request.headers[header_key]
         return metadata
 
@@ -1086,19 +1090,22 @@ class ObjectController(BaseStorageServer):
         try:
             with disk_file.open(current_time=req_timestamp):
                 metadata = disk_file.get_metadata()
-                ignore_range_headers = set(
-                    h.strip().lower()
-                    for h in request.headers.get(
-                        'X-Backend-Ignore-Range-If-Metadata-Present',
-                        '').split(','))
-                if ignore_range_headers.intersection(
-                        h.lower() for h in metadata):
-                    request.headers.pop('Range', None)
+                resolve_ignore_range_header(request, metadata)
                 obj_size = int(metadata['Content-Length'])
                 file_x_ts = Timestamp(metadata['X-Timestamp'])
-                keep_cache = (self.keep_cache_private or
-                              ('X-Auth-Token' not in request.headers and
-                               'X-Storage-Token' not in request.headers))
+                keep_cache = (
+                    self.keep_cache_private
+                    or (
+                        "X-Auth-Token" not in request.headers
+                        and "X-Storage-Token" not in request.headers
+                    )
+                    or (
+                        self.keep_cache_slo_manifest
+                        and config_true_value(
+                            metadata.get("X-Static-Large-Object")
+                        )
+                    )
+                )
                 conditional_etag = resolve_etag_is_at_header(request, metadata)
                 response = Response(
                     app_iter=disk_file.reader(keep_cache=keep_cache),

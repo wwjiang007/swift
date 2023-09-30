@@ -39,6 +39,8 @@ import functools
 import email.parser
 from random import random, shuffle
 from contextlib import contextmanager, closing
+import ctypes
+import ctypes.util
 from optparse import OptionParser
 import traceback
 import warnings
@@ -84,7 +86,6 @@ from six.moves.urllib.parse import quote as _quote, unquote
 from six.moves.urllib.parse import urlparse
 from six.moves import UserList
 
-from swift import gettext_ as _
 import swift.common.exceptions
 from swift.common.http import is_server_error
 from swift.common.header_key_dict import HeaderKeyDict
@@ -95,13 +96,10 @@ from swift.common.registry import register_swift_info, get_swift_info  # noqa
 from swift.common.utils.libc import (  # noqa
     F_SETPIPE_SZ,
     load_libc_function,
-    config_fallocate_value,
-    disable_fallocate,
-    fallocate,
-    punch_hole,
     drop_buffer_cache,
     get_md5_socket,
     modify_priority,
+    _LibcWrapper,
 )
 from swift.common.utils.timestamp import (  # noqa
     NORMAL_FORMAT,
@@ -130,6 +128,21 @@ import logging
 
 NOTICE = 25
 
+# These are lazily pulled from libc elsewhere
+_sys_fallocate = None
+
+# If set to non-zero, fallocate routines will fail based on free space
+# available being at or below this amount, in bytes.
+FALLOCATE_RESERVE = 0
+# Indicates if FALLOCATE_RESERVE is the percentage of free space (True) or
+# the number of bytes (False).
+FALLOCATE_IS_PERCENT = False
+
+# from /usr/include/linux/falloc.h
+FALLOC_FL_KEEP_SIZE = 1
+FALLOC_FL_PUNCH_HOLE = 2
+
+
 # Used by hash_path to offer a bit more security when generating hashes for
 # paths. It simply appends this value to all paths; guessing the hash a path
 # will end up with would also require knowing this suffix.
@@ -138,6 +151,10 @@ HASH_PATH_PREFIX = b''
 
 SWIFT_CONF_FILE = '/etc/swift/swift.conf'
 
+# These constants are Linux-specific, and Python doesn't seem to know
+# about them. We ask anyway just in case that ever gets fixed.
+#
+# The values were copied from the Linux 3.x kernel headers.
 O_TMPFILE = getattr(os, 'O_TMPFILE', 0o20000000 | os.O_DIRECTORY)
 
 MD5_OF_EMPTY_STRING = 'd41d8cd98f00b204e9800998ecf8427e'
@@ -673,6 +690,25 @@ def get_trans_id_time(trans_id):
     return None
 
 
+def config_fallocate_value(reserve_value):
+    """
+    Returns fallocate reserve_value as an int or float.
+    Returns is_percent as a boolean.
+    Returns a ValueError on invalid fallocate value.
+    """
+    try:
+        if str(reserve_value[-1:]) == '%':
+            reserve_value = float(reserve_value[:-1])
+            is_percent = True
+        else:
+            reserve_value = int(reserve_value)
+            is_percent = False
+    except ValueError:
+        raise ValueError('Error: %s is an invalid value for fallocate'
+                         '_reserve.' % reserve_value)
+    return reserve_value, is_percent
+
+
 class FileLikeIter(object):
 
     def __init__(self, iterable):
@@ -823,6 +859,116 @@ def fs_has_free_space(fs_path, space_needed, is_percent):
         return free_bytes >= space_needed
 
 
+_fallocate_enabled = True
+_fallocate_warned_about_missing = False
+_sys_fallocate = _LibcWrapper('fallocate')
+_sys_posix_fallocate = _LibcWrapper('posix_fallocate')
+
+
+def disable_fallocate():
+    global _fallocate_enabled
+    _fallocate_enabled = False
+
+
+def fallocate(fd, size, offset=0):
+    """
+    Pre-allocate disk space for a file.
+
+    This function can be disabled by calling disable_fallocate(). If no
+    suitable C function is available in libc, this function is a no-op.
+
+    :param fd: file descriptor
+    :param size: size to allocate (in bytes)
+    """
+    global _fallocate_enabled
+    if not _fallocate_enabled:
+        return
+
+    if size < 0:
+        size = 0  # Done historically; not really sure why
+    if size >= (1 << 63):
+        raise ValueError('size must be less than 2 ** 63')
+    if offset < 0:
+        raise ValueError('offset must be non-negative')
+    if offset >= (1 << 63):
+        raise ValueError('offset must be less than 2 ** 63')
+
+    # Make sure there's some (configurable) amount of free space in
+    # addition to the number of bytes we're allocating.
+    if FALLOCATE_RESERVE:
+        st = os.fstatvfs(fd)
+        free = st.f_frsize * st.f_bavail - size
+        if FALLOCATE_IS_PERCENT:
+            free = (float(free) / float(st.f_frsize * st.f_blocks)) * 100
+        if float(free) <= float(FALLOCATE_RESERVE):
+            raise OSError(
+                errno.ENOSPC,
+                'FALLOCATE_RESERVE fail %g <= %g' %
+                (free, FALLOCATE_RESERVE))
+
+    if _sys_fallocate.available:
+        # Parameters are (fd, mode, offset, length).
+        #
+        # mode=FALLOC_FL_KEEP_SIZE pre-allocates invisibly (without
+        # affecting the reported file size).
+        ret = _sys_fallocate(
+            fd, FALLOC_FL_KEEP_SIZE, ctypes.c_uint64(offset),
+            ctypes.c_uint64(size))
+        err = ctypes.get_errno()
+    elif _sys_posix_fallocate.available:
+        # Parameters are (fd, offset, length).
+        ret = _sys_posix_fallocate(fd, ctypes.c_uint64(offset),
+                                   ctypes.c_uint64(size))
+        err = ctypes.get_errno()
+    else:
+        # No suitable fallocate-like function is in our libc. Warn about it,
+        # but just once per process, and then do nothing.
+        global _fallocate_warned_about_missing
+        if not _fallocate_warned_about_missing:
+            logging.warning("Unable to locate fallocate, posix_fallocate in "
+                            "libc.  Leaving as a no-op.")
+            _fallocate_warned_about_missing = True
+        return
+
+    if ret and err not in (0, errno.ENOSYS, errno.EOPNOTSUPP,
+                           errno.EINVAL):
+        raise OSError(err, 'Unable to fallocate(%s)' % size)
+
+
+def punch_hole(fd, offset, length):
+    """
+    De-allocate disk space in the middle of a file.
+
+    :param fd: file descriptor
+    :param offset: index of first byte to de-allocate
+    :param length: number of bytes to de-allocate
+    """
+    if offset < 0:
+        raise ValueError('offset must be non-negative')
+    if offset >= (1 << 63):
+        raise ValueError('offset must be less than 2 ** 63')
+    if length <= 0:
+        raise ValueError('length must be positive')
+    if length >= (1 << 63):
+        raise ValueError('length must be less than 2 ** 63')
+
+    if _sys_fallocate.available:
+        # Parameters are (fd, mode, offset, length).
+        ret = _sys_fallocate(
+            fd,
+            FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE,
+            ctypes.c_uint64(offset),
+            ctypes.c_uint64(length))
+        err = ctypes.get_errno()
+        if ret and err:
+            mode_str = "FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE"
+            raise OSError(err, "Unable to fallocate(%d, %s, %d, %d)" % (
+                fd, mode_str, offset, length))
+    else:
+        raise OSError(errno.ENOTSUP,
+                      'No suitable C function found for hole punching')
+
+
 def fsync(fd):
     """
     Sync modified file data and metadata to disk.
@@ -864,8 +1010,8 @@ def fsync_dir(dirpath):
         if err.errno == errno.ENOTDIR:
             # Raise error if someone calls fsync_dir on a non-directory
             raise
-        logging.warning(_('Unable to perform fsync() on directory %(dir)s:'
-                          ' %(err)s'),
+        logging.warning('Unable to perform fsync() on directory %(dir)s:'
+                        ' %(err)s',
                         {'dir': dirpath, 'err': os.strerror(err.errno)})
     finally:
         if dirfd:
@@ -1177,9 +1323,9 @@ class LoggerFileObject(object):
             if value:
                 if 'Connection reset by peer' in value:
                     self.logger.error(
-                        _('%s: Connection reset by peer'), self.log_type)
+                        '%s: Connection reset by peer', self.log_type)
                 else:
-                    self.logger.error(_('%(type)s: %(value)s'),
+                    self.logger.error('%(type)s: %(value)s',
                                       {'type': self.log_type, 'value': value})
         finally:
             self._cls_thread_local.already_called_write = False
@@ -1190,7 +1336,7 @@ class LoggerFileObject(object):
 
         self._cls_thread_local.already_called_writelines = True
         try:
-            self.logger.error(_('%(type)s: %(value)s'),
+            self.logger.error('%(type)s: %(value)s',
                               {'type': self.log_type,
                                'value': '#012'.join(values)})
         finally:
@@ -1235,21 +1381,7 @@ class StatsdClient(object):
         self.logger = logger
 
         # Determine if host is IPv4 or IPv6
-        addr_info = None
-        try:
-            addr_info = socket.getaddrinfo(host, port, socket.AF_INET)
-            self._sock_family = socket.AF_INET
-        except socket.gaierror:
-            try:
-                addr_info = socket.getaddrinfo(host, port, socket.AF_INET6)
-                self._sock_family = socket.AF_INET6
-            except socket.gaierror:
-                # Don't keep the server from starting from what could be a
-                # transient DNS failure.  Any hostname will get re-resolved as
-                # necessary in the .sendto() calls.
-                # However, we don't know if we're IPv4 or IPv6 in this case, so
-                # we assume legacy IPv4.
-                self._sock_family = socket.AF_INET
+        addr_info, self._sock_family = self._determine_sock_family(host, port)
 
         # NOTE: we use the original host value, not the DNS-resolved one
         # because if host is a hostname, we don't want to cache the DNS
@@ -1268,6 +1400,24 @@ class StatsdClient(object):
             self._target = (host,) + (sockaddr[1:])
         else:
             self._target = (host, port)
+
+    def _determine_sock_family(self, host, port):
+        addr_info = sock_family = None
+        try:
+            addr_info = socket.getaddrinfo(host, port, socket.AF_INET)
+            sock_family = socket.AF_INET
+        except socket.gaierror:
+            try:
+                addr_info = socket.getaddrinfo(host, port, socket.AF_INET6)
+                sock_family = socket.AF_INET6
+            except socket.gaierror:
+                # Don't keep the server from starting from what could be a
+                # transient DNS failure.  Any hostname will get re-resolved as
+                # necessary in the .sendto() calls.
+                # However, we don't know if we're IPv4 or IPv6 in this case, so
+                # we assume legacy IPv4.
+                sock_family = socket.AF_INET
+        return addr_info, sock_family
 
     def _set_prefix(self, tail_prefix):
         """
@@ -1328,7 +1478,7 @@ class StatsdClient(object):
             except IOError as err:
                 if self.logger:
                     self.logger.warning(
-                        _('Error sending UDP message to %(target)r: %(err)s'),
+                        'Error sending UDP message to %(target)r: %(err)s',
                         {'target': self._target, 'err': err})
 
     def _open_socket(self):
@@ -1343,12 +1493,16 @@ class StatsdClient(object):
     def decrement(self, metric, sample_rate=None):
         return self.update_stats(metric, -1, sample_rate)
 
-    def timing(self, metric, timing_ms, sample_rate=None):
+    def _timing(self, metric, timing_ms, sample_rate):
+        # This method was added to disagregate timing metrics when testing
         return self._send(metric, timing_ms, 'ms', sample_rate)
 
+    def timing(self, metric, timing_ms, sample_rate=None):
+        return self._timing(metric, timing_ms, sample_rate)
+
     def timing_since(self, metric, orig_time, sample_rate=None):
-        return self.timing(metric, (time.time() - orig_time) * 1000,
-                           sample_rate)
+        return self._timing(metric, (time.time() - orig_time) * 1000,
+                            sample_rate)
 
     def transfer_rate(self, metric, elapsed_time, byte_xfer, sample_rate=None):
         if byte_xfer:
@@ -1423,28 +1577,23 @@ class SwiftLoggerAdapter(logging.LoggerAdapter):
         # py3 does this for us already; add it for py2
         return self.logger.name
 
-    def get_metric_name(self, metric):
-        # subclasses may override this method to annotate the metric name
-        return metric
+    def update_stats(self, *a, **kw):
+        return self.logger.update_stats(*a, **kw)
 
-    def update_stats(self, metric, *a, **kw):
-        return self.logger.update_stats(self.get_metric_name(metric), *a, **kw)
+    def increment(self, *a, **kw):
+        return self.logger.increment(*a, **kw)
 
-    def increment(self, metric, *a, **kw):
-        return self.logger.increment(self.get_metric_name(metric), *a, **kw)
+    def decrement(self, *a, **kw):
+        return self.logger.decrement(*a, **kw)
 
-    def decrement(self, metric, *a, **kw):
-        return self.logger.decrement(self.get_metric_name(metric), *a, **kw)
+    def timing(self, *a, **kw):
+        return self.logger.timing(*a, **kw)
 
-    def timing(self, metric, *a, **kw):
-        return self.logger.timing(self.get_metric_name(metric), *a, **kw)
+    def timing_since(self, *a, **kw):
+        return self.logger.timing_since(*a, **kw)
 
-    def timing_since(self, metric, *a, **kw):
-        return self.logger.timing_since(self.get_metric_name(metric), *a, **kw)
-
-    def transfer_rate(self, metric, *a, **kw):
-        return self.logger.transfer_rate(
-            self.get_metric_name(metric), *a, **kw)
+    def transfer_rate(self, *a, **kw):
+        return self.logger.transfer_rate(*a, **kw)
 
     @property
     def thread_locals(self):
@@ -1479,27 +1628,6 @@ class PrefixLoggerAdapter(SwiftLoggerAdapter):
         if 'prefix' in self.extra:
             msg = self.extra['prefix'] + msg
         return (msg, kwargs)
-
-
-class MetricsPrefixLoggerAdapter(SwiftLoggerAdapter):
-    """
-    Adds a prefix to all Statsd metrics' names.
-    """
-
-    def __init__(self, logger, extra, metric_prefix):
-        """
-        :param logger: an instance of logging.Logger
-        :param extra: a dict-like object
-        :param metric_prefix: A prefix that will be added to the start of each
-            metric name such that the metric name is transformed to:
-            ``<metric_prefix>.<metric name>``. Note that the logger's
-            StatsdClient also adds its configured prefix to metric names.
-        """
-        super(MetricsPrefixLoggerAdapter, self).__init__(logger, extra)
-        self.metric_prefix = metric_prefix
-
-    def get_metric_name(self, metric):
-        return '%s.%s' % (self.metric_prefix, metric)
 
 
 # double inheritance to support property with setter
@@ -1601,27 +1729,30 @@ class LogAdapter(logging.LoggerAdapter, object):
         _junk, exc, _junk = sys.exc_info()
         call = self.error
         emsg = ''
-        if isinstance(exc, (OSError, socket.error)):
+        if isinstance(exc, (http_client.BadStatusLine,
+                            green_http_client.BadStatusLine)):
+            # Use error(); not really exceptional
+            emsg = repr(exc)
+            # Note that on py3, we've seen a RemoteDisconnected error getting
+            # raised, which inherits from *both* BadStatusLine and OSError;
+            # we want it getting caught here
+        elif isinstance(exc, (OSError, socket.error)):
             if exc.errno in (errno.EIO, errno.ENOSPC):
                 emsg = str(exc)
             elif exc.errno == errno.ECONNREFUSED:
-                emsg = _('Connection refused')
+                emsg = 'Connection refused'
             elif exc.errno == errno.ECONNRESET:
-                emsg = _('Connection reset')
+                emsg = 'Connection reset'
             elif exc.errno == errno.EHOSTUNREACH:
-                emsg = _('Host unreachable')
+                emsg = 'Host unreachable'
             elif exc.errno == errno.ENETUNREACH:
-                emsg = _('Network unreachable')
+                emsg = 'Network unreachable'
             elif exc.errno == errno.ETIMEDOUT:
-                emsg = _('Connection timeout')
+                emsg = 'Connection timeout'
             elif exc.errno == errno.EPIPE:
-                emsg = _('Broken pipe')
+                emsg = 'Broken pipe'
             else:
                 call = self._exception
-        elif isinstance(exc, (http_client.BadStatusLine,
-                              green_http_client.BadStatusLine)):
-            # Use error(); not really exceptional
-            emsg = '%s: %s' % (exc.__class__.__name__, exc.line)
         elif isinstance(exc, eventlet.Timeout):
             emsg = exc.__class__.__name__
             detail = '%ss' % exc.seconds
@@ -1664,13 +1795,13 @@ class LogAdapter(logging.LoggerAdapter, object):
 
         :param statsd_func_name: the name of a method on StatsdClient.
         """
-
         func = getattr(StatsdClient, statsd_func_name)
 
         @functools.wraps(func)
         def wrapped(self, *a, **kw):
             if getattr(self.logger, 'statsd_client'):
-                return func(self.logger.statsd_client, *a, **kw)
+                func = getattr(self.logger.statsd_client, statsd_func_name)
+                return func(*a, **kw)
         return wrapped
 
     update_stats = statsd_delegate('update_stats')
@@ -1978,7 +2109,7 @@ def capture_stdio(logger, **kwargs):
     """
     # log uncaught exceptions
     sys.excepthook = lambda * exc_info: \
-        logger.critical(_('UNCAUGHT EXCEPTION'), exc_info=exc_info)
+        logger.critical('UNCAUGHT EXCEPTION', exc_info=exc_info)
 
     # collect stdio file desc not in use for logging
     stdio_files = [sys.stdin, sys.stdout, sys.stderr]
@@ -2007,11 +2138,13 @@ def capture_stdio(logger, **kwargs):
         sys.stderr = LoggerFileObject(logger, 'STDERR')
 
 
-def parse_options(parser=None, once=False, test_args=None):
+def parse_options(parser=None, once=False, test_config=False, test_args=None):
     """Parse standard swift server/daemon options with optparse.OptionParser.
 
     :param parser: OptionParser to use. If not sent one will be created.
     :param once: Boolean indicating the "once" option is available
+    :param test_config: Boolean indicating the "test-config" option is
+                        available
     :param test_args: Override sys.argv; used in testing
 
     :returns: Tuple of (config, options); config is an absolute path to the
@@ -2026,18 +2159,23 @@ def parse_options(parser=None, once=False, test_args=None):
     if once:
         parser.add_option("-o", "--once", default=False, action="store_true",
                           help="only run one pass of daemon")
+    if test_config:
+        parser.add_option("-t", "--test-config",
+                          default=False, action="store_true",
+                          help="exit after loading and validating config; "
+                               "do not run the daemon")
 
     # if test_args is None, optparse will use sys.argv[:1]
     options, args = parser.parse_args(args=test_args)
 
     if not args:
         parser.print_usage()
-        print(_("Error: missing config path argument"))
+        print("Error: missing config path argument")
         sys.exit(1)
     config = os.path.abspath(args.pop(0))
     if not os.path.exists(config):
         parser.print_usage()
-        print(_("Error: unable to locate %s") % config)
+        print("Error: unable to locate %s" % config)
         sys.exit(1)
 
     extra_args = []
@@ -2454,14 +2592,14 @@ def readconf(conf_path, section_name=None, log_name=None, defaults=None,
         else:
             success = c.read(conf_path)
         if not success:
-            raise IOError(_("Unable to read config from %s") %
+            raise IOError("Unable to read config from %s" %
                           conf_path)
     if section_name:
         if c.has_section(section_name):
             conf = dict(c.items(section_name))
         else:
             raise ValueError(
-                _("Unable to find %(section)s config section in %(conf)s") %
+                "Unable to find %(section)s config section in %(conf)s" %
                 {'section': section_name, 'conf': conf_path})
         if "log_name" not in conf:
             if log_name is not None:
@@ -2691,7 +2829,7 @@ def audit_location_generator(devices, datadir, suffix='',
                 error_counter['unmounted'].append(device)
             if logger:
                 logger.warning(
-                    _('Skipping %s as it is not mounted'), device)
+                    'Skipping %s as it is not mounted', device)
             continue
         if hook_pre_device:
             hook_pre_device(os.path.join(devices, device))
@@ -2704,7 +2842,7 @@ def audit_location_generator(devices, datadir, suffix='',
                 error_counter.setdefault('unlistable_partitions', [])
                 error_counter['unlistable_partitions'].append(datadir_path)
             if logger:
-                logger.warning(_('Skipping %(datadir)s because %(err)s'),
+                logger.warning('Skipping %(datadir)s because %(err)s',
                                {'datadir': datadir_path, 'err': e})
             continue
         if partitions_filter:
@@ -2902,6 +3040,9 @@ class ContextPool(GreenPool):
         return self
 
     def __exit__(self, type, value, traceback):
+        self.close()
+
+    def close(self):
         for coro in list(self.coroutines_running):
             coro.kill()
 
@@ -3084,16 +3225,16 @@ def validate_sync_to(value, allowed_sync_hosts, realms_conf):
         data = value[2:].split('/')
         if len(data) != 4:
             return (
-                _('Invalid X-Container-Sync-To format %r') % orig_value,
+                'Invalid X-Container-Sync-To format %r' % orig_value,
                 None, None, None)
         realm, cluster, account, container = data
         realm_key = realms_conf.key(realm)
         if not realm_key:
-            return (_('No realm key for %r') % realm, None, None, None)
+            return ('No realm key for %r' % realm, None, None, None)
         endpoint = realms_conf.endpoint(realm, cluster)
         if not endpoint:
             return (
-                _('No cluster endpoint for %(realm)r %(cluster)r')
+                'No cluster endpoint for %(realm)r %(cluster)r'
                 % {'realm': realm, 'cluster': cluster},
                 None, None, None)
         return (
@@ -3103,19 +3244,19 @@ def validate_sync_to(value, allowed_sync_hosts, realms_conf):
     p = urlparse(value)
     if p.scheme not in ('http', 'https'):
         return (
-            _('Invalid scheme %r in X-Container-Sync-To, must be "//", '
-              '"http", or "https".') % p.scheme,
+            'Invalid scheme %r in X-Container-Sync-To, must be "//", '
+            '"http", or "https".' % p.scheme,
             None, None, None)
     if not p.path:
-        return (_('Path required in X-Container-Sync-To'), None, None, None)
+        return ('Path required in X-Container-Sync-To', None, None, None)
     if p.params or p.query or p.fragment:
         return (
-            _('Params, queries, and fragments not allowed in '
-              'X-Container-Sync-To'),
+            'Params, queries, and fragments not allowed in '
+            'X-Container-Sync-To',
             None, None, None)
     if p.hostname not in allowed_sync_hosts:
         return (
-            _('Invalid host %r in X-Container-Sync-To') % p.hostname,
+            'Invalid host %r in X-Container-Sync-To' % p.hostname,
             None, None, None)
     return (None, value, None, None)
 
@@ -3258,7 +3399,7 @@ def put_recon_cache_entry(cache_entry, key, item):
 
     If ``item`` is an empty dict then any existing ``key`` in ``cache_entry``
     will be deleted. Similarly if ``item`` is a dict and any of its values are
-    empty dicts then the corrsponsing key will be deleted from the nested dict
+    empty dicts then the corresponding key will be deleted from the nested dict
     in ``cache_entry``.
 
     We use nested recon cache entries when the object auditor
@@ -3970,7 +4111,7 @@ def override_bytes_from_content_type(listing_dict, logger=None):
             listing_dict['bytes'] = int(swift_bytes)
         except ValueError:
             if logger:
-                logger.exception(_("Invalid swift_bytes"))
+                logger.exception("Invalid swift_bytes")
 
 
 def clean_content_type(value):
@@ -4289,7 +4430,7 @@ def document_iters_to_http_response_body(ranges_iter, boundary, multipart,
                 pass
             else:
                 logger.warning(
-                    _("More than one part in a single-part response?"))
+                    "More than one part in a single-part response?")
 
         return string_along(response_body_iter, ranges_iter, logger)
 
@@ -4391,7 +4532,16 @@ class NamespaceOuterBound(object):
 
 @functools.total_ordering
 class Namespace(object):
+    """
+    A Namespace encapsulates parameters that define a range of the object
+    namespace.
 
+    :param name: the name of the ``Namespace``.
+    :param lower: the lower bound of object names contained in the namespace;
+        the lower bound *is not* included in the namespace.
+    :param upper: the upper bound of object names contained in the namespace;
+        the upper bound *is* included in the namespace.
+    """
     __slots__ = ('_lower', '_upper', 'name')
 
     @functools.total_ordering

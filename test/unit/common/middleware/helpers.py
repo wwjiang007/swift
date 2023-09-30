@@ -20,7 +20,8 @@ from six.moves.urllib import parse
 from swift.common import swob
 from swift.common.header_key_dict import HeaderKeyDict
 from swift.common.request_helpers import is_user_meta, \
-    is_object_transient_sysmeta, resolve_etag_is_at_header
+    is_object_transient_sysmeta, resolve_etag_is_at_header, \
+    resolve_ignore_range_header
 from swift.common.swob import HTTPNotImplemented
 from swift.common.utils import split_path, md5
 
@@ -73,6 +74,48 @@ def normalize_path(path):
 class FakeSwift(object):
     """
     A good-enough fake Swift proxy server to use in testing middleware.
+
+    Responses for expected requests should be registered using the ``register``
+    method. Registered requests are keyed by their method and path *including
+    query string*.
+
+    Received requests are matched to registered requests with the same method
+    as follows, in order of preference:
+
+      * A received request matches a registered request if the received
+        request's path, including query string, is the same as the registered
+        request's path, including query string.
+      * A received request matches a registered request if the received
+        request's path, excluding query string, is the same as the registered
+        request's path, including query string.
+
+    A received ``HEAD`` request will be matched to a registered ``GET``,
+    according to the same path preferences, if a match cannot be made to a
+    registered ``HEAD`` request.
+
+    A ``PUT`` request that matches a registered ``PUT`` request will create an
+    entry in the ``uploaded`` object cache that is keyed by the received
+    request's path, excluding query string. A subsequent ``GET`` or ``HEAD``
+    request that does not match a registered request will match an ``uploaded``
+    object based on the ``GET`` or ``HEAD`` request's path, excluding query
+    string.
+
+    A ``POST`` request whose path, excluding query string, matches an object in
+    the ``uploaded`` cache will modify the metadata of the object in the
+    ``uploaded`` cache. However, the ``POST`` request must first match a
+    registered ``POST`` request.
+
+    Examples:
+
+      * received ``GET /v1/a/c/o`` will match registered ``GET /v1/a/c/o``
+      * received ``GET /v1/a/c/o?x=y`` will match registered ``GET /v1/a/c/o``
+      * received ``HEAD /v1/a/c/o?x=y`` will match registered ``GET /v1/a/c/o``
+      * received ``GET /v1/a/c/o`` will NOT match registered
+        ``GET /v1/a/c/o?x=y``
+      * received ``PUT /v1/a/c/o?x=y``, if it matches a registered ``PUT``,
+        will create uploaded ``/v1/a/c/o``
+      * received ``POST /v1/a/c/o?x=y``, if it matches a registered ``POST``,
+        will update uploaded ``/v1/a/c/o``
     """
     ALLOWED_METHODS = [
         'PUT', 'POST', 'DELETE', 'GET', 'HEAD', 'OPTIONS', 'REPLICATE',
@@ -98,10 +141,11 @@ class FakeSwift(object):
         self.auto_create_account_prefix = '.'
         self.backend_user_agent = "fake_swift"
         self._pipeline_final_app = self
-        # some tests want to opt in to mimicking the
-        # X-Backend-Ignore-Range-If-Metadata-Present header behavior,
-        # but default to old-swift behavior
-        self.can_ignore_range = False
+        # Object Servers learned to resolve_ignore_range_header in Jan-2020,
+        # and although we still maintain some middleware tests that assert
+        # proper behavior across rolling upgrades, having a FakeSwift not act
+        # like modern swift is now opt-in.
+        self.can_ignore_range = True
 
     def _find_response(self, method, path):
         path = normalize_path(path)
@@ -115,10 +159,41 @@ class FakeSwift(object):
                                      (method, path),))
         return resp
 
+    def _select_response(self, env, method, path):
+        # in some cases we can borrow different registered response
+        # ... the order is brittle and significant
+        preferences = [(method, path)]
+        if env.get('QUERY_STRING'):
+            # we can always reuse response w/o query string
+            preferences.append((method, env['PATH_INFO']))
+        if method == 'HEAD':
+            # any path suitable for GET always works for HEAD
+            # N.B. list(preferences) to avoid iter+modify/sigkill
+            preferences.extend(('GET', p) for _, p in list(preferences))
+        for m, p in preferences:
+            try:
+                resp_class, headers, body = self._find_response(m, p)
+            except KeyError:
+                pass
+            else:
+                break
+        else:
+            # special case for re-reading an uploaded file
+            # ... uploaded is only objects and always raw path
+            if method in ('GET', 'HEAD') and env['PATH_INFO'] in self.uploaded:
+                resp_class = swob.HTTPOk
+                headers, body = self.uploaded[env['PATH_INFO']]
+            else:
+                raise KeyError("Didn't find %r in allowed responses" % (
+                    (method, path),))
+
+        if method == 'HEAD':
+            # HEAD resp never has body
+            body = None
+
+        return resp_class, HeaderKeyDict(headers), body
+
     def __call__(self, env, start_response):
-        if self.can_ignore_range:
-            # we might pop off the Range header
-            env = dict(env)
         method = env['REQUEST_METHOD']
         if method not in self.ALLOWED_METHODS:
             raise HTTPNotImplemented()
@@ -139,32 +214,20 @@ class FakeSwift(object):
         self.swift_sources.append(env.get('swift.source'))
         self.txn_ids.append(env.get('swift.trans_id'))
 
-        try:
-            resp_class, raw_headers, body = self._find_response(method, path)
-            headers = HeaderKeyDict(raw_headers)
-        except KeyError:
-            if (env.get('QUERY_STRING')
-                    and (method, env['PATH_INFO']) in self._responses):
-                resp_class, raw_headers, body = self._find_response(
-                    method, env['PATH_INFO'])
-                headers = HeaderKeyDict(raw_headers)
-            elif method == 'HEAD' and ('GET', path) in self._responses:
-                resp_class, raw_headers, body = self._find_response(
-                    'GET', path)
-                body = None
-                headers = HeaderKeyDict(raw_headers)
-            elif method == 'GET' and obj and path in self.uploaded:
-                resp_class = swob.HTTPOk
-                headers, body = self.uploaded[path]
-            else:
-                raise KeyError("Didn't find %r in allowed responses" % (
-                    (method, path),))
+        resp_class, headers, body = self._select_response(env, method, path)
 
-        ignore_range_meta = req.headers.get(
-            'x-backend-ignore-range-if-metadata-present')
-        if self.can_ignore_range and ignore_range_meta and set(
-                ignore_range_meta.split(',')).intersection(headers.keys()):
-            req.headers.pop('range', None)
+        # Update req.headers before capturing the request
+        if method in ('GET', 'HEAD') and obj:
+            req.headers['X-Backend-Storage-Policy-Index'] = headers.get(
+                'x-backend-storage-policy-index', '2')
+
+        # Capture the request before reading the body, in case the iter raises
+        # an exception.
+        # note: tests may assume this copy of req_headers is case insensitive
+        # so we deliberately use a HeaderKeyDict
+        req_headers_copy = HeaderKeyDict(req.headers)
+        self._calls.append(
+            FakeSwiftCall(method, path, req_headers_copy))
 
         req_body = None  # generally, we don't care and let eventlet discard()
         if (cont and not obj and method == 'UPDATE') or (
@@ -177,18 +240,20 @@ class FakeSwift(object):
                 footers = HeaderKeyDict()
                 env['swift.callback.update_footers'](footers)
                 req.headers.update(footers)
+                req_headers_copy.update(footers)
             etag = md5(req_body, usedforsecurity=False).hexdigest()
             headers.setdefault('Etag', etag)
             headers.setdefault('Content-Length', len(req_body))
 
             # keep it for subsequent GET requests later
-            self.uploaded[path] = (dict(req.headers), req_body)
+            resp_headers = dict(req.headers)
             if "CONTENT_TYPE" in env:
-                self.uploaded[path][0]['Content-Type'] = env["CONTENT_TYPE"]
+                resp_headers['Content-Type'] = env["CONTENT_TYPE"]
+            self.uploaded[env['PATH_INFO']] = (resp_headers, req_body)
 
         # simulate object POST
         elif method == 'POST' and obj:
-            metadata, data = self.uploaded.get(path, ({}, None))
+            metadata, data = self.uploaded.get(env['PATH_INFO'], ({}, None))
             # select items to keep from existing...
             new_metadata = dict(
                 (k, v) for k, v in metadata.items()
@@ -200,21 +265,17 @@ class FakeSwift(object):
                      if (is_user_meta('object', k) or
                          is_object_transient_sysmeta(k) or
                          k.lower == 'content-type')))
-            self.uploaded[path] = new_metadata, data
+            self.uploaded[env['PATH_INFO']] = new_metadata, data
 
-        # simulate object GET/HEAD
-        elif method in ('GET', 'HEAD') and obj:
-            req.headers['X-Backend-Storage-Policy-Index'] = headers.get(
-                'x-backend-storage-policy-index', '2')
-
-        # note: tests may assume this copy of req_headers is case insensitive
-        # so we deliberately use a HeaderKeyDict
-        self._calls.append(
-            FakeSwiftCall(method, path, HeaderKeyDict(req.headers)))
         self.req_bodies.append(req_body)
 
         # Apply conditional etag overrides
         conditional_etag = resolve_etag_is_at_header(req, headers)
+
+        if self.can_ignore_range:
+            # avoid popping range from original environ
+            req = swob.Request(dict(req.environ))
+            resolve_ignore_range_header(req, headers)
 
         # range requests ought to work, hence conditional_response=True
         if isinstance(body, list):
@@ -227,7 +288,7 @@ class FakeSwift(object):
                 req=req, headers=headers, body=body,
                 conditional_response=req.method in ('GET', 'HEAD'),
                 conditional_etag=conditional_etag)
-        wsgi_iter = resp(env, start_response)
+        wsgi_iter = resp(req.environ, start_response)
         self.mark_opened((method, path))
         return LeakTrackingIter(wsgi_iter, self.mark_closed,
                                 self.mark_read, (method, path))

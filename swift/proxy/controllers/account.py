@@ -21,7 +21,7 @@ from swift.common.utils import public
 from swift.common.constraints import check_metadata
 from swift.common.http import HTTP_NOT_FOUND, HTTP_GONE
 from swift.proxy.controllers.base import Controller, clear_info_cache, \
-    set_info_cache
+    set_info_cache, NodeIter
 from swift.common.middleware import listing_formats
 from swift.common.swob import HTTPBadRequest, HTTPMethodNotAllowed
 from swift.common.request_helpers import get_sys_meta_prefix
@@ -63,8 +63,9 @@ class AccountController(Controller):
         partition = self.app.account_ring.get_part(self.account_name)
         concurrency = self.app.account_ring.replica_count \
             if self.app.get_policy_options(None).concurrent_gets else 1
-        node_iter = self.app.iter_nodes(self.app.account_ring, partition,
-                                        self.logger, req)
+        node_iter = NodeIter(
+            'account', self.app, self.app.account_ring, partition,
+            self.logger, req)
         params = req.params
         params['format'] = 'json'
         req.params = params
@@ -96,7 +97,7 @@ class AccountController(Controller):
         # up-to-date information for the account.
         resp.headers['X-Backend-Recheck-Account-Existence'] = str(
             self.app.recheck_account_existence)
-        set_info_cache(self.app, req.environ, self.account_name, None, resp)
+        set_info_cache(req.environ, self.account_name, None, resp)
 
         if req.environ.get('swift_owner'):
             self.add_acls_from_sys_metadata(resp)
@@ -124,7 +125,7 @@ class AccountController(Controller):
         account_partition, accounts = \
             self.app.account_ring.get_nodes(self.account_name)
         headers = self.generate_request_headers(req, transfer=True)
-        clear_info_cache(self.app, req.environ, self.account_name)
+        clear_info_cache(req.environ, self.account_name)
         resp = self.make_requests(
             req, self.app.account_ring, account_partition, 'PUT',
             req.swift_entity_path, [headers] * len(accounts))
@@ -146,7 +147,7 @@ class AccountController(Controller):
         account_partition, accounts = \
             self.app.account_ring.get_nodes(self.account_name)
         headers = self.generate_request_headers(req, transfer=True)
-        clear_info_cache(self.app, req.environ, self.account_name)
+        clear_info_cache(req.environ, self.account_name)
         resp = self.make_requests(
             req, self.app.account_ring, account_partition, 'POST',
             req.swift_entity_path, [headers] * len(accounts))
@@ -173,7 +174,7 @@ class AccountController(Controller):
         account_partition, accounts = \
             self.app.account_ring.get_nodes(self.account_name)
         headers = self.generate_request_headers(req)
-        clear_info_cache(self.app, req.environ, self.account_name)
+        clear_info_cache(req.environ, self.account_name)
         resp = self.make_requests(
             req, self.app.account_ring, account_partition, 'DELETE',
             req.swift_entity_path, [headers] * len(accounts))

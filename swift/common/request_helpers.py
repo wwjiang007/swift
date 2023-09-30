@@ -27,7 +27,6 @@ import time
 import six
 from swift.common.header_key_dict import HeaderKeyDict
 
-from swift import gettext_ as _
 from swift.common.constraints import AUTO_CREATE_ACCOUNT_PREFIX, \
     CONTAINER_LISTING_LIMIT
 from swift.common.storage_policy import POLICIES
@@ -202,7 +201,7 @@ def get_name_and_placement(request, minsegs=1, maxsegs=None,
     policy = POLICIES.get_by_index(policy_index)
     if not policy:
         raise HTTPServiceUnavailable(
-            body=_("No policy with index %s") % policy_index,
+            body="No policy with index %s" % policy_index,
             request=request, content_type='text/plain')
     results = split_and_validate_path(request, minsegs=minsegs,
                                       maxsegs=maxsegs,
@@ -899,6 +898,24 @@ def update_ignore_range_header(req, name):
         raise ValueError('Header name must not contain commas')
     hdr = 'X-Backend-Ignore-Range-If-Metadata-Present'
     req.headers[hdr] = csv_append(req.headers.get(hdr), name)
+
+
+def resolve_ignore_range_header(req, metadata):
+    """
+    Helper function to remove Range header from request if metadata matching
+    the X-Backend-Ignore-Range-If-Metadata-Present header is found.
+
+    :param req: a swob Request
+    :param metadata: dictionary of object metadata
+    """
+    ignore_range_headers = set(
+        h.strip().lower()
+        for h in req.headers.get(
+            'X-Backend-Ignore-Range-If-Metadata-Present',
+            '').split(','))
+    if ignore_range_headers.intersection(
+            h.lower() for h in metadata):
+        req.headers.pop('Range', None)
 
 
 def is_use_replication_network(headers=None):

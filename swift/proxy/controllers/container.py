@@ -27,8 +27,8 @@ from swift.common.constraints import check_metadata, CONTAINER_LISTING_LIMIT
 from swift.common.http import HTTP_ACCEPTED, is_success
 from swift.common.request_helpers import get_sys_meta_prefix, get_param, \
     constrain_req_limit, validate_container_params
-from swift.proxy.controllers.base import Controller, delay_denial, \
-    cors_validation, set_info_cache, clear_info_cache, _get_info_from_caches, \
+from swift.proxy.controllers.base import Controller, delay_denial, NodeIter, \
+    cors_validation, set_info_cache, clear_info_cache, get_container_info, \
     record_cache_op_metrics, get_cache_key, headers_from_container_info, \
     update_headers
 from swift.common.storage_policy import POLICIES
@@ -92,9 +92,9 @@ class ContainerController(Controller):
         return None
 
     def _clear_container_info_cache(self, req):
-        clear_info_cache(self.app, req.environ,
+        clear_info_cache(req.environ,
                          self.account_name, self.container_name)
-        clear_info_cache(self.app, req.environ,
+        clear_info_cache(req.environ,
                          self.account_name, self.container_name, 'listing')
         # TODO: should we also purge updating shards from cache?
 
@@ -103,8 +103,9 @@ class ContainerController(Controller):
             self.account_name, self.container_name)
         concurrency = self.app.container_ring.replica_count \
             if self.app.get_policy_options(None).concurrent_gets else 1
-        node_iter = self.app.iter_nodes(self.app.container_ring, part,
-                                        self.logger, req)
+        node_iter = NodeIter(
+            'container', self.app, self.app.container_ring, part,
+            self.logger, req)
         resp = self.GETorHEAD_base(
             req, 'Container', node_iter, part,
             req.swift_entity_path, concurrency)
@@ -239,8 +240,8 @@ class ContainerController(Controller):
             memcache = cache_from_env(req.environ, True)
             if memcache and ns_bound_list:
                 # cache in memcache only if shard ranges as expected
-                self.logger.debug('Caching %d shards for %s',
-                                  len(ns_bound_list.bounds), req.path_qs)
+                self.logger.info('Caching listing shards for %s (%d shards)',
+                                 cache_key, len(ns_bound_list.bounds))
                 memcache.set(cache_key, ns_bound_list.bounds,
                              time=self.app.recheck_listing_shard_ranges)
         return ns_bound_list
@@ -327,7 +328,8 @@ class ContainerController(Controller):
 
         if should_record:
             record_cache_op_metrics(
-                self.logger, 'shard_listing', cache_state, resp)
+                self.logger, self.server_type.lower(), 'shard_listing',
+                cache_state, resp)
 
     def _GET_using_cache(self, req, info):
         # It may be possible to fulfil the request from cache: we only reach
@@ -389,9 +391,10 @@ class ContainerController(Controller):
                 and get_param(req, 'states') == 'listing'
                 and record_type != 'object'):
             may_get_listing_shards = True
-            info = _get_info_from_caches(self.app, req.environ,
-                                         self.account_name,
-                                         self.container_name)
+            # Only lookup container info from cache and skip the backend HEAD,
+            # since we are going to GET the backend container anyway.
+            info = get_container_info(
+                req.environ, self.app, swift_source=None, cache_only=True)
         else:
             info = None
             may_get_listing_shards = False
@@ -430,10 +433,10 @@ class ContainerController(Controller):
             # node and got up-to-date information for the container.
             resp.headers['X-Backend-Recheck-Container-Existence'] = str(
                 self.app.recheck_container_existence)
-            set_info_cache(self.app, req.environ, self.account_name,
+            set_info_cache(req.environ, self.account_name,
                            self.container_name, resp)
         if 'swift.authorize' in req.environ:
-            req.acl = resp.headers.get('x-container-read')
+            req.acl = wsgi_to_str(resp.headers.get('x-container-read'))
             aresp = req.environ['swift.authorize'](req)
             if aresp:
                 # Don't cache this. It doesn't reflect the state of the

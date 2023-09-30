@@ -151,6 +151,7 @@ from swift.common.middleware.listing_formats import \
     MAX_CONTAINER_LISTING_CONTENT_LENGTH
 from swift.common.wsgi import PipelineWrapper, loadcontext, WSGIContext
 
+from swift.common.middleware import app_property
 from swift.common.middleware.s3api.exception import NotS3Request, \
     InvalidSubresource
 from swift.common.middleware.s3api.s3request import get_request_class
@@ -167,9 +168,12 @@ from swift.common.registry import register_swift_info, \
 class ListingEtagMiddleware(object):
     def __init__(self, app):
         self.app = app
-        # Pass this along so get_container_info will have the configured
-        # odds to skip cache
-        self._pipeline_final_app = app._pipeline_final_app
+
+    # Pass these along so get_container_info will have the configured
+    # odds to skip cache
+    _pipeline_final_app = app_property('_pipeline_final_app')
+    _pipeline_request_logging_app = app_property(
+        '_pipeline_request_logging_app')
 
     def __call__(self, env, start_response):
         # a lot of this is cribbed from listing_formats / swob.Request
@@ -293,7 +297,7 @@ class S3ApiMiddleware(object):
             wsgi_conf.get('ratelimit_as_client_error', False))
 
         self.logger = get_logger(
-            wsgi_conf, log_route=wsgi_conf.get('log_name', 's3api'))
+            wsgi_conf, log_route='s3api', statsd_tail_prefix='s3api')
         self.check_pipeline(wsgi_conf)
 
     def is_s3_cors_preflight(self, env):
@@ -348,6 +352,7 @@ class S3ApiMiddleware(object):
         except InvalidSubresource as e:
             self.logger.debug(e.cause)
         except ErrorResponse as err_resp:
+            self.logger.increment(err_resp.metric_name)
             if isinstance(err_resp, InternalError):
                 self.logger.exception(err_resp)
             resp = err_resp

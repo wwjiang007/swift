@@ -49,7 +49,7 @@ import six.moves.cPickle as pickle
 from six.moves import range
 from six.moves.http_client import HTTPException
 
-from swift.common import storage_policy, swob, utils
+from swift.common import storage_policy, swob, utils, exceptions
 from swift.common.memcached import MemcacheConnectionError
 from swift.common.storage_policy import (StoragePolicy, ECStoragePolicy,
                                          VALID_EC_TYPES)
@@ -1099,7 +1099,7 @@ def requires_o_tmpfile_support_in_tmp(func):
 class StubResponse(object):
 
     def __init__(self, status, body=b'', headers=None, frag_index=None,
-                 slowdown=None):
+                 slowdown=None, slowdown_after=0):
         self.status = status
         self.body = body
         self.readable = BytesIO(body)
@@ -1107,13 +1107,17 @@ class StubResponse(object):
             self._slowdown = iter(slowdown)
         except TypeError:
             self._slowdown = iter([slowdown])
+        self.slowdown_after = slowdown_after
         self.headers = HeaderKeyDict(headers)
         if frag_index is not None:
             self.headers['X-Object-Sysmeta-Ec-Frag-Index'] = frag_index
         fake_reason = ('Fake', 'This response is a lie.')
         self.reason = swob.RESPONSE_REASONS.get(status, fake_reason)[0]
+        self.bytes_read = 0
 
     def slowdown(self):
+        if self.bytes_read < self.slowdown_after:
+            return
         try:
             wait = next(self._slowdown)
         except StopIteration:
@@ -1135,11 +1139,15 @@ class StubResponse(object):
 
     def read(self, amt=0):
         self.slowdown()
-        return self.readable.read(amt)
+        res = self.readable.read(amt)
+        self.bytes_read += len(res)
+        return res
 
     def readline(self, size=-1):
         self.slowdown()
-        return self.readable.readline(size)
+        res = self.readable.readline(size)
+        self.bytes_read += len(res)
+        return res
 
     def __repr__(self):
         info = ['Status: %s' % self.status]
@@ -1452,3 +1460,36 @@ class ConfigAssertMixin(object):
                 app = app._pipeline_final_app
             found_value = getattr(app, option_name)
         self.assertEqual(found_value, option_value)
+
+
+class FakeSource(object):
+    def __init__(self, chunks, headers=None, body=b''):
+        self.chunks = list(chunks)
+        self.headers = headers or {}
+        self.status = 200
+        self.swift_conn = None
+        self.body = body
+
+    def read(self, _read_size):
+        if self.chunks:
+            chunk = self.chunks.pop(0)
+            if chunk is None:
+                raise exceptions.ChunkReadTimeout()
+            else:
+                return chunk
+        else:
+            return self.body
+
+    def getheader(self, header):
+        # content-length for the whole object is generated dynamically
+        # by summing non-None chunks
+        if header.lower() == "content-length":
+            if self.chunks:
+                return str(sum(len(c) for c in self.chunks
+                               if c is not None))
+            return len(self.read(-1))
+        return self.headers.get(header.lower())
+
+    def getheaders(self):
+        return [('content-length', self.getheader('content-length'))] + \
+               [(k, v) for k, v in self.headers.items()]

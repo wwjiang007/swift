@@ -21,7 +21,6 @@ import errno
 import fcntl
 import os
 import signal
-from swift import gettext_ as _
 import sys
 from textwrap import dedent
 import time
@@ -207,19 +206,19 @@ def get_socket(conf):
                 raise
             sleep(0.1)
     if not sock:
-        raise Exception(_('Could not bind to %(addr)s:%(port)s '
-                          'after trying for %(timeout)s seconds') % {
-                              'addr': bind_addr[0], 'port': bind_addr[1],
-                              'timeout': bind_timeout})
+        raise Exception('Could not bind to %(addr)s:%(port)s '
+                        'after trying for %(timeout)s seconds' % {
+                            'addr': bind_addr[0], 'port': bind_addr[1],
+                            'timeout': bind_timeout})
     # in my experience, sockets can hang around forever without keepalive
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
     sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
     if hasattr(socket, 'TCP_KEEPIDLE'):
         sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, keepidle)
     if warn_ssl:
-        ssl_warning_message = _('WARNING: SSL should only be enabled for '
-                                'testing purposes. Use external SSL '
-                                'termination for a production deployment.')
+        ssl_warning_message = ('WARNING: SSL should only be enabled for '
+                               'testing purposes. Use external SSL '
+                               'termination for a production deployment.')
         get_logger(conf).warning(ssl_warning_message)
         print(ssl_warning_message)
     return sock
@@ -362,15 +361,29 @@ def loadapp(conf_file, global_conf=None, allow_modify_pipeline=True):
             func(PipelineWrapper(ctx))
         filters = [c.create() for c in reversed(ctx.filter_contexts)]
         pipeline = [ultimate_app]
-        ultimate_app._pipeline = pipeline
-        ultimate_app._pipeline_final_app = ultimate_app
-        app = ultimate_app
+        request_logging_app = app = ultimate_app
         for filter_app in filters:
             app = filter_app(pipeline[0])
             pipeline.insert(0, app)
+            if request_logging_app is ultimate_app and \
+                    app.__class__.__name__ == 'ProxyLoggingMiddleware':
+                request_logging_app = filter_app(ultimate_app)
+                # Set some separate-pipeline attrs
+                request_logging_app._pipeline = [
+                    request_logging_app, ultimate_app]
+                request_logging_app._pipeline_request_logging_app = \
+                    request_logging_app
+                request_logging_app._pipeline_final_app = ultimate_app
+
+        for app in pipeline:
             app._pipeline = pipeline
+            # For things like making (logged) backend requests for
+            # get_account_info and get_container_info
+            app._pipeline_request_logging_app = request_logging_app
+            # For getting proxy-server options like *_existence_skip_cache_pct
             app._pipeline_final_app = ultimate_app
-        return app
+
+        return pipeline[0]
     return ctx.create()
 
 
@@ -795,27 +808,10 @@ class ServersPerPortStrategy(StrategyBase):
                 yield sock
 
 
-def run_wsgi(conf_path, app_section, *args, **kwargs):
-    """
-    Runs the server according to some strategy.  The default strategy runs a
-    specified number of workers in pre-fork model.  The object-server (only)
-    may use a servers-per-port strategy if its config has a servers_per_port
-    setting with a value greater than zero.
-
-    :param conf_path: Path to paste.deploy style configuration file/directory
-    :param app_section: App name from conf file to load config from
-    :param allow_modify_pipeline: Boolean for whether the server should have
-                                  an opportunity to change its own pipeline.
-                                  Defaults to True
-    :returns: 0 if successful, nonzero otherwise
-    """
+def check_config(conf_path, app_section, *args, **kwargs):
     # Load configuration, Set logger and Load request processor
-    try:
-        (conf, logger, log_name) = \
-            _initrp(conf_path, app_section, *args, **kwargs)
-    except ConfigFileError as e:
-        print(e)
-        return 1
+    (conf, logger, log_name) = \
+        _initrp(conf_path, app_section, *args, **kwargs)
 
     # optional nice/ionice priority scheduling
     utils.modify_priority(conf, logger)
@@ -832,13 +828,13 @@ def run_wsgi(conf_path, app_section, *args, **kwargs):
         strategy = WorkersStrategy(conf, logger)
         try:
             # Quick sanity check
-            int(conf['bind_port'])
+            if not (1 <= int(conf['bind_port']) <= 2 ** 16 - 1):
+                raise ValueError
         except (ValueError, KeyError, TypeError):
             error_msg = 'bind_port wasn\'t properly set in the config file. ' \
-                'It must be explicitly set to a valid port number.'
+                        'It must be explicitly set to a valid port number.'
             logger.error(error_msg)
-            print(error_msg)
-            return 1
+            raise ConfigFileError(error_msg)
 
     # patch event before loadapp
     utils.monkey_patch()
@@ -849,16 +845,44 @@ def run_wsgi(conf_path, app_section, *args, **kwargs):
     if 'global_conf_callback' in kwargs:
         kwargs['global_conf_callback'](conf, global_conf)
 
-    allow_modify_pipeline = kwargs.get('allow_modify_pipeline', True)
-
     # set utils.FALLOCATE_RESERVE if desired
     utils.FALLOCATE_RESERVE, utils.FALLOCATE_IS_PERCENT = \
         utils.config_fallocate_value(conf.get('fallocate_reserve', '1%'))
+    return conf, logger, global_conf, strategy
+
+
+def run_wsgi(conf_path, app_section, *args, **kwargs):
+    """
+    Runs the server according to some strategy.  The default strategy runs a
+    specified number of workers in pre-fork model.  The object-server (only)
+    may use a servers-per-port strategy if its config has a servers_per_port
+    setting with a value greater than zero.
+
+    :param conf_path: Path to paste.deploy style configuration file/directory
+    :param app_section: App name from conf file to load config from
+    :param allow_modify_pipeline: Boolean for whether the server should have
+                                  an opportunity to change its own pipeline.
+                                  Defaults to True
+    :param test_config: if False (the default) then load and validate the
+        config and if successful then continue to run the server; if True then
+        load and validate the config but do not run the server.
+    :returns: 0 if successful, nonzero otherwise
+    """
+    try:
+        conf, logger, global_conf, strategy = check_config(
+            conf_path, app_section, *args, **kwargs)
+    except ConfigFileError as err:
+        print(err)
+        return 1
+
+    if kwargs.get('test_config'):
+        return 0
 
     # Do some daemonization process hygene before we fork any children or run a
     # server without forking.
     clean_up_daemon_hygiene()
 
+    allow_modify_pipeline = kwargs.get('allow_modify_pipeline', True)
     no_fork_sock = strategy.no_fork_sock()
     if no_fork_sock:
         run_server(conf, logger, no_fork_sock, global_conf=global_conf,

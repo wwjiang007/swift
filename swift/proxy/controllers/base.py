@@ -44,7 +44,7 @@ from swift.common.utils import Timestamp, WatchdogTimeout, config_true_value, \
     public, split_path, list_from_csv, GreenthreadSafeIterator, \
     GreenAsyncPile, quorum_size, parse_content_type, drain_and_close, \
     document_iters_to_http_response_body, ShardRange, cache_from_env, \
-    MetricsPrefixLoggerAdapter, CooperativeIterator
+    CooperativeIterator
 from swift.common.bufferedhttp import http_connect
 from swift.common import constraints
 from swift.common.exceptions import ChunkReadTimeout, ChunkWriteTimeout, \
@@ -53,7 +53,8 @@ from swift.common.header_key_dict import HeaderKeyDict
 from swift.common.http import is_informational, is_success, is_redirection, \
     is_server_error, HTTP_OK, HTTP_PARTIAL_CONTENT, HTTP_MULTIPLE_CHOICES, \
     HTTP_BAD_REQUEST, HTTP_NOT_FOUND, HTTP_SERVICE_UNAVAILABLE, \
-    HTTP_UNAUTHORIZED, HTTP_CONTINUE, HTTP_GONE
+    HTTP_UNAUTHORIZED, HTTP_CONTINUE, HTTP_GONE, \
+    HTTP_REQUESTED_RANGE_NOT_SATISFIABLE
 from swift.common.swob import Request, Response, Range, \
     HTTPException, HTTPRequestedRangeNotSatisfiable, HTTPServiceUnavailable, \
     status_map, wsgi_to_str, str_to_wsgi, wsgi_quote, wsgi_unquote, \
@@ -87,19 +88,6 @@ def update_headers(response, headers):
                 'date', 'content-length', 'content-type',
                 'connection', 'x-put-timestamp', 'x-delete-after'):
             response.headers[name] = value
-
-
-def source_key(resp):
-    """
-    Provide the timestamp of the swift http response as a floating
-    point value.  Used as a sort key.
-
-    :param resp: bufferedhttp response object
-    """
-    return Timestamp(resp.getheader('x-backend-data-timestamp') or
-                     resp.getheader('x-backend-timestamp') or
-                     resp.getheader('x-put-timestamp') or
-                     resp.getheader('x-timestamp') or 0)
 
 
 def delay_denial(func):
@@ -416,10 +404,42 @@ def get_object_info(env, app, path=None, swift_source=None):
     return info
 
 
-def get_container_info(env, app, swift_source=None):
+def _record_ac_info_cache_metrics(
+        app, cache_state, container=None, resp=None):
+    """
+    Record a single cache operation by account or container lookup into its
+    corresponding metrics.
+
+    :param  app: the application object
+    :param  cache_state: the state of this cache operation, includes
+                infocache_hit, memcache hit, miss, error, skip, force_skip
+                and disabled.
+    :param  container: the container name
+    :param  resp: the response from either backend or cache hit.
+    """
+    try:
+        proxy_app = app._pipeline_final_app
+    except AttributeError:
+        logger = None
+    else:
+        logger = proxy_app.logger
+    server_type = 'container' if container else 'account'
+    if logger:
+        record_cache_op_metrics(logger, server_type, 'info', cache_state, resp)
+
+
+def get_container_info(env, app, swift_source=None, cache_only=False):
     """
     Get the info structure for a container, based on env and app.
     This is useful to middlewares.
+
+    :param env: the environment used by the current request
+    :param app: the application object
+    :param swift_source: Used to mark the request as originating out of
+                         middleware. Will be logged in proxy logs.
+    :param cache_only: If true, indicates that caller doesn't want to HEAD the
+                       backend container when cache miss.
+    :returns: the object info
 
     .. note::
 
@@ -438,14 +458,18 @@ def get_container_info(env, app, swift_source=None):
     container = wsgi_to_str(wsgi_container)
 
     # Try to cut through all the layers to the proxy app
+    # (while also preserving logging)
     try:
-        app = app._pipeline_final_app
+        logged_app = app._pipeline_request_logging_app
+        proxy_app = app._pipeline_final_app
     except AttributeError:
-        pass
+        logged_app = proxy_app = app
     # Check in environment cache and in memcache (in that order)
-    info = _get_info_from_caches(app, env, account, container)
+    info, cache_state = _get_info_from_caches(
+        proxy_app, env, account, container)
 
-    if not info:
+    resp = None
+    if not info and not cache_only:
         # Cache miss; go HEAD the container and populate the caches
         env.setdefault('swift.infocache', {})
         # Before checking the container, make sure the account exists.
@@ -455,11 +479,13 @@ def get_container_info(env, app, swift_source=None):
         # account is successful whether the account actually has .db files
         # on disk or not.
         is_autocreate_account = account.startswith(
-            getattr(app, 'auto_create_account_prefix',
+            getattr(proxy_app, 'auto_create_account_prefix',
                     constraints.AUTO_CREATE_ACCOUNT_PREFIX))
         if not is_autocreate_account:
-            account_info = get_account_info(env, app, swift_source)
+            account_info = get_account_info(env, logged_app, swift_source)
             if not account_info or not is_success(account_info['status']):
+                _record_ac_info_cache_metrics(
+                    logged_app, cache_state, container)
                 return headers_to_container_info({}, 0)
 
         req = _prepare_pre_auth_info_request(
@@ -468,7 +494,7 @@ def get_container_info(env, app, swift_source=None):
         # *Always* allow reserved names for get-info requests -- it's on the
         # caller to keep the result private-ish
         req.headers['X-Backend-Allow-Reserved-Names'] = 'true'
-        resp = req.get_response(app)
+        resp = req.get_response(logged_app)
         drain_and_close(resp)
         # Check in infocache to see if the proxy (or anyone else) already
         # populated the cache for us. If they did, just use what's there.
@@ -476,12 +502,13 @@ def get_container_info(env, app, swift_source=None):
         # See similar comment in get_account_info() for justification.
         info = _get_info_from_infocache(env, account, container)
         if info is None:
-            info = set_info_cache(app, env, account, container, resp)
+            info = set_info_cache(env, account, container, resp)
 
     if info:
         info = deepcopy(info)  # avoid mutating what's in swift.infocache
     else:
-        info = headers_to_container_info({}, 503)
+        status_int = 0 if cache_only else 503
+        info = headers_to_container_info({}, status_int)
 
     # Old data format in memcache immediately after a Swift upgrade; clean
     # it up so consumers of get_container_info() aren't exposed to it.
@@ -508,6 +535,7 @@ def get_container_info(env, app, swift_source=None):
         versions_info = get_container_info(versions_req.environ, app)
         info['bytes'] = info['bytes'] + versions_info['bytes']
 
+    _record_ac_info_cache_metrics(logged_app, cache_state, container, resp)
     return info
 
 
@@ -531,15 +559,18 @@ def get_account_info(env, app, swift_source=None):
     account = wsgi_to_str(wsgi_account)
 
     # Try to cut through all the layers to the proxy app
+    # (while also preserving logging)
     try:
-        app = app._pipeline_final_app
+        app = app._pipeline_request_logging_app
     except AttributeError:
         pass
     # Check in environment cache and in memcache (in that order)
-    info = _get_info_from_caches(app, env, account)
+    info, cache_state = _get_info_from_caches(app, env, account)
 
     # Cache miss; go HEAD the account and populate the caches
-    if not info:
+    if info:
+        resp = None
+    else:
         env.setdefault('swift.infocache', {})
         req = _prepare_pre_auth_info_request(
             env, "/%s/%s" % (version, wsgi_account),
@@ -565,7 +596,7 @@ def get_account_info(env, app, swift_source=None):
         # memcache would defeat the purpose.
         info = _get_info_from_infocache(env, account)
         if info is None:
-            info = set_info_cache(app, env, account, None, resp)
+            info = set_info_cache(env, account, None, resp)
 
     if info:
         info = info.copy()  # avoid mutating what's in swift.infocache
@@ -578,6 +609,7 @@ def get_account_info(env, app, swift_source=None):
         else:
             info[field] = int(info[field])
 
+    _record_ac_info_cache_metrics(app, cache_state, container=None, resp=resp)
     return info
 
 
@@ -632,11 +664,11 @@ def get_cache_key(account, container=None, obj=None, shard=None):
     return cache_key
 
 
-def set_info_cache(app, env, account, container, resp):
+def set_info_cache(env, account, container, resp):
     """
     Cache info in both memcache and env.
 
-    :param  app: the application object
+    :param  env: the WSGI request environment
     :param  account: the unquoted account name
     :param  container: the unquoted container name or None
     :param  resp: the response received or None if info cache should be cleared
@@ -648,7 +680,7 @@ def set_info_cache(app, env, account, container, resp):
     infocache = env.setdefault('swift.infocache', {})
     memcache = cache_from_env(env, True)
     if resp is None:
-        clear_info_cache(app, env, account, container)
+        clear_info_cache(env, account, container)
         return
 
     if container:
@@ -705,12 +737,11 @@ def set_object_info_cache(app, env, account, container, obj, resp):
     return info
 
 
-def clear_info_cache(app, env, account, container=None, shard=None):
+def clear_info_cache(env, account, container=None, shard=None):
     """
     Clear the cached info in both memcache and env
 
-    :param  app: the application object
-    :param  env: the WSGI environment
+    :param  env: the WSGI request environment
     :param  account: the account name
     :param  container: the container name if clearing info for containers, or
               None
@@ -743,11 +774,12 @@ def _get_info_from_infocache(env, account, container=None):
 
 
 def record_cache_op_metrics(
-        logger, op_type, cache_state, resp=None):
+        logger, server_type, op_type, cache_state, resp=None):
     """
     Record a single cache operation into its corresponding metrics.
 
     :param  logger: the metrics logger
+    :param  server_type: 'account' or 'container'
     :param  op_type: the name of the operation type, includes 'shard_listing',
               'shard_updating', and etc.
     :param  cache_state: the state of this cache operation. When it's
@@ -756,18 +788,23 @@ def record_cache_op_metrics(
               which will make to backend, expect a valid 'resp'.
     :param  resp: the response from backend for all cases except cache hits.
     """
+    server_type = server_type.lower()
     if cache_state == 'infocache_hit':
-        logger.increment('%s.infocache.hit' % op_type)
+        logger.increment('%s.%s.infocache.hit' % (server_type, op_type))
     elif cache_state == 'hit':
         # memcache hits.
-        logger.increment('%s.cache.hit' % op_type)
+        logger.increment('%s.%s.cache.hit' % (server_type, op_type))
     else:
         # the cases of cache_state is memcache miss, error, skip, force_skip
         # or disabled.
-        if resp is not None:
-            # Note: currently there is no case that 'resp' will be None.
-            logger.increment(
-                '%s.cache.%s.%d' % (op_type, cache_state, resp.status_int))
+        if resp:
+            logger.increment('%s.%s.cache.%s.%d' % (
+                server_type, op_type, cache_state, resp.status_int))
+        else:
+            # In some situation, we choose not to lookup backend after cache
+            # miss.
+            logger.increment('%s.%s.cache.%s' % (
+                server_type, op_type, cache_state))
 
 
 def _get_info_from_memcache(app, env, account, container=None):
@@ -779,61 +816,58 @@ def _get_info_from_memcache(app, env, account, container=None):
     :param  account: the account name
     :param  container: the container name
 
-    :returns: a dictionary of cached info on cache hit, None on miss. Also
-      returns None if memcache is not in use.
+    :returns: a tuple of two values, the first is a dictionary of cached info
+      on cache hit, None on miss or if memcache is not in use; the second is
+      cache state.
     """
-    cache_key = get_cache_key(account, container)
     memcache = cache_from_env(env, True)
-    if memcache:
-        try:
-            proxy_app = app._pipeline_final_app
-        except AttributeError:
-            # Only the middleware entry-points get a reference to the
-            # proxy-server app; if a middleware composes itself as multiple
-            # filters, we'll just have to choose a reasonable default
-            skip_chance = 0.0
-            logger = None
+    if not memcache:
+        return None, 'disabled'
+
+    try:
+        proxy_app = app._pipeline_final_app
+    except AttributeError:
+        # Only the middleware entry-points get a reference to the
+        # proxy-server app; if a middleware composes itself as multiple
+        # filters, we'll just have to choose a reasonable default
+        skip_chance = 0.0
+    else:
+        if container:
+            skip_chance = proxy_app.container_existence_skip_cache
         else:
-            if container:
-                skip_chance = proxy_app.container_existence_skip_cache
+            skip_chance = proxy_app.account_existence_skip_cache
+
+    cache_key = get_cache_key(account, container)
+    if skip_chance and random.random() < skip_chance:
+        info = None
+        cache_state = 'skip'
+    else:
+        info = memcache.get(cache_key)
+        cache_state = 'hit' if info else 'miss'
+    if info and six.PY2:
+        # Get back to native strings
+        new_info = {}
+        for key in info:
+            new_key = key.encode("utf-8") if isinstance(
+                key, six.text_type) else key
+            if isinstance(info[key], six.text_type):
+                new_info[new_key] = info[key].encode("utf-8")
+            elif isinstance(info[key], dict):
+                new_info[new_key] = {}
+                for subkey, value in info[key].items():
+                    new_subkey = subkey.encode("utf-8") if isinstance(
+                        subkey, six.text_type) else subkey
+                    if isinstance(value, six.text_type):
+                        new_info[new_key][new_subkey] = \
+                            value.encode("utf-8")
+                    else:
+                        new_info[new_key][new_subkey] = value
             else:
-                skip_chance = proxy_app.account_existence_skip_cache
-            logger = proxy_app.logger
-        info_type = 'container' if container else 'account'
-        if skip_chance and random.random() < skip_chance:
-            info = None
-            if logger:
-                logger.increment('%s.info.cache.skip' % info_type)
-        else:
-            info = memcache.get(cache_key)
-            if logger:
-                logger.increment('%s.info.cache.%s' % (
-                    info_type, 'hit' if info else 'miss'))
-        if info and six.PY2:
-            # Get back to native strings
-            new_info = {}
-            for key in info:
-                new_key = key.encode("utf-8") if isinstance(
-                    key, six.text_type) else key
-                if isinstance(info[key], six.text_type):
-                    new_info[new_key] = info[key].encode("utf-8")
-                elif isinstance(info[key], dict):
-                    new_info[new_key] = {}
-                    for subkey, value in info[key].items():
-                        new_subkey = subkey.encode("utf-8") if isinstance(
-                            subkey, six.text_type) else subkey
-                        if isinstance(value, six.text_type):
-                            new_info[new_key][new_subkey] = \
-                                value.encode("utf-8")
-                        else:
-                            new_info[new_key][new_subkey] = value
-                else:
-                    new_info[new_key] = info[key]
-            info = new_info
-        if info:
-            env.setdefault('swift.infocache', {})[cache_key] = info
-        return info
-    return None
+                new_info[new_key] = info[key]
+        info = new_info
+    if info:
+        env.setdefault('swift.infocache', {})[cache_key] = info
+    return info, cache_state
 
 
 def _get_info_from_caches(app, env, account, container=None):
@@ -843,13 +877,16 @@ def _get_info_from_caches(app, env, account, container=None):
 
     :param  app: the application object
     :param  env: the environment used by the current request
-    :returns: the cached info or None if not cached
+    :returns: a tuple of (the cached info or None if not cached, cache state)
     """
 
     info = _get_info_from_infocache(env, account, container)
-    if info is None:
-        info = _get_info_from_memcache(app, env, account, container)
-    return info
+    if info:
+        cache_state = 'infocache_hit'
+    else:
+        info, cache_state = _get_info_from_memcache(
+            app, env, account, container)
+    return info, cache_state
 
 
 def _prepare_pre_auth_info_request(env, path, swift_source):
@@ -984,6 +1021,21 @@ def bytes_to_skip(record_size, range_start):
     return (record_size - (range_start % record_size)) % record_size
 
 
+def is_good_source(status, server_type):
+    """
+    Indicates whether or not the request made to the backend found
+    what it was looking for.
+
+    :param resp: the response from the backend.
+    :param server_type: the type of server: 'Account', 'Container' or 'Object'.
+    :returns: True if the response status code is acceptable, False if not.
+    """
+    if (server_type == 'Object' and
+            status == HTTP_REQUESTED_RANGE_NOT_SATISFIABLE):
+        return True
+    return is_success(status) or is_redirection(status)
+
+
 class ByteCountEnforcer(object):
     """
     Enforces that successive calls to file_like.read() give at least
@@ -1015,49 +1067,73 @@ class ByteCountEnforcer(object):
             return chunk
 
 
-class GetOrHeadHandler(object):
-    def __init__(self, app, req, server_type, node_iter, partition, path,
-                 backend_headers, concurrency=1, policy=None,
-                 client_chunk_size=None, newest=None, logger=None):
+class GetterSource(object):
+    __slots__ = ('app', 'resp', 'node', '_parts_iter')
+
+    def __init__(self, app, resp, node):
         self.app = app
+        self.resp = resp
+        self.node = node
+        self._parts_iter = None
+
+    @property
+    def timestamp(self):
+        """
+        Provide the timestamp of the swift http response as a floating
+        point value.  Used as a sort key.
+
+        :return: an instance of ``utils.Timestamp``
+        """
+        return Timestamp(self.resp.getheader('x-backend-data-timestamp') or
+                         self.resp.getheader('x-backend-timestamp') or
+                         self.resp.getheader('x-put-timestamp') or
+                         self.resp.getheader('x-timestamp') or 0)
+
+    @property
+    def parts_iter(self):
+        # lazy load a source response body parts iter if and when the source is
+        # actually read
+        if self.resp and not self._parts_iter:
+            self._parts_iter = http_response_to_document_iters(
+                self.resp, read_chunk_size=self.app.object_chunk_size)
+        return self._parts_iter
+
+    def close(self):
+        # Close-out the connection as best as possible.
+        close_swift_conn(self.resp)
+
+
+class GetterBase(object):
+    def __init__(self, app, req, node_iter, partition, policy,
+                 path, backend_headers, logger=None):
+        self.app = app
+        self.req = req
         self.node_iter = node_iter
-        self.server_type = server_type
         self.partition = partition
+        self.policy = policy
         self.path = path
         self.backend_headers = backend_headers
-        self.client_chunk_size = client_chunk_size
         self.logger = logger or app.logger
-        self.skip_bytes = 0
         self.bytes_used_from_backend = 0
-        self.used_nodes = []
-        self.used_source_etag = ''
-        self.concurrency = concurrency
-        self.policy = policy
-        self.node = None
-        self.latest_404_timestamp = Timestamp(0)
-        policy_options = self.app.get_policy_options(self.policy)
-        self.rebalance_missing_suppression_count = min(
-            policy_options.rebalance_missing_suppression_count,
-            node_iter.num_primary_nodes - 1)
+        self.source = None
 
-        # stuff from request
-        self.req_method = req.method
-        self.req_path = req.path
-        self.req_query_string = req.query_string
-        if newest is None:
-            self.newest = config_true_value(req.headers.get('x-newest', 'f'))
-        else:
-            self.newest = newest
+    def _find_source(self):
+        """
+        Look for a suitable new source and if one is found then set
+        ``self.source``.
 
-        # populated when finding source
-        self.statuses = []
-        self.reasons = []
-        self.bodies = []
-        self.source_headers = []
-        self.sources = []
+        :return: ``True`` if ``self.source`` has been updated, ``False``
+            otherwise.
+        """
+        # Subclasses must implement this method, but _replace_source should be
+        # called to get a source installed
+        raise NotImplementedError()
 
-        # populated from response headers
-        self.start_byte = self.end_byte = self.length = None
+    def _replace_source(self, err_msg=''):
+        if self.source:
+            self.app.error_occurred(self.source.node, err_msg)
+            self.source.close()
+        return self._find_source()
 
     def fast_forward(self, num_bytes):
         """
@@ -1071,6 +1147,9 @@ class GetOrHeadHandler(object):
                                                   > end of range + 1
         :raises RangeAlreadyComplete: if begin + num_bytes == end of range + 1
         """
+        self.backend_headers.pop(
+            'X-Backend-Ignore-Range-If-Metadata-Present', None)
+
         try:
             req_range = Range(self.backend_headers.get('Range'))
         except ValueError:
@@ -1133,9 +1212,6 @@ class GetOrHeadHandler(object):
 
     def learn_size_from_content_range(self, start, end, length):
         """
-        If client_chunk_size is set, makes sure we yield things starting on
-        chunk boundaries based on the Content-Range header in the response.
-
         Sets our Range header's first byterange to the value learned from
         the Content-Range header in the response; if we were given a
         fully-specified range (e.g. "bytes=123-456"), this is a no-op.
@@ -1147,9 +1223,6 @@ class GetOrHeadHandler(object):
         """
         if length == 0:
             return
-
-        if self.client_chunk_size:
-            self.skip_bytes = bytes_to_skip(self.client_chunk_size, start)
 
         if 'Range' in self.backend_headers:
             try:
@@ -1165,181 +1238,133 @@ class GetOrHeadHandler(object):
                                             e if e is not None else '')
                                  for s, e in new_ranges)))
 
-    def is_good_source(self, src):
-        """
-        Indicates whether or not the request made to the backend found
-        what it was looking for.
 
-        :param src: the response from the backend
-        :returns: True if found, False if not
-        """
-        if self.server_type == 'Object' and src.status == 416:
-            return True
-        return is_success(src.status) or is_redirection(src.status)
+class GetOrHeadHandler(GetterBase):
+    def __init__(self, app, req, server_type, node_iter, partition, path,
+                 backend_headers, concurrency=1, policy=None,
+                 newest=None, logger=None):
+        super(GetOrHeadHandler, self).__init__(
+            app=app, req=req, node_iter=node_iter,
+            partition=partition, policy=policy, path=path,
+            backend_headers=backend_headers, logger=logger)
+        self.server_type = server_type
+        self.used_nodes = []
+        self.used_source_etag = None
+        self.concurrency = concurrency
+        self.latest_404_timestamp = Timestamp(0)
+        if self.server_type == 'Object':
+            self.node_timeout = self.app.recoverable_node_timeout
+        else:
+            self.node_timeout = self.app.node_timeout
+        policy_options = self.app.get_policy_options(self.policy)
+        self.rebalance_missing_suppression_count = min(
+            policy_options.rebalance_missing_suppression_count,
+            node_iter.num_primary_nodes - 1)
 
-    def _get_response_parts_iter(self, req, node, source):
-        # Someday we can replace this [mess] with python 3's "nonlocal"
-        source = [source]
-        node = [node]
+        if newest is None:
+            self.newest = config_true_value(req.headers.get('x-newest', 'f'))
+        else:
+            self.newest = newest
 
+        # populated when finding source
+        self.statuses = []
+        self.reasons = []
+        self.bodies = []
+        self.source_headers = []
+        self.sources = []
+
+        # populated from response headers
+        self.start_byte = self.end_byte = self.length = None
+
+    def _get_next_response_part(self):
+        # return the next part of the response body; there may only be one part
+        # unless it's a multipart/byteranges response
+        while True:
+            try:
+                # This call to next() performs IO when we have a
+                # multipart/byteranges response; it reads the MIME
+                # boundary and part headers.
+                #
+                # If we don't have a multipart/byteranges response,
+                # but just a 200 or a single-range 206, then this
+                # performs no IO, and either just returns source or
+                # raises StopIteration.
+                with WatchdogTimeout(self.app.watchdog, self.node_timeout,
+                                     ChunkReadTimeout):
+                    # if StopIteration is raised, it escapes and is
+                    # handled elsewhere
+                    start_byte, end_byte, length, headers, part = next(
+                        self.source.parts_iter)
+                return (start_byte, end_byte, length, headers, part)
+            except ChunkReadTimeout:
+                if not self._replace_source(
+                        'Trying to read object during GET (retrying)'):
+                    raise StopIteration()
+
+    def _iter_bytes_from_response_part(self, part_file, nbytes):
+        # yield chunks of bytes from a single response part; if an error
+        # occurs, try to resume yielding bytes from a different source
+        part_file = ByteCountEnforcer(part_file, nbytes)
+        while True:
+            try:
+                with WatchdogTimeout(self.app.watchdog, self.node_timeout,
+                                     ChunkReadTimeout):
+                    chunk = part_file.read(self.app.object_chunk_size)
+                    if nbytes is not None:
+                        nbytes -= len(chunk)
+            except (ChunkReadTimeout, ShortReadError):
+                exc_type, exc_value, exc_traceback = exc_info()
+                if self.newest or self.server_type != 'Object':
+                    raise
+                try:
+                    self.fast_forward(self.bytes_used_from_backend)
+                except (HTTPException, ValueError):
+                    six.reraise(exc_type, exc_value, exc_traceback)
+                except RangeAlreadyComplete:
+                    break
+                if self._replace_source(
+                        'Trying to read object during GET (retrying)'):
+                    try:
+                        _junk, _junk, _junk, _junk, part_file = \
+                            self._get_next_response_part()
+                    except StopIteration:
+                        # Tried to find a new node from which to
+                        # finish the GET, but failed. There's
+                        # nothing more we can do here.
+                        six.reraise(exc_type, exc_value, exc_traceback)
+                    part_file = ByteCountEnforcer(part_file, nbytes)
+                else:
+                    six.reraise(exc_type, exc_value, exc_traceback)
+            else:
+                if not chunk:
+                    break
+
+                with WatchdogTimeout(self.app.watchdog,
+                                     self.app.client_timeout,
+                                     ChunkWriteTimeout):
+                    self.bytes_used_from_backend += len(chunk)
+                    yield chunk
+
+    def _iter_parts_from_response(self, req):
+        # iterate over potentially multiple response body parts; for each
+        # part, yield an iterator over the part's bytes
         try:
-            client_chunk_size = self.client_chunk_size
-            node_timeout = self.app.node_timeout
-            if self.server_type == 'Object':
-                node_timeout = self.app.recoverable_node_timeout
-
-            # This is safe; it sets up a generator but does not call next()
-            # on it, so no IO is performed.
-            parts_iter = [
-                http_response_to_document_iters(
-                    source[0], read_chunk_size=self.app.object_chunk_size)]
-
-            def get_next_doc_part():
-                while True:
-                    try:
-                        # This call to next() performs IO when we have a
-                        # multipart/byteranges response; it reads the MIME
-                        # boundary and part headers.
-                        #
-                        # If we don't have a multipart/byteranges response,
-                        # but just a 200 or a single-range 206, then this
-                        # performs no IO, and either just returns source or
-                        # raises StopIteration.
-                        with WatchdogTimeout(self.app.watchdog, node_timeout,
-                                             ChunkReadTimeout):
-                            # if StopIteration is raised, it escapes and is
-                            # handled elsewhere
-                            start_byte, end_byte, length, headers, part = next(
-                                parts_iter[0])
-                        return (start_byte, end_byte, length, headers, part)
-                    except ChunkReadTimeout:
-                        new_source, new_node = self._get_source_and_node()
-                        if new_source:
-                            self.app.error_occurred(
-                                node[0], 'Trying to read object during '
-                                         'GET (retrying)')
-                            # Close-out the connection as best as possible.
-                            if getattr(source[0], 'swift_conn', None):
-                                close_swift_conn(source[0])
-                            source[0] = new_source
-                            node[0] = new_node
-                            # This is safe; it sets up a generator but does
-                            # not call next() on it, so no IO is performed.
-                            parts_iter[0] = http_response_to_document_iters(
-                                new_source,
-                                read_chunk_size=self.app.object_chunk_size)
-                        else:
-                            raise StopIteration()
-
-            def iter_bytes_from_response_part(part_file, nbytes):
-                buf = b''
-                part_file = ByteCountEnforcer(part_file, nbytes)
-                while True:
-                    try:
-                        with WatchdogTimeout(self.app.watchdog, node_timeout,
-                                             ChunkReadTimeout):
-                            chunk = part_file.read(self.app.object_chunk_size)
-                            # NB: this append must be *inside* the context
-                            # manager for test.unit.SlowBody to do its thing
-                            buf += chunk
-                            if nbytes is not None:
-                                nbytes -= len(chunk)
-                    except (ChunkReadTimeout, ShortReadError):
-                        exc_type, exc_value, exc_traceback = exc_info()
-                        if self.newest or self.server_type != 'Object':
-                            raise
-                        try:
-                            self.fast_forward(self.bytes_used_from_backend)
-                        except (HTTPException, ValueError):
-                            six.reraise(exc_type, exc_value, exc_traceback)
-                        except RangeAlreadyComplete:
-                            break
-                        buf = b''
-                        new_source, new_node = self._get_source_and_node()
-                        if new_source:
-                            self.app.error_occurred(
-                                node[0], 'Trying to read object during '
-                                         'GET (retrying)')
-                            # Close-out the connection as best as possible.
-                            if getattr(source[0], 'swift_conn', None):
-                                close_swift_conn(source[0])
-                            source[0] = new_source
-                            node[0] = new_node
-                            # This is safe; it just sets up a generator but
-                            # does not call next() on it, so no IO is
-                            # performed.
-                            parts_iter[0] = http_response_to_document_iters(
-                                new_source,
-                                read_chunk_size=self.app.object_chunk_size)
-
-                            try:
-                                _junk, _junk, _junk, _junk, part_file = \
-                                    get_next_doc_part()
-                            except StopIteration:
-                                # Tried to find a new node from which to
-                                # finish the GET, but failed. There's
-                                # nothing more we can do here.
-                                six.reraise(exc_type, exc_value, exc_traceback)
-                            part_file = ByteCountEnforcer(part_file, nbytes)
-                        else:
-                            six.reraise(exc_type, exc_value, exc_traceback)
-                    else:
-                        if buf and self.skip_bytes:
-                            if self.skip_bytes < len(buf):
-                                buf = buf[self.skip_bytes:]
-                                self.bytes_used_from_backend += self.skip_bytes
-                                self.skip_bytes = 0
-                            else:
-                                self.skip_bytes -= len(buf)
-                                self.bytes_used_from_backend += len(buf)
-                                buf = b''
-
-                        if not chunk:
-                            if buf:
-                                with WatchdogTimeout(self.app.watchdog,
-                                                     self.app.client_timeout,
-                                                     ChunkWriteTimeout):
-                                    self.bytes_used_from_backend += len(buf)
-                                    yield buf
-                                buf = b''
-                            break
-
-                        if client_chunk_size is not None:
-                            while len(buf) >= client_chunk_size:
-                                client_chunk = buf[:client_chunk_size]
-                                buf = buf[client_chunk_size:]
-                                with WatchdogTimeout(self.app.watchdog,
-                                                     self.app.client_timeout,
-                                                     ChunkWriteTimeout):
-                                    self.bytes_used_from_backend += \
-                                        len(client_chunk)
-                                    yield client_chunk
-                        else:
-                            with WatchdogTimeout(self.app.watchdog,
-                                                 self.app.client_timeout,
-                                                 ChunkWriteTimeout):
-                                self.bytes_used_from_backend += len(buf)
-                                yield buf
-                            buf = b''
-
             part_iter = None
             try:
                 while True:
                     start_byte, end_byte, length, headers, part = \
-                        get_next_doc_part()
-                    # note: learn_size_from_content_range() sets
-                    # self.skip_bytes
+                        self._get_next_response_part()
                     self.learn_size_from_content_range(
                         start_byte, end_byte, length)
                     self.bytes_used_from_backend = 0
                     # not length; that refers to the whole object, so is the
                     # wrong value to use for GET-range responses
-                    byte_count = ((end_byte - start_byte + 1) - self.skip_bytes
+                    byte_count = ((end_byte - start_byte + 1)
                                   if (end_byte is not None
                                       and start_byte is not None)
                                   else None)
                     part_iter = CooperativeIterator(
-                        iter_bytes_from_response_part(part, byte_count))
+                        self._iter_bytes_from_response_part(part, byte_count))
                     yield {'start_byte': start_byte, 'end_byte': end_byte,
                            'entity_length': length, 'headers': headers,
                            'part_iter': part_iter}
@@ -1351,14 +1376,15 @@ class GetOrHeadHandler(object):
                     part_iter.close()
 
         except ChunkReadTimeout:
-            self.app.exception_occurred(node[0], 'Object',
+            self.app.exception_occurred(self.source.node, 'Object',
                                         'Trying to read during GET')
             raise
         except ChunkWriteTimeout:
             self.logger.info(
                 'Client did not read from proxy within %ss',
                 self.app.client_timeout)
-            self.logger.increment('client_timeouts')
+            self.logger.increment('%s.client_timeouts' %
+                                  self.server_type.lower())
         except GeneratorExit:
             warn = True
             req_range = self.backend_headers['Range']
@@ -1377,9 +1403,7 @@ class GetOrHeadHandler(object):
             self.logger.exception('Trying to send to client')
             raise
         finally:
-            # Close-out the connection as best as possible.
-            if getattr(source[0], 'swift_conn', None):
-                close_swift_conn(source[0])
+            self.source.close()
 
     @property
     def last_status(self):
@@ -1396,6 +1420,10 @@ class GetOrHeadHandler(object):
             return None
 
     def _make_node_request(self, node, node_timeout, logger_thread_locals):
+        # make a backend request; return True if the response is deemed good
+        # (has an acceptable status code), useful (matches any previously
+        # discovered etag) and sufficient (a single good response is
+        # insufficient when we're searching for the newest timestamp)
         self.logger.thread_locals = logger_thread_locals
         if node in self.used_nodes:
             return False
@@ -1406,9 +1434,9 @@ class GetOrHeadHandler(object):
             with ConnectionTimeout(self.app.conn_timeout):
                 conn = http_connect(
                     ip, port, node['device'],
-                    self.partition, self.req_method, self.path,
+                    self.partition, self.req.method, self.path,
                     headers=req_headers,
-                    query_string=self.req_query_string)
+                    query_string=self.req.query_string)
             self.app.set_node_timing(node, time.time() - start_node_timing)
 
             with Timeout(node_timeout):
@@ -1419,13 +1447,13 @@ class GetOrHeadHandler(object):
             self.app.exception_occurred(
                 node, self.server_type,
                 'Trying to %(method)s %(path)s' %
-                {'method': self.req_method, 'path': self.req_path})
+                {'method': self.req.method, 'path': self.req.path})
             return False
 
         src_headers = dict(
             (k.lower(), v) for k, v in
             possible_source.getheaders())
-        if self.is_good_source(possible_source):
+        if is_good_source(possible_source.status, self.server_type):
             # 404 if we know we don't have a synced copy
             if not float(possible_source.getheader('X-PUT-Timestamp', 1)):
                 self.statuses.append(HTTP_NOT_FOUND)
@@ -1455,7 +1483,8 @@ class GetOrHeadHandler(object):
                     self.reasons.append(possible_source.reason)
                     self.bodies.append(None)
                     self.source_headers.append(possible_source.getheaders())
-                    self.sources.append((possible_source, node))
+                    self.sources.append(
+                        GetterSource(self.app, possible_source, node))
                     if not self.newest:  # one good source is enough
                         return True
         else:
@@ -1489,11 +1518,11 @@ class GetOrHeadHandler(object):
                 if ts > self.latest_404_timestamp:
                     self.latest_404_timestamp = ts
             self.app.check_response(node, self.server_type, possible_source,
-                                    self.req_method, self.path,
+                                    self.req.method, self.path,
                                     self.bodies[-1])
         return False
 
-    def _get_source_and_node(self):
+    def _find_source(self):
         self.statuses = []
         self.reasons = []
         self.bodies = []
@@ -1524,41 +1553,38 @@ class GetOrHeadHandler(object):
         # and added to the list in the case of x-newest.
         if self.sources:
             self.sources = [s for s in self.sources
-                            if source_key(s[0]) >= self.latest_404_timestamp]
+                            if s.timestamp >= self.latest_404_timestamp]
 
         if self.sources:
-            self.sources.sort(key=lambda s: source_key(s[0]))
-            source, node = self.sources.pop()
-            for src, _junk in self.sources:
-                close_swift_conn(src)
-            self.used_nodes.append(node)
-            src_headers = dict(
-                (k.lower(), v) for k, v in
-                source.getheaders())
+            self.sources.sort(key=operator.attrgetter('timestamp'))
+            source = self.sources.pop()
+            for unused_source in self.sources:
+                unused_source.close()
+            self.used_nodes.append(source.node)
 
             # Save off the source etag so that, if we lose the connection
             # and have to resume from a different node, we can be sure that
             # we have the same object (replication). Otherwise, if the cluster
             # has two versions of the same object, we might end up switching
             # between old and new mid-stream and giving garbage to the client.
-            self.used_source_etag = normalize_etag(src_headers.get('etag', ''))
-            self.node = node
-            return source, node
-        return None, None
+            if self.used_source_etag is None:
+                self.used_source_etag = normalize_etag(
+                    source.resp.getheader('etag', ''))
+            self.source = source
+            return True
+        return False
 
-    def _make_app_iter(self, req, node, source):
+    def _make_app_iter(self, req):
         """
         Returns an iterator over the contents of the source (via its read
         func).  There is also quite a bit of cleanup to ensure garbage
         collection works and the underlying socket of the source is closed.
 
         :param req: incoming request object
-        :param source: The httplib.Response object this iterator should read
-                       from.
-        :param node: The node the source is reading from, for logging purposes.
+        :return: an iterator that yields chunks of response body bytes
         """
 
-        ct = source.getheader('Content-Type')
+        ct = self.source.resp.getheader('Content-Type')
         if ct:
             content_type, content_type_attrs = parse_content_type(ct)
             is_multipart = content_type == 'multipart/byteranges'
@@ -1571,7 +1597,7 @@ class GetOrHeadHandler(object):
             # furnished one for us, so we'll just re-use it
             boundary = dict(content_type_attrs)["boundary"]
 
-        parts_iter = self._get_response_parts_iter(req, node, source)
+        parts_iter = self._iter_parts_from_response(req)
 
         def add_content_type(response_part):
             response_part["content_type"] = \
@@ -1583,25 +1609,25 @@ class GetOrHeadHandler(object):
             boundary, is_multipart, self.logger)
 
     def get_working_response(self, req):
-        source, node = self._get_source_and_node()
         res = None
-        if source:
+        if self._replace_source():
             res = Response(request=req)
-            res.status = source.status
-            update_headers(res, source.getheaders())
+            res.status = self.source.resp.status
+            update_headers(res, self.source.resp.getheaders())
             if req.method == 'GET' and \
-                    source.status in (HTTP_OK, HTTP_PARTIAL_CONTENT):
-                res.app_iter = self._make_app_iter(req, node, source)
+                    self.source.resp.status in (HTTP_OK, HTTP_PARTIAL_CONTENT):
+                res.app_iter = self._make_app_iter(req)
                 # See NOTE: swift_conn at top of file about this.
-                res.swift_conn = source.swift_conn
+                res.swift_conn = self.source.resp.swift_conn
             if not res.environ:
                 res.environ = {}
-            res.environ['swift_x_timestamp'] = source.getheader('x-timestamp')
+            res.environ['swift_x_timestamp'] = self.source.resp.getheader(
+                'x-timestamp')
             res.accept_ranges = 'bytes'
-            res.content_length = source.getheader('Content-Length')
-            if source.getheader('Content-Type'):
+            res.content_length = self.source.resp.getheader('Content-Length')
+            if self.source.resp.getheader('Content-Type'):
                 res.charset = None
-                res.content_type = source.getheader('Content-Type')
+                res.content_type = self.source.resp.getheader('Content-Type')
         return res
 
 
@@ -1619,6 +1645,7 @@ class NodeIter(object):
     may not, depending on how logging is configured, the vagaries of
     socket IO and eventlet, and the phase of the moon.)
 
+    :param server_type: one of 'account', 'container', or 'object'
     :param app: a proxy app
     :param ring: ring to get yield nodes from
     :param partition: ring partition to yield nodes for
@@ -1631,8 +1658,9 @@ class NodeIter(object):
         None for an account or container ring.
     """
 
-    def __init__(self, app, ring, partition, logger, request, node_iter=None,
-                 policy=None):
+    def __init__(self, server_type, app, ring, partition, logger, request,
+                 node_iter=None, policy=None):
+        self.server_type = server_type
         self.app = app
         self.ring = ring
         self.partition = partition
@@ -1679,12 +1707,14 @@ class NodeIter(object):
             return
         extra_handoffs = handoffs - self.expected_handoffs
         if extra_handoffs > 0:
-            self.logger.increment('handoff_count')
+            self.logger.increment('%s.handoff_count' %
+                                  self.server_type.lower())
             self.logger.warning(
                 'Handoff requested (%d)' % handoffs)
             if (extra_handoffs == self.num_primary_nodes):
                 # all the primaries were skipped, and handoffs didn't help
-                self.logger.increment('handoff_all_count')
+                self.logger.increment('%s.handoff_all_count' %
+                                      self.server_type.lower())
 
     def set_node_provider(self, callback):
         """
@@ -1761,9 +1791,10 @@ class Controller(object):
         self.trans_id = '-'
         self._allowed_methods = None
         self._private_methods = None
-        # adapt the app logger to prefix statsd metrics with the server type
-        self.logger = MetricsPrefixLoggerAdapter(
-            self.app.logger, {}, self.server_type.lower())
+
+    @property
+    def logger(self):
+        return self.app.logger
 
     @property
     def allowed_methods(self):
@@ -1981,9 +2012,8 @@ class Controller(object):
         :param node_iterator: optional node iterator.
         :returns: a swob.Response object
         """
-        nodes = GreenthreadSafeIterator(
-            node_iterator or self.app.iter_nodes(ring, part, self.logger, req)
-        )
+        nodes = GreenthreadSafeIterator(node_iterator or NodeIter(
+            self.server_type.lower(), self.app, ring, part, self.logger, req))
         node_number = node_count or len(ring.get_part_nodes(part))
         pile = GreenAsyncPile(node_number)
 
@@ -2152,19 +2182,19 @@ class Controller(object):
         headers.update((k, v)
                        for k, v in req.headers.items()
                        if is_sys_meta('account', k))
-        resp = self.make_requests(Request.blank('/v1' + path),
+        resp = self.make_requests(Request.blank(str_to_wsgi('/v1' + path)),
                                   self.app.account_ring, partition, 'PUT',
                                   path, [headers] * len(nodes))
         if is_success(resp.status_int):
             self.logger.info('autocreate account %r', path)
-            clear_info_cache(self.app, req.environ, account)
+            clear_info_cache(req.environ, account)
             return True
         else:
             self.logger.warning('Could not autocreate account %r', path)
             return False
 
     def GETorHEAD_base(self, req, server_type, node_iter, partition, path,
-                       concurrency=1, policy=None, client_chunk_size=None):
+                       concurrency=1, policy=None):
         """
         Base handler for HTTP GET or HEAD requests.
 
@@ -2175,7 +2205,6 @@ class Controller(object):
         :param path: path for the request
         :param concurrency: number of requests to run concurrently
         :param policy: the policy instance, or None if Account or Container
-        :param client_chunk_size: chunk size for response body iterator
         :returns: swob.Response object
         """
         backend_headers = self.generate_request_headers(
@@ -2184,7 +2213,6 @@ class Controller(object):
         handler = GetOrHeadHandler(self.app, req, self.server_type, node_iter,
                                    partition, path, backend_headers,
                                    concurrency, policy=policy,
-                                   client_chunk_size=client_chunk_size,
                                    logger=self.logger)
         res = handler.get_working_response(req)
 
@@ -2402,7 +2430,7 @@ class Controller(object):
         params.pop('limit', None)
         params['format'] = 'json'
         if includes:
-            params['includes'] = includes
+            params['includes'] = str_to_wsgi(includes)
         if states:
             params['states'] = states
         headers = {'X-Backend-Record-Type': 'shard'}

@@ -45,7 +45,8 @@ from swift.common.utils import Timestamp, list_from_csv, md5, FileLikeIter
 from swift.proxy import server as proxy_server
 from swift.proxy.controllers import obj
 from swift.proxy.controllers.base import \
-    get_container_info as _real_get_container_info
+    get_container_info as _real_get_container_info, GetterSource, \
+    NodeIter
 from swift.common.storage_policy import POLICIES, ECDriverError, \
     StoragePolicy, ECStoragePolicy
 from swift.common.swob import Request
@@ -54,7 +55,7 @@ from test.unit import (
     FakeRing, fake_http_connect, patch_policies, SlowBody, FakeStatus,
     DEFAULT_TEST_EC_TYPE, encode_frag_archive_bodies, make_ec_object_stub,
     fake_ec_node_response, StubResponse, mocked_http_conn,
-    quiet_eventlet_exceptions)
+    quiet_eventlet_exceptions, FakeSource)
 from test.unit.proxy.test_server import node_error_count
 
 
@@ -1552,6 +1553,31 @@ class TestReplicatedObjController(CommonObjectControllerMixin,
         for conn in conns:
             self.assertTrue(conn.closed)
 
+    def test_PUT_insufficient_data_from_client(self):
+        class FakeReader(object):
+            def read(self, size):
+                raise Timeout()
+        conns = []
+
+        def capture_expect(conn):
+            # stash connections so that we can verify they all get closed
+            conns.append(conn)
+
+        req = swob.Request.blank('/v1/a/c/o.jpg', method='PUT',
+                                 body='7 bytes')
+        req.headers['content-length'] = '99'
+        with set_http_connect(201, 201, 201, give_expect=capture_expect):
+            resp = req.get_response(self.app)
+
+        self.assertEqual(resp.status_int, 499)
+        warning_lines = self.app.logger.get_lines_for_level('warning')
+        self.assertEqual(1, len(warning_lines))
+        self.assertIn('Client disconnected without sending enough data',
+                      warning_lines[0])
+        self.assertEqual(self.replicas(), len(conns))
+        for conn in conns:
+            self.assertTrue(conn.closed)
+
     def test_PUT_exception_during_transfer_data(self):
         class FakeReader(object):
             def read(self, size):
@@ -1574,6 +1600,301 @@ class TestReplicatedObjController(CommonObjectControllerMixin,
         self.assertEqual(resp.status_int, 200)
         self.assertIn('Accept-Ranges', resp.headers)
         self.assertNotIn('Connection', resp.headers)
+
+    def test_GET_slow_read(self):
+        self.app.recoverable_node_timeout = 0.01
+        self.app.client_timeout = 0.1
+        self.app.object_chunk_size = 10
+        body = b'test'
+        etag = md5(body, usedforsecurity=False).hexdigest()
+        headers = {
+            'Etag': etag,
+            'Content-Length': len(body),
+            'X-Timestamp': Timestamp(self.ts()).normal,
+        }
+        responses = [(200, body, headers)] * 2
+        status_codes, body_iter, headers = zip(*responses)
+        req = swift.common.swob.Request.blank('/v1/a/c/o')
+        # make the first response slow...
+        read_sleeps = [0.1, 0]
+        with mocked_http_conn(*status_codes, body_iter=body_iter,
+                              headers=headers, slow=read_sleeps) as log:
+            resp = req.get_response(self.app)
+            self.assertEqual(resp.status_int, 200)
+            body = resp.body
+        self.assertEqual(b'test', body)
+        self.assertEqual(len(log.requests), 2)
+
+        def make_key(r):
+            r['device'] = r['path'].split('/')[1]
+            return '%(ip)s:%(port)s/%(device)s' % r
+        # the first node got errors incr'd
+        expected_error_limiting = {
+            make_key(log.requests[0]): {
+                'errors': 1,
+                'last_error': mock.ANY,
+            }
+        }
+        actual = {}
+        for n in self.app.get_object_ring(int(self.policy)).devs:
+            node_key = self.app.error_limiter.node_key(n)
+            stats = self.app.error_limiter.stats.get(node_key) or {}
+            if stats:
+                actual[self.app.error_limiter.node_key(n)] = stats
+        self.assertEqual(actual, expected_error_limiting)
+        for read_line in self.app.logger.get_lines_for_level('error'):
+            self.assertIn("Trying to read object during GET (retrying)",
+                          read_line)
+        self.assertEqual(
+            len(self.logger.logger.records['ERROR']), 1,
+            'Expected 1 ERROR lines, got %r' % (
+                self.logger.logger.records['ERROR'], ))
+
+    def _do_test_GET_with_multirange_slow_body_resumes(
+            self, slowdown_after=0, resume_bytes=0):
+        self.app.logger.clear()
+        self.app.recoverable_node_timeout = 0.01
+        self.app.object_chunk_size = 10
+        obj_data = b''.join([b'testing%03d' % i for i in range(100)])
+        etag = md5(obj_data, usedforsecurity=False).hexdigest()
+        boundary1 = b'81eb9c110b32ced5fe'
+        resp_body1 = b'\r\n'.join([
+            b'--' + boundary1,
+            b'Content-Type: application/octet-stream',
+            b'Content-Range: bytes 0-49/700',
+            b'',
+            obj_data[0:50],
+            b'--' + boundary1,
+            b'Content-Type: application/octet-stream',
+            b'Content-Range: bytes 100-104/700',
+            b'',
+            obj_data[100:105],
+            b'--' + boundary1 + b'--',
+        ])
+        boundary2 = b'aaeb9c110b32ced5fe'
+        resp_body2 = b'\r\n'.join([
+            b'--' + boundary2,
+            b'Content-Type: application/octet-stream',
+            b'Content-Range: bytes %d-49/700' % resume_bytes,
+            b'',
+            obj_data[resume_bytes:50],
+            b'--' + boundary2,
+            b'Content-Type: application/octet-stream',
+            b'Content-Range: bytes 100-104/700',
+            b'',
+            obj_data[100:105],
+            b'--' + boundary2 + b'--',
+        ])
+
+        headers1 = {
+            'Etag': etag,
+            'Content-Type': b'multipart/byteranges;boundary=' + boundary1,
+            'Content-Length': len(resp_body1),
+            'X-Timestamp': Timestamp(self.ts()).normal,
+        }
+        headers2 = {
+            'Etag': etag,
+            'Content-Type': b'multipart/byteranges;boundary=' + boundary2,
+            'Content-Length': len(resp_body2),
+            'X-Timestamp': Timestamp(self.ts()).normal,
+        }
+        responses = [
+            StubResponse(206, resp_body1, headers1, slowdown=0.1,
+                         slowdown_after=slowdown_after),
+            StubResponse(206, resp_body2, headers2)
+        ]
+        req_range_hdrs = []
+
+        def get_response(req):
+            req_range_hdrs.append(req['headers'].get('Range'))
+            return responses.pop(0) if responses else StubResponse(404)
+
+        req = swob.Request.blank('/v1/a/c/o', headers={
+            'Range': 'bytes=0-49,100-104'})
+        with capture_http_requests(get_response) as log:
+            resp = req.get_response(self.app)
+            self.assertEqual(resp.status_int, 206)
+            actual_body = resp.body
+
+        self.assertEqual(resp.status_int, 206)
+        self.assertEqual(2, len(log))
+        # note: client response uses boundary from first backend response
+        self.assertEqual(resp_body1, actual_body)
+        error_lines = self.app.logger.get_lines_for_level('error')
+        self.assertEqual(1, len(error_lines))
+        self.assertIn('Trying to read object during GET ', error_lines[0])
+        return req_range_hdrs
+
+    def test_GET_with_multirange_slow_body_resumes(self):
+        req_range_hdrs = self._do_test_GET_with_multirange_slow_body_resumes(
+            slowdown_after=0)
+        self.assertEqual(['bytes=0-49,100-104'] * 2, req_range_hdrs)
+
+    def test_GET_with_multirange_slow_body_resumes_before_body_started(self):
+        # First response times out while first part boundary/headers are being
+        # read. No part body has been yielded to the client so range header is
+        # not adjusted for the second backend request.
+        req_range_hdrs = self._do_test_GET_with_multirange_slow_body_resumes(
+            slowdown_after=40, resume_bytes=0)
+        self.assertEqual(['bytes=0-49,100-104'] * 2, req_range_hdrs)
+
+    def test_GET_with_multirange_slow_body_resumes_after_body_started(self):
+        # First response times out after first part boundary/headers have been
+        # read. Some part body has been yielded to the client so range header
+        # is adjusted for the second backend request.
+        # 140 bytes before timeout is sufficient for the part boundary, headers
+        # and approx 50 body bytes to be read, but _MultipartMimeFileLikeObject
+        # buffers bytes from the backend response such that only 20 bytes are
+        # actually yielded to the client.
+        req_range_hdrs = self._do_test_GET_with_multirange_slow_body_resumes(
+            slowdown_after=140, resume_bytes=20)
+        self.assertEqual(['bytes=0-49,100-104', 'bytes=20-49,100-104'],
+                         req_range_hdrs)
+
+    def test_GET_with_multirange_slow_body_unable_to_resume(self):
+        self.app.recoverable_node_timeout = 0.01
+        self.app.object_chunk_size = 10
+        obj_data = b'testing' * 100
+        etag = md5(obj_data, usedforsecurity=False).hexdigest()
+        boundary = b'81eb9c110b32ced5fe'
+
+        resp_body = b'\r\n'.join([
+            b'--' + boundary,
+            b'Content-Type: application/octet-stream',
+            b'Content-Range: bytes 0-49/700',
+            b'',
+            obj_data[0:50],
+            b'--' + boundary,
+            b'Content-Type: application/octet-stream',
+            b'Content-Range: bytes 100-104/700',
+            b'',
+            obj_data[100:105],
+            b'--' + boundary + b'--',
+        ])
+
+        headers = {
+            'Etag': etag,
+            'Content-Type': b'multipart/byteranges;boundary=' + boundary,
+            'Content-Length': len(resp_body),
+            'X-Timestamp': Timestamp(self.ts()).normal,
+        }
+        responses = [
+            StubResponse(206, resp_body, headers, slowdown=0.1),
+            StubResponse(206, resp_body, headers, slowdown=0.1),
+            StubResponse(206, resp_body, headers, slowdown=0.1),
+        ]
+
+        def get_response(req):
+            return responses.pop(0) if responses else StubResponse(404)
+
+        req = swob.Request.blank('/v1/a/c/o', headers={
+            'Range': 'bytes=0-49,100-104'})
+        with capture_http_requests(get_response) as log:
+            resp = req.get_response(self.app)
+            self.assertEqual(resp.status_int, 206)
+            actual_body = resp.body
+
+        self.assertEqual(resp.status_int, 206)
+        self.assertEqual(6, len(log))
+        resp_boundary = resp.headers['content-type'].rsplit('=', 1)[1].encode()
+        self.assertEqual(b'--%s--' % resp_boundary, actual_body)
+        error_lines = self.app.logger.get_lines_for_level('error')
+        self.assertEqual(3, len(error_lines))
+        for line in error_lines:
+            self.assertIn('Trying to read object during GET ', line)
+
+    def test_GET_resuming_ignores_416(self):
+        # verify that a resuming getter will not try to use the content of a
+        # 416 response (because it's etag will mismatch that from the first
+        # response)
+        self.app.recoverable_node_timeout = 0.01
+        self.app.client_timeout = 0.1
+        self.app.object_chunk_size = 10
+        body = b'length 8'
+        body_short = b'four'
+        body_416 = b'<html><h1>Requested Range Not Satisfiable</h1>' \
+                   b'<p>The Range requested is not available.</p></html>'
+        etag = md5(body, usedforsecurity=False).hexdigest()
+        etag_short = md5(body_short, usedforsecurity=False).hexdigest()
+        headers_206 = {
+            'Etag': etag,
+            'Content-Length': len(body),
+            'X-Timestamp': Timestamp(self.ts()).normal,
+            'Content-Range': 'bytes 7-8/8'
+        }
+        headers_416 = {
+            # note: 416 when applying the same range implies different object
+            # length and therefore different etag
+            'Etag': etag_short,
+            'Content-Length': len(body_416),
+            'X-Timestamp': Timestamp(self.ts()).normal,
+            'Content-Range': 'bytes */4'
+        }
+        req = swift.common.swob.Request.blank(
+            '/v1/a/c/o', headers={'Range': 'bytes=7-8'})
+        # make the first response slow...
+        read_sleeps = [0.1, 0]
+        with mocked_http_conn(206, 416, 206, body_iter=[body, body_416, body],
+                              headers=[headers_206, headers_416, headers_206],
+                              slow=read_sleeps) as log:
+            resp = req.get_response(self.app)
+            self.assertEqual(resp.status_int, 206)
+            resp_body = resp.body
+        self.assertEqual(b'length 8', resp_body)
+        self.assertEqual(len(log.requests), 3)
+        self.assertEqual('bytes=7-8', log.requests[0]['headers']['Range'])
+        self.assertEqual('bytes=7-8', log.requests[1]['headers']['Range'])
+        self.assertEqual('bytes=7-8', log.requests[2]['headers']['Range'])
+
+    def test_GET_resuming(self):
+        self.app.recoverable_node_timeout = 0.01
+        self.app.client_timeout = 0.1
+        self.app.object_chunk_size = 10
+        body = b'length 8'
+        etag = md5(body, usedforsecurity=False).hexdigest()
+        headers_200 = {
+            'Etag': etag,
+            'Content-Length': len(body),
+            'X-Timestamp': Timestamp(self.ts()).normal,
+        }
+        headers_206 = {
+            # note: use of 'X-Backend-Ignore-Range-If-Metadata-Present' in
+            # request means that 200 response did not evaluate the Range and
+            # the proxy modifies requested backend range accordingly
+            'Etag': etag,
+            'Content-Length': len(body),
+            'X-Timestamp': Timestamp(self.ts()).normal,
+            'Content-Range': 'bytes 0-7/8'
+        }
+        req = swift.common.swob.Request.blank(
+            '/v1/a/c/o',
+            headers={'Range': 'bytes=9-10, 20-30',
+                     'X-Backend-Ignore-Range-If-Metadata-Present':
+                         'X-Static-Large-Object'})
+        # make the first 2 responses slow...
+        read_sleeps = [0.1, 0.1, 0]
+        with mocked_http_conn(200, 206, 206, body_iter=[body, body, body],
+                              headers=[headers_200, headers_206, headers_206],
+                              slow=read_sleeps) as log:
+            resp = req.get_response(self.app)
+            self.assertEqual(resp.status_int, 200)
+            resp_body = resp.body
+        self.assertEqual(b'length 8', resp_body)
+        self.assertEqual(len(log.requests), 3)
+        # NB: original range is not satisfiable but is ignored
+        self.assertEqual('bytes=9-10, 20-30',
+                         log.requests[0]['headers']['Range'])
+        self.assertIn('X-Backend-Ignore-Range-If-Metadata-Present',
+                      log.requests[0]['headers'])
+        # backend Range is updated to something that is satisfiable
+        self.assertEqual('bytes=0-7,20-30',
+                         log.requests[1]['headers']['Range'])
+        self.assertNotIn('X-Backend-Ignore-Range-If-Metadata-Present',
+                         log.requests[1]['headers'])
+        self.assertEqual('bytes=0-7,20-30',
+                         log.requests[2]['headers']['Range'])
+        self.assertNotIn('X-Backend-Ignore-Range-If-Metadata-Present',
+                         log.requests[2]['headers'])
 
     def test_GET_transfer_encoding_chunked(self):
         req = swift.common.swob.Request.blank('/v1/a/c/o')
@@ -2411,6 +2732,10 @@ class TestECObjController(ECObjectControllerMixin, unittest.TestCase):
     def test_GET_disconnect(self):
         self.app.recoverable_node_timeout = 0.01
         self.app.client_timeout = 0.1
+        # Before, we used the default 64k chunk size, so the entire ~16k test
+        # data would come in the first chunk, and the generator should
+        # cleanly exit by the time we reiterate() the response.
+        self.app.object_chunk_size = 10
         segment_size = self.policy.ec_segment_size
         test_data = (b'test' * segment_size)[:-743]
         etag = md5(test_data, usedforsecurity=False).hexdigest()
@@ -2455,6 +2780,17 @@ class TestECObjController(ECObjectControllerMixin, unittest.TestCase):
             if stats:
                 actual[self.app.error_limiter.node_key(n)] = stats
         self.assertEqual(actual, expected_error_limiting)
+        expected = ["Client disconnected on read of EC frag '/a/c/o'"] * 10
+        self.assertEqual(
+            self.app.logger.get_lines_for_level('warning'),
+            expected)
+        for read_line in self.app.logger.get_lines_for_level('error'):
+            self.assertIn("Trying to read EC fragment during GET (retrying)",
+                          read_line)
+        self.assertEqual(
+            len(self.logger.logger.records['ERROR']), 4,
+            'Expected 4 ERROR lines, got %r' % (
+                self.logger.logger.records['ERROR'], ))
 
     def test_GET_not_found_when_404_newer(self):
         # if proxy receives a 404, it keeps waiting for other connections until
@@ -2619,9 +2955,9 @@ class TestECObjController(ECObjectControllerMixin, unittest.TestCase):
     def test_feed_remaining_primaries(self):
         controller = self.controller_cls(
             self.app, 'a', 'c', 'o')
-        safe_iter = utils.GreenthreadSafeIterator(self.app.iter_nodes(
-            self.policy.object_ring, 0, self.logger, policy=self.policy,
-            request=Request.blank('')))
+        safe_iter = utils.GreenthreadSafeIterator(NodeIter(
+            'object', self.app, self.policy.object_ring, 0, self.logger,
+            policy=self.policy, request=Request.blank('')))
         controller._fragment_GET_request = lambda *a, **k: next(safe_iter)
         pile = utils.GreenAsyncPile(self.policy.ec_ndata)
         for i in range(self.policy.ec_ndata):
@@ -3728,6 +4064,35 @@ class TestECObjController(ECObjectControllerMixin, unittest.TestCase):
         # all 28 nodes tried with an optimistic get, none are durable and none
         # report having a durable timestamp
         self.assertEqual(28, len(log))
+        self.assertEqual([], self.app.logger.get_lines_for_level('error'))
+
+    def test_GET_nondurable_when_node_iter_runs_out_of_nodes(self):
+        policy_opts = self.app.get_policy_options(self.policy)
+        policy_opts.concurrent_gets = True
+        policy_opts.concurrent_ec_extra_requests = 1
+        policy_opts.concurrency_timeout = 0.1
+
+        obj1 = self._make_ec_object_stub(pattern='obj1')
+        node_frags = [
+            {'obj': obj1, 'frag': i, 'durable': False}
+            for i in range(self.policy.ec_ndata + 1)
+        ]
+        fake_response = self._fake_ec_node_response(node_frags)
+        # limit remaining nodes
+        obj_ring = self.app.get_object_ring(int(self.policy))
+        part, nodes = obj_ring.get_nodes('a', 'c', 'o')
+        nodes.extend(list(obj_ring.get_more_nodes(part)))
+        for dev in nodes[self.policy.ec_ndata + 1:]:
+            self.app.error_limiter.limit(dev)
+
+        req = swob.Request.blank('/v1/a/c/o')
+        with capture_http_requests(fake_response) as log:
+            resp = req.get_response(self.app)
+
+        # non-durable responds 404
+        self.assertEqual(resp.status_int, 404)
+        self.assertEqual(len(log), self.policy.ec_ndata + 1)
+        self.assertEqual([], self.app.logger.get_lines_for_level('error'))
 
     def test_GET_with_missing_durable_files_and_mixed_etags(self):
         obj1 = self._make_ec_object_stub(pattern='obj1')
@@ -4379,11 +4744,18 @@ class TestECObjController(ECObjectControllerMixin, unittest.TestCase):
             'Range': 'bytes=1000-2000,14000-15000'})
         with capture_http_requests(get_response) as log:
             resp = req.get_response(self.app)
+            _ = resp.body
         self.assertEqual(resp.status_int, 500)
         self.assertEqual(len(log), self.policy.ec_n_unique_fragments * 2)
         log_lines = self.app.logger.get_lines_for_level('error')
+        self.assertEqual(3, len(log_lines), log_lines)
+        self.assertIn('Trying to read next part of EC multi-part GET',
+                      log_lines[0])
+        self.assertIn('Trying to read during GET: ChunkReadTimeout',
+                      log_lines[1])
         # not the most graceful ending
-        self.assertIn('Unhandled exception', log_lines[-1])
+        self.assertIn('Unhandled exception in request: ChunkReadTimeout',
+                      log_lines[2])
 
     def test_GET_with_multirange_short_resume_body(self):
         self.app.object_chunk_size = 256
@@ -4922,12 +5294,17 @@ class TestECObjController(ECObjectControllerMixin, unittest.TestCase):
                 md5(resp.body, usedforsecurity=False).hexdigest(),
                 etag)
         error_lines = self.logger.get_lines_for_level('error')
-        nparity = self.policy.ec_nparity
-        self.assertGreater(len(error_lines), nparity)
-        for line in error_lines[:nparity]:
-            self.assertIn('retrying', line)
-        for line in error_lines[nparity:]:
-            self.assertIn('ChunkReadTimeout (0.01s', line)
+        # all primaries timeout and get error limited
+        error_limit_lines = [
+            line for line in error_lines
+            if 'Trying to read EC fragment during GET (retrying)' in line]
+        self.assertEqual(self.policy.ec_n_unique_fragments,
+                         len(error_limit_lines))
+        # all ec_ndata frag getters eventually get a read timeout
+        read_timeout_lines = [
+            line for line in error_lines if 'ChunkReadTimeout (0.01s' in line]
+        self.assertEqual(self.policy.ec_ndata,
+                         len(read_timeout_lines))
         for line in self.logger.logger.records['ERROR']:
             self.assertIn(req.headers['x-trans-id'], line)
 
@@ -5010,11 +5387,17 @@ class TestECObjController(ECObjectControllerMixin, unittest.TestCase):
             # resume but won't be able to give us all the right bytes
             self.assertNotEqual(md5(resp.body).hexdigest(), etag)
         error_lines = self.logger.get_lines_for_level('error')
-        self.assertEqual(ndata, len(error_lines))
-        for line in error_lines:
-            self.assertIn('ChunkReadTimeout (0.01s', line)
-        for line in self.logger.logger.records['ERROR']:
-            self.assertIn(req.headers['x-trans-id'], line)
+        # only ec_ndata primaries that timeout get error limited (404 or
+        # different etag primaries do not get error limited)
+        error_limit_lines = [
+            line for line in error_lines
+            if 'Trying to read EC fragment during GET (retrying)' in line]
+        self.assertEqual(self.policy.ec_ndata, len(error_limit_lines))
+        # all ec_ndata frag getters eventually get a read timeout
+        read_timeout_lines = [
+            line for line in error_lines if 'ChunkReadTimeout (0.01s' in line]
+        self.assertEqual(self.policy.ec_ndata,
+                         len(read_timeout_lines))
 
         debug_lines = self.logger.get_lines_for_level('debug')
         nparity = self.policy.ec_nparity
@@ -6689,14 +7072,14 @@ class TestECFragGetter(BaseObjectControllerMixin, unittest.TestCase):
 
     def test_iter_bytes_from_response_part(self):
         part = FileLikeIter([b'some', b'thing'])
-        it = self.getter.iter_bytes_from_response_part(part, nbytes=None)
+        it = self.getter._iter_bytes_from_response_part(part, nbytes=None)
         self.assertEqual(b'something', b''.join(it))
 
     def test_iter_bytes_from_response_part_insufficient_bytes(self):
         part = FileLikeIter([b'some', b'thing'])
-        it = self.getter.iter_bytes_from_response_part(part, nbytes=100)
-        with mock.patch.object(self.getter, '_dig_for_source_and_node',
-                               return_value=(None, None)):
+        it = self.getter._iter_bytes_from_response_part(part, nbytes=100)
+        with mock.patch.object(self.getter, '_find_source',
+                               return_value=False):
             with self.assertRaises(ShortReadError) as cm:
                 b''.join(it)
         self.assertEqual('Too few bytes; read 9, expecting 100',
@@ -6706,9 +7089,9 @@ class TestECFragGetter(BaseObjectControllerMixin, unittest.TestCase):
         part = FileLikeIter([b'some', b'thing'])
         self.app.recoverable_node_timeout = 0.05
         self.app.client_timeout = 0.8
-        it = self.getter.iter_bytes_from_response_part(part, nbytes=9)
-        with mock.patch.object(self.getter, '_dig_for_source_and_node',
-                               return_value=(None, None)):
+        it = self.getter._iter_bytes_from_response_part(part, nbytes=9)
+        with mock.patch.object(self.getter, '_find_source',
+                               return_value=False):
             with mock.patch.object(part, 'read',
                                    side_effect=[b'some', ChunkReadTimeout(9)]):
                 with self.assertRaises(ChunkReadTimeout) as cm:
@@ -6718,12 +7101,81 @@ class TestECFragGetter(BaseObjectControllerMixin, unittest.TestCase):
     def test_iter_bytes_from_response_part_small_fragment_size(self):
         self.getter.fragment_size = 4
         part = FileLikeIter([b'some', b'thing', b''])
-        it = self.getter.iter_bytes_from_response_part(part, nbytes=None)
+        it = self.getter._iter_bytes_from_response_part(part, nbytes=None)
         self.assertEqual([b'some', b'thin', b'g'], [ch for ch in it])
         self.getter.fragment_size = 1
         part = FileLikeIter([b'some', b'thing', b''])
-        it = self.getter.iter_bytes_from_response_part(part, nbytes=None)
+        it = self.getter._iter_bytes_from_response_part(part, nbytes=None)
         self.assertEqual([c.encode() for c in 'something'], [ch for ch in it])
+
+    def test_fragment_size(self):
+        source = FakeSource((
+            b'abcd', b'1234', b'abc', b'd1', b'234abcd1234abcd1', b'2'))
+        req = Request.blank('/v1/a/c/o')
+
+        def mock_source_gen():
+            yield GetterSource(self.app, source, {})
+
+        self.getter.fragment_size = 8
+        with mock.patch.object(self.getter, '_source_gen',
+                               mock_source_gen):
+            it = self.getter.response_parts_iter(req)
+            fragments = list(next(it)['part_iter'])
+
+        self.assertEqual(fragments, [
+            b'abcd1234', b'abcd1234', b'abcd1234', b'abcd12'])
+
+    def test_fragment_size_resuming(self):
+        node = {'ip': '1.2.3.4', 'port': 6200, 'device': 'sda'}
+
+        source1 = FakeSource([b'abcd', b'1234', None,
+                              b'efgh', b'5678', b'lots', b'more', b'data'])
+        # incomplete reads of fragment_size will be re-fetched
+        source2 = FakeSource([b'efgh', b'5678', b'lots', None])
+        source3 = FakeSource([b'lots', b'more', b'data'])
+        req = Request.blank('/v1/a/c/o')
+        range_headers = []
+        sources = [GetterSource(self.app, src, node)
+                   for src in (source1, source2, source3)]
+
+        def mock_source_gen():
+            for source in sources:
+                range_headers.append(self.getter.backend_headers.get('Range'))
+                yield source
+
+        self.getter.fragment_size = 8
+        with mock.patch.object(self.getter, '_source_gen',
+                               mock_source_gen):
+            it = self.getter.response_parts_iter(req)
+            fragments = list(next(it)['part_iter'])
+
+        self.assertEqual(fragments, [
+            b'abcd1234', b'efgh5678', b'lotsmore', b'data'])
+        self.assertEqual(range_headers, [None, 'bytes=8-27', 'bytes=16-27'])
+
+    def test_fragment_size_resuming_chunked(self):
+        node = {'ip': '1.2.3.4', 'port': 6200, 'device': 'sda'}
+        headers = {'transfer-encoding': 'chunked',
+                   'content-type': 'text/plain'}
+        source1 = FakeSource([b'abcd', b'1234', b'abc', None], headers=headers)
+        source2 = FakeSource([b'efgh5678'], headers=headers)
+        range_headers = []
+        sources = [GetterSource(self.app, src, node)
+                   for src in (source1, source2)]
+        req = Request.blank('/v1/a/c/o')
+
+        def mock_source_gen():
+            for source in sources:
+                range_headers.append(self.getter.backend_headers.get('Range'))
+                yield source
+
+        self.getter.fragment_size = 8
+        with mock.patch.object(self.getter, '_source_gen',
+                               mock_source_gen):
+            it = self.getter.response_parts_iter(req)
+            fragments = list(next(it)['part_iter'])
+        self.assertEqual(fragments, [b'abcd1234', b'efgh5678'])
+        self.assertEqual(range_headers, [None, 'bytes=8-'])
 
 
 if __name__ == '__main__':

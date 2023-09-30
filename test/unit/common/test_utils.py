@@ -73,7 +73,8 @@ from swift.common.exceptions import Timeout, MessageTimeout, \
     ConnectionTimeout, LockTimeout, ReplicationLockTimeout, \
     MimeInvalid
 from swift.common import utils
-from swift.common.utils import set_swift_dir, md5, ShardRangeList
+from swift.common.utils import set_swift_dir, md5, ShardRangeList, \
+    SwiftLogFormatter
 from swift.common.container_sync_realms import ContainerSyncRealms
 from swift.common.header_key_dict import HeaderKeyDict
 from swift.common.storage_policy import POLICIES, reload_storage_policies
@@ -989,25 +990,108 @@ class TestUtils(unittest.TestCase):
                          'test1\ntest3\ntest4\ntest6\n')
 
     def test_get_logger_name_and_route(self):
+        @contextlib.contextmanager
+        def add_log_handler(logger):
+            # install a handler to capture log messages formatted as per swift
+            sio = StringIO()
+            handler = logging.StreamHandler(sio)
+            handler.setFormatter(SwiftLogFormatter(
+                fmt="%(server)s: %(message)s", max_line_length=20)
+            )
+            logger.logger.addHandler(handler)
+            yield sio
+            logger.logger.removeHandler(handler)
+
         logger = utils.get_logger({}, name='name', log_route='route')
+        # log_route becomes the LogAdapter.name and logging.Logger.name
         self.assertEqual('route', logger.name)
+        self.assertEqual('route', logger.logger.name)
+        # name becomes the LogAdapter.server!
         self.assertEqual('name', logger.server)
+        # LogAdapter.server is used when formatting a log message
+        with add_log_handler(logger) as sio:
+            logger.info('testing')
+            self.assertEqual('name: testing\n', sio.getvalue())
+
         logger = utils.get_logger({'log_name': 'conf-name'}, name='name',
                                   log_route='route')
         self.assertEqual('route', logger.name)
         self.assertEqual('name', logger.server)
+        with add_log_handler(logger) as sio:
+            logger.info('testing')
+            self.assertEqual('name: testing\n', sio.getvalue())
+
         logger = utils.get_logger({'log_name': 'conf-name'}, log_route='route')
         self.assertEqual('route', logger.name)
         self.assertEqual('conf-name', logger.server)
+        with add_log_handler(logger) as sio:
+            logger.info('testing')
+            self.assertEqual('conf-name: testing\n', sio.getvalue())
+
         logger = utils.get_logger({'log_name': 'conf-name'})
         self.assertEqual('conf-name', logger.name)
         self.assertEqual('conf-name', logger.server)
+        with add_log_handler(logger) as sio:
+            logger.info('testing')
+            self.assertEqual('conf-name: testing\n', sio.getvalue())
+
         logger = utils.get_logger({})
         self.assertEqual('swift', logger.name)
         self.assertEqual('swift', logger.server)
+        with add_log_handler(logger) as sio:
+            logger.info('testing')
+            self.assertEqual('swift: testing\n', sio.getvalue())
+
         logger = utils.get_logger({}, log_route='route')
         self.assertEqual('route', logger.name)
         self.assertEqual('swift', logger.server)
+        with add_log_handler(logger) as sio:
+            logger.info('testing')
+            self.assertEqual('swift: testing\n', sio.getvalue())
+
+        # same log_route, different names...
+        logger1 = utils.get_logger({'log_statsd_host': '1.2.3.4'},
+                                   name='name1', log_route='route')
+        logger2 = utils.get_logger({'log_statsd_host': '1.2.3.5'},
+                                   name='name2', log_route='route')
+        self.assertEqual('route', logger1.name)
+        self.assertEqual('route', logger1.logger.name)
+        self.assertEqual('name1', logger1.server)
+        # oh dear, the statsd client on the common logging.Logger instance got
+        # mutated when logger2 was created
+        self.assertEqual('name2.', logger1.logger.statsd_client._prefix)
+        self.assertEqual('route', logger2.name)
+        self.assertEqual('route', logger2.logger.name)
+        self.assertEqual('name2', logger2.server)
+        self.assertEqual('name2.', logger2.logger.statsd_client._prefix)
+        self.assertIs(logger2.logger, logger1.logger)
+        with add_log_handler(logger1) as sio:
+            logger1.info('testing')
+            self.assertEqual('name1: testing\n', sio.getvalue())
+        with add_log_handler(logger2) as sio:
+            logger2.info('testing')
+            self.assertEqual('name2: testing\n', sio.getvalue())
+
+        # different log_route, different names...
+        logger1 = utils.get_logger({'log_statsd_host': '1.2.3.4'},
+                                   name='name1', log_route='route1')
+        logger2 = utils.get_logger({'log_statsd_host': '1.2.3.5'},
+                                   name='name2', log_route='route2')
+        self.assertEqual('route1', logger1.name)
+        self.assertEqual('route1', logger1.logger.name)
+        self.assertEqual('name1', logger1.server)
+        self.assertEqual('name1.', logger1.logger.statsd_client._prefix)
+        self.assertEqual('route2', logger2.name)
+        self.assertEqual('route2', logger2.logger.name)
+        self.assertEqual('name2', logger2.server)
+        self.assertEqual('name2.', logger2.logger.statsd_client._prefix)
+        self.assertIsNot(logger2.logger, logger1.logger)
+        with add_log_handler(logger1) as sio:
+            logger1.info('testing')
+            self.assertEqual('name1: testing\n', sio.getvalue())
+        with add_log_handler(logger2) as sio:
+            logger2.info('testing')
+            self.assertEqual('name2: testing\n', sio.getvalue())
 
     @with_tempdir
     def test_get_logger_sysloghandler_plumbing(self, tempdir):
@@ -1221,15 +1305,33 @@ class TestUtils(unittest.TestCase):
             log_exception(http_client.BadStatusLine(''))
             log_msg = strip_value(sio)
             self.assertNotIn('Traceback', log_msg)
-            self.assertIn('BadStatusLine', log_msg)
-            self.assertIn("''", log_msg)
+            self.assertIn('''BadStatusLine("''"''', log_msg)
 
             # green version is separate :-(
             log_exception(green_http_client.BadStatusLine(''))
             log_msg = strip_value(sio)
             self.assertNotIn('Traceback', log_msg)
-            self.assertIn('BadStatusLine', log_msg)
-            self.assertIn("''", log_msg)
+            self.assertIn('''BadStatusLine("''"''', log_msg)
+
+            if not six.PY2:
+                # py3 introduced RemoteDisconnected exceptions which inherit
+                # from both BadStatusLine *and* OSError; make sure those are
+                # handled as BadStatusLine, not OSError
+                log_exception(http_client.RemoteDisconnected(
+                    'Remote end closed connection'))
+                log_msg = strip_value(sio)
+                self.assertNotIn('Traceback', log_msg)
+                self.assertIn(
+                    "RemoteDisconnected('Remote end closed connection'",
+                    log_msg)
+
+                log_exception(green_http_client.RemoteDisconnected(
+                    'Remote end closed connection'))
+                log_msg = strip_value(sio)
+                self.assertNotIn('Traceback', log_msg)
+                self.assertIn(
+                    "RemoteDisconnected('Remote end closed connection'",
+                    log_msg)
 
             # test unhandled
             log_exception(Exception('my error message'))
@@ -2280,6 +2382,7 @@ cluster_dfw1 = http://dfw1.host/v1/
             self.assertTrue(utils.config_true_value(True) is True)
             self.assertTrue(utils.config_true_value('foo') is False)
             self.assertTrue(utils.config_true_value(False) is False)
+            self.assertTrue(utils.config_true_value(None) is False)
         finally:
             utils.TRUE_VALUES = orig_trues
 
@@ -2608,6 +2711,44 @@ cluster_dfw1 = http://dfw1.host/v1/
         self.assertIsNone(ts)
         ts = utils.get_trans_id_time('tx1df4ff4f55ea45f7b2ec2-almostright')
         self.assertIsNone(ts)
+
+    def test_config_fallocate_value(self):
+        fallocate_value, is_percent = utils.config_fallocate_value('10%')
+        self.assertEqual(fallocate_value, 10)
+        self.assertTrue(is_percent)
+        fallocate_value, is_percent = utils.config_fallocate_value('10')
+        self.assertEqual(fallocate_value, 10)
+        self.assertFalse(is_percent)
+        try:
+            fallocate_value, is_percent = utils.config_fallocate_value('ab%')
+        except ValueError as err:
+            exc = err
+        self.assertEqual(str(exc), 'Error: ab% is an invalid value for '
+                                   'fallocate_reserve.')
+        try:
+            fallocate_value, is_percent = utils.config_fallocate_value('ab')
+        except ValueError as err:
+            exc = err
+        self.assertEqual(str(exc), 'Error: ab is an invalid value for '
+                                   'fallocate_reserve.')
+        try:
+            fallocate_value, is_percent = utils.config_fallocate_value('1%%')
+        except ValueError as err:
+            exc = err
+        self.assertEqual(str(exc), 'Error: 1%% is an invalid value for '
+                                   'fallocate_reserve.')
+        try:
+            fallocate_value, is_percent = utils.config_fallocate_value('10.0')
+        except ValueError as err:
+            exc = err
+        self.assertEqual(str(exc), 'Error: 10.0 is an invalid value for '
+                                   'fallocate_reserve.')
+        fallocate_value, is_percent = utils.config_fallocate_value('10.5%')
+        self.assertEqual(fallocate_value, 10.5)
+        self.assertTrue(is_percent)
+        fallocate_value, is_percent = utils.config_fallocate_value('10.000%')
+        self.assertEqual(fallocate_value, 10.000)
+        self.assertTrue(is_percent)
 
     def test_lock_file(self):
         flags = os.O_CREAT | os.O_RDWR
@@ -3840,22 +3981,25 @@ cluster_dfw1 = http://dfw1.host/v1/
     @mock.patch('importlib.metadata.distribution')
     def test_load_pkg_resource_importlib(self, mock_driver):
         import importlib.metadata
+
+        class TestEntryPoint(importlib.metadata.EntryPoint):
+            def load(self):
+                return self.value
+
         repl_obj = object()
         ec_obj = object()
         other_obj = object()
         mock_driver.return_value.entry_points = [
-            importlib.metadata.EntryPoint(group='swift.diskfile',
-                                          name='replication.fs',
-                                          value=repl_obj),
-            importlib.metadata.EntryPoint(group='swift.diskfile',
-                                          name='erasure_coding.fs',
-                                          value=ec_obj),
-            importlib.metadata.EntryPoint(group='swift.section',
-                                          name='thing.other',
-                                          value=other_obj),
+            TestEntryPoint(group='swift.diskfile',
+                           name='replication.fs',
+                           value=repl_obj),
+            TestEntryPoint(group='swift.diskfile',
+                           name='erasure_coding.fs',
+                           value=ec_obj),
+            TestEntryPoint(group='swift.section',
+                           name='thing.other',
+                           value=other_obj),
         ]
-        for ep in mock_driver.return_value.entry_points:
-            ep.load = lambda ep=ep: ep.value
         tests = {
             ('swift.diskfile', 'egg:swift#replication.fs'): repl_obj,
             ('swift.diskfile', 'egg:swift#erasure_coding.fs'): ec_obj,
@@ -5603,57 +5747,6 @@ class TestSwiftLoggerAdapter(unittest.TestCase):
         mocked.assert_called_with('Caught: Connection refused')
 
 
-class TestMetricsPrefixLoggerAdapter(unittest.TestCase):
-    def test_metric_prefix(self):
-        logger = utils.get_logger({}, 'logger_name')
-        adapter1 = utils.MetricsPrefixLoggerAdapter(logger, {}, 'one')
-        adapter2 = utils.MetricsPrefixLoggerAdapter(logger, {}, 'two')
-        adapter3 = utils.SwiftLoggerAdapter(logger, {})
-        self.assertEqual('logger_name', logger.name)
-        self.assertEqual('logger_name', adapter1.logger.name)
-        self.assertEqual('logger_name', adapter2.logger.name)
-        self.assertEqual('logger_name', adapter3.logger.name)
-
-        with mock.patch.object(logger, 'increment') as mock_increment:
-            adapter1.increment('test1')
-            adapter2.increment('test2')
-            adapter3.increment('test3')
-            logger.increment('test')
-        self.assertEqual(
-            [mock.call('one.test1'), mock.call('two.test2'),
-             mock.call('test3'), mock.call('test')],
-            mock_increment.call_args_list)
-
-        adapter1.metric_prefix = 'not one'
-        with mock.patch.object(logger, 'increment') as mock_increment:
-            adapter1.increment('test1')
-            adapter2.increment('test2')
-            adapter3.increment('test3')
-            logger.increment('test')
-        self.assertEqual(
-            [mock.call('not one.test1'), mock.call('two.test2'),
-             mock.call('test3'), mock.call('test')],
-            mock_increment.call_args_list)
-
-    def test_wrapped_prefixing(self):
-        logger = utils.get_logger({}, 'logger_name')
-        adapter1 = utils.MetricsPrefixLoggerAdapter(logger, {}, 'one')
-        adapter2 = utils.MetricsPrefixLoggerAdapter(adapter1, {}, 'two')
-        self.assertEqual('logger_name', logger.name)
-        self.assertEqual('logger_name', adapter1.logger.name)
-        self.assertEqual('logger_name', adapter2.logger.name)
-
-        with mock.patch.object(logger, 'increment') as mock_increment:
-            adapter1.increment('test1')
-            adapter2.increment('test2')
-            logger.increment('test')
-        self.assertEqual(
-            [mock.call('one.test1'),
-             mock.call('one.two.test2'),
-             mock.call('test')],
-            mock_increment.call_args_list)
-
-
 class TestAuditLocationGenerator(unittest.TestCase):
 
     def test_drive_tree_access(self):
@@ -6198,10 +6291,14 @@ class TestGreenAsyncPile(unittest.TestCase):
         pile.spawn(self._exploder, Exception('kaboom'))
         self.assertEqual(1, next(pile))
         self.assertEqual(2, next(pile))
-        with self.assertRaises(StopIteration):
+        with mock.patch('sys.stderr', StringIO()) as mock_stderr, \
+                self.assertRaises(StopIteration):
             next(pile)
         self.assertEqual(pile.inflight, 0)
         self.assertEqual(pile._pending, 0)
+        self.assertIn('Exception: kaboom', mock_stderr.getvalue())
+        self.assertIn('Traceback (most recent call last):',
+                      mock_stderr.getvalue())
 
     def test_no_blocking_last_next_explodes(self):
         pile = utils.GreenAsyncPile(10)
@@ -6210,13 +6307,18 @@ class TestGreenAsyncPile(unittest.TestCase):
         pile.spawn(self._exploder, 2)
         self.assertEqual(2, next(pile))
         pile.spawn(self._exploder, Exception('kaboom'))
-        with self.assertRaises(StopIteration):
+        with mock.patch('sys.stderr', StringIO()) as mock_stderr, \
+                self.assertRaises(StopIteration):
             next(pile)
         self.assertEqual(pile.inflight, 0)
         self.assertEqual(pile._pending, 0)
+        self.assertIn('Exception: kaboom', mock_stderr.getvalue())
+        self.assertIn('Traceback (most recent call last):',
+                      mock_stderr.getvalue())
 
     def test_exceptions_in_streaming_pile(self):
-        with utils.StreamingPile(2) as pile:
+        with mock.patch('sys.stderr', StringIO()) as mock_stderr, \
+                utils.StreamingPile(2) as pile:
             results = list(pile.asyncstarmap(self._exploder, [
                 (1,),
                 (Exception('kaboom'),),
@@ -6225,9 +6327,13 @@ class TestGreenAsyncPile(unittest.TestCase):
         self.assertEqual(results, [1, 3])
         self.assertEqual(pile.inflight, 0)
         self.assertEqual(pile._pending, 0)
+        self.assertIn('Exception: kaboom', mock_stderr.getvalue())
+        self.assertIn('Traceback (most recent call last):',
+                      mock_stderr.getvalue())
 
     def test_exceptions_at_end_of_streaming_pile(self):
-        with utils.StreamingPile(2) as pile:
+        with mock.patch('sys.stderr', StringIO()) as mock_stderr, \
+                utils.StreamingPile(2) as pile:
             results = list(pile.asyncstarmap(self._exploder, [
                 (1,),
                 (2,),
@@ -6236,6 +6342,9 @@ class TestGreenAsyncPile(unittest.TestCase):
         self.assertEqual(results, [1, 2])
         self.assertEqual(pile.inflight, 0)
         self.assertEqual(pile._pending, 0)
+        self.assertIn('Exception: kaboom', mock_stderr.getvalue())
+        self.assertIn('Traceback (most recent call last):',
+                      mock_stderr.getvalue())
 
 
 class TestLRUCache(unittest.TestCase):
@@ -8679,6 +8788,397 @@ class TestShardRangeList(unittest.TestCase):
                          do_test([utils.ShardRange.ACTIVE]))
 
 
+@patch('ctypes.get_errno')
+@patch.object(utils, '_sys_posix_fallocate')
+@patch.object(utils, '_sys_fallocate')
+@patch.object(utils, 'FALLOCATE_RESERVE', 0)
+class TestFallocate(unittest.TestCase):
+    def test_fallocate(self, sys_fallocate_mock,
+                       sys_posix_fallocate_mock, get_errno_mock):
+        sys_fallocate_mock.available = True
+        sys_fallocate_mock.return_value = 0
+
+        utils.fallocate(1234, 5000 * 2 ** 20)
+
+        # We can't use sys_fallocate_mock.assert_called_once_with because no
+        # two ctypes.c_uint64 objects are equal even if their values are
+        # equal. Yes, ctypes.c_uint64(123) != ctypes.c_uint64(123).
+        calls = sys_fallocate_mock.mock_calls
+        self.assertEqual(len(calls), 1)
+        args = calls[0][1]
+        self.assertEqual(len(args), 4)
+        self.assertEqual(args[0], 1234)
+        self.assertEqual(args[1], utils.FALLOC_FL_KEEP_SIZE)
+        self.assertEqual(args[2].value, 0)
+        self.assertEqual(args[3].value, 5000 * 2 ** 20)
+
+        sys_posix_fallocate_mock.assert_not_called()
+
+    def test_fallocate_offset(self, sys_fallocate_mock,
+                              sys_posix_fallocate_mock, get_errno_mock):
+        sys_fallocate_mock.available = True
+        sys_fallocate_mock.return_value = 0
+
+        utils.fallocate(1234, 5000 * 2 ** 20, offset=3 * 2 ** 30)
+        calls = sys_fallocate_mock.mock_calls
+        self.assertEqual(len(calls), 1)
+        args = calls[0][1]
+        self.assertEqual(len(args), 4)
+        self.assertEqual(args[0], 1234)
+        self.assertEqual(args[1], utils.FALLOC_FL_KEEP_SIZE)
+        self.assertEqual(args[2].value, 3 * 2 ** 30)
+        self.assertEqual(args[3].value, 5000 * 2 ** 20)
+
+        sys_posix_fallocate_mock.assert_not_called()
+
+    def test_fallocate_fatal_error(self, sys_fallocate_mock,
+                                   sys_posix_fallocate_mock, get_errno_mock):
+        sys_fallocate_mock.available = True
+        sys_fallocate_mock.return_value = -1
+        get_errno_mock.return_value = errno.EIO
+
+        with self.assertRaises(OSError) as cm:
+            utils.fallocate(1234, 5000 * 2 ** 20)
+        self.assertEqual(cm.exception.errno, errno.EIO)
+
+    def test_fallocate_silent_errors(self, sys_fallocate_mock,
+                                     sys_posix_fallocate_mock, get_errno_mock):
+        sys_fallocate_mock.available = True
+        sys_fallocate_mock.return_value = -1
+
+        for silent_error in (0, errno.ENOSYS, errno.EOPNOTSUPP, errno.EINVAL):
+            get_errno_mock.return_value = silent_error
+            try:
+                utils.fallocate(1234, 5678)
+            except OSError:
+                self.fail("fallocate() raised an error on %d", silent_error)
+
+    def test_posix_fallocate_fallback(self, sys_fallocate_mock,
+                                      sys_posix_fallocate_mock,
+                                      get_errno_mock):
+        sys_fallocate_mock.available = False
+        sys_fallocate_mock.side_effect = NotImplementedError
+
+        sys_posix_fallocate_mock.available = True
+        sys_posix_fallocate_mock.return_value = 0
+
+        utils.fallocate(1234, 567890)
+        sys_fallocate_mock.assert_not_called()
+
+        calls = sys_posix_fallocate_mock.mock_calls
+        self.assertEqual(len(calls), 1)
+        args = calls[0][1]
+        self.assertEqual(len(args), 3)
+        self.assertEqual(args[0], 1234)
+        self.assertEqual(args[1].value, 0)
+        self.assertEqual(args[2].value, 567890)
+
+    def test_posix_fallocate_offset(self, sys_fallocate_mock,
+                                    sys_posix_fallocate_mock, get_errno_mock):
+        sys_fallocate_mock.available = False
+        sys_fallocate_mock.side_effect = NotImplementedError
+
+        sys_posix_fallocate_mock.available = True
+        sys_posix_fallocate_mock.return_value = 0
+
+        utils.fallocate(1234, 5000 * 2 ** 20, offset=3 * 2 ** 30)
+        calls = sys_posix_fallocate_mock.mock_calls
+        self.assertEqual(len(calls), 1)
+        args = calls[0][1]
+        self.assertEqual(len(args), 3)
+        self.assertEqual(args[0], 1234)
+        self.assertEqual(args[1].value, 3 * 2 ** 30)
+        self.assertEqual(args[2].value, 5000 * 2 ** 20)
+
+        sys_fallocate_mock.assert_not_called()
+
+    def test_no_fallocates_available(self, sys_fallocate_mock,
+                                     sys_posix_fallocate_mock, get_errno_mock):
+        sys_fallocate_mock.available = False
+        sys_posix_fallocate_mock.available = False
+
+        with mock.patch("logging.warning") as warning_mock, \
+                mock.patch.object(utils, "_fallocate_warned_about_missing",
+                                  False):
+            utils.fallocate(321, 654)
+            utils.fallocate(321, 654)
+
+        sys_fallocate_mock.assert_not_called()
+        sys_posix_fallocate_mock.assert_not_called()
+        get_errno_mock.assert_not_called()
+
+        self.assertEqual(len(warning_mock.mock_calls), 1)
+
+    def test_arg_bounds(self, sys_fallocate_mock,
+                        sys_posix_fallocate_mock, get_errno_mock):
+        sys_fallocate_mock.available = True
+        sys_fallocate_mock.return_value = 0
+        with self.assertRaises(ValueError):
+            utils.fallocate(0, 1 << 64, 0)
+        with self.assertRaises(ValueError):
+            utils.fallocate(0, 0, -1)
+        with self.assertRaises(ValueError):
+            utils.fallocate(0, 0, 1 << 64)
+        self.assertEqual([], sys_fallocate_mock.mock_calls)
+        # sanity check
+        utils.fallocate(0, 0, 0)
+        self.assertEqual(
+            [mock.call(0, utils.FALLOC_FL_KEEP_SIZE, mock.ANY, mock.ANY)],
+            sys_fallocate_mock.mock_calls)
+        # Go confirm the ctypes values separately; apparently == doesn't
+        # work the way you'd expect with ctypes :-/
+        self.assertEqual(sys_fallocate_mock.mock_calls[0][1][2].value, 0)
+        self.assertEqual(sys_fallocate_mock.mock_calls[0][1][3].value, 0)
+        sys_fallocate_mock.reset_mock()
+
+        # negative size will be adjusted as 0
+        utils.fallocate(0, -1, 0)
+        self.assertEqual(
+            [mock.call(0, utils.FALLOC_FL_KEEP_SIZE, mock.ANY, mock.ANY)],
+            sys_fallocate_mock.mock_calls)
+        self.assertEqual(sys_fallocate_mock.mock_calls[0][1][2].value, 0)
+        self.assertEqual(sys_fallocate_mock.mock_calls[0][1][3].value, 0)
+
+
+@patch.object(os, 'fstatvfs')
+@patch.object(utils, '_sys_fallocate', available=True, return_value=0)
+@patch.object(utils, 'FALLOCATE_RESERVE', 0)
+@patch.object(utils, 'FALLOCATE_IS_PERCENT', False)
+@patch.object(utils, '_fallocate_enabled', True)
+class TestFallocateReserve(unittest.TestCase):
+    def _statvfs_result(self, f_frsize, f_bavail):
+        # Only 3 values are relevant to us, so use zeros for the rest
+        f_blocks = 100
+        return posix.statvfs_result((0, f_frsize, f_blocks, 0, f_bavail,
+                                     0, 0, 0, 0, 0))
+
+    def test_disabled(self, sys_fallocate_mock, fstatvfs_mock):
+        utils.disable_fallocate()
+        utils.fallocate(123, 456)
+
+        sys_fallocate_mock.assert_not_called()
+        fstatvfs_mock.assert_not_called()
+
+    def test_zero_reserve(self, sys_fallocate_mock, fstatvfs_mock):
+        utils.fallocate(123, 456)
+
+        fstatvfs_mock.assert_not_called()
+        self.assertEqual(len(sys_fallocate_mock.mock_calls), 1)
+
+    def test_enough_space(self, sys_fallocate_mock, fstatvfs_mock):
+        # Want 1024 bytes in reserve plus 1023 allocated, and have 2 blocks
+        # of size 1024 free, so succeed
+        utils.FALLOCATE_RESERVE, utils.FALLOCATE_IS_PERCENT = \
+            utils.config_fallocate_value('1024')
+
+        fstatvfs_mock.return_value = self._statvfs_result(1024, 2)
+        utils.fallocate(88, 1023)
+
+    def test_not_enough_space(self, sys_fallocate_mock, fstatvfs_mock):
+        # Want 1024 bytes in reserve plus 1024 allocated, and have 2 blocks
+        # of size 1024 free, so fail
+        utils.FALLOCATE_RESERVE, utils.FALLOCATE_IS_PERCENT = \
+            utils.config_fallocate_value('1024')
+
+        fstatvfs_mock.return_value = self._statvfs_result(1024, 2)
+        with self.assertRaises(OSError) as catcher:
+            utils.fallocate(88, 1024)
+        self.assertEqual(
+            str(catcher.exception),
+            '[Errno %d] FALLOCATE_RESERVE fail 1024 <= 1024'
+            % errno.ENOSPC)
+        sys_fallocate_mock.assert_not_called()
+
+    def test_not_enough_space_large(self, sys_fallocate_mock, fstatvfs_mock):
+        # Want 1024 bytes in reserve plus 1GB allocated, and have 2 blocks
+        # of size 1024 free, so fail
+        utils.FALLOCATE_RESERVE, utils.FALLOCATE_IS_PERCENT = \
+            utils.config_fallocate_value('1024')
+
+        fstatvfs_mock.return_value = self._statvfs_result(1024, 2)
+        with self.assertRaises(OSError) as catcher:
+            utils.fallocate(88, 1 << 30)
+        self.assertEqual(
+            str(catcher.exception),
+            '[Errno %d] FALLOCATE_RESERVE fail %g <= 1024'
+            % (errno.ENOSPC, ((2 * 1024) - (1 << 30))))
+        sys_fallocate_mock.assert_not_called()
+
+    def test_enough_space_small_blocks(self, sys_fallocate_mock,
+                                       fstatvfs_mock):
+        # Want 1024 bytes in reserve plus 1023 allocated, and have 4 blocks
+        # of size 512 free, so succeed
+        utils.FALLOCATE_RESERVE, utils.FALLOCATE_IS_PERCENT = \
+            utils.config_fallocate_value('1024')
+
+        fstatvfs_mock.return_value = self._statvfs_result(512, 4)
+        utils.fallocate(88, 1023)
+
+    def test_not_enough_space_small_blocks(self, sys_fallocate_mock,
+                                           fstatvfs_mock):
+        # Want 1024 bytes in reserve plus 1024 allocated, and have 4 blocks
+        # of size 512 free, so fail
+        utils.FALLOCATE_RESERVE, utils.FALLOCATE_IS_PERCENT = \
+            utils.config_fallocate_value('1024')
+
+        fstatvfs_mock.return_value = self._statvfs_result(512, 4)
+        with self.assertRaises(OSError) as catcher:
+            utils.fallocate(88, 1024)
+        self.assertEqual(
+            str(catcher.exception),
+            '[Errno %d] FALLOCATE_RESERVE fail 1024 <= 1024'
+            % errno.ENOSPC)
+        sys_fallocate_mock.assert_not_called()
+
+    def test_free_space_under_reserve(self, sys_fallocate_mock, fstatvfs_mock):
+        # Want 2048 bytes in reserve but have only 3 blocks of size 512, so
+        # allocating even 0 bytes fails
+        utils.FALLOCATE_RESERVE, utils.FALLOCATE_IS_PERCENT = \
+            utils.config_fallocate_value('2048')
+
+        fstatvfs_mock.return_value = self._statvfs_result(512, 3)
+        with self.assertRaises(OSError) as catcher:
+            utils.fallocate(88, 0)
+        self.assertEqual(
+            str(catcher.exception),
+            '[Errno %d] FALLOCATE_RESERVE fail 1536 <= 2048'
+            % errno.ENOSPC)
+        sys_fallocate_mock.assert_not_called()
+
+    def test_all_reserved(self, sys_fallocate_mock, fstatvfs_mock):
+        # Filesystem is empty, but our reserve is bigger than the
+        # filesystem, so any allocation will fail
+        utils.FALLOCATE_RESERVE, utils.FALLOCATE_IS_PERCENT = \
+            utils.config_fallocate_value('9999999999999')
+
+        fstatvfs_mock.return_value = self._statvfs_result(1024, 100)
+        self.assertRaises(OSError, utils.fallocate, 88, 0)
+        sys_fallocate_mock.assert_not_called()
+
+    def test_enough_space_pct(self, sys_fallocate_mock, fstatvfs_mock):
+        # Want 1% reserved, filesystem has 3/100 blocks of size 1024 free
+        # and file size is 2047, so succeed
+        utils.FALLOCATE_RESERVE, utils.FALLOCATE_IS_PERCENT = \
+            utils.config_fallocate_value('1%')
+
+        fstatvfs_mock.return_value = self._statvfs_result(1024, 3)
+        utils.fallocate(88, 2047)
+
+    def test_not_enough_space_pct(self, sys_fallocate_mock, fstatvfs_mock):
+        # Want 1% reserved, filesystem has 3/100 blocks of size 1024 free
+        # and file size is 2048, so fail
+        utils.FALLOCATE_RESERVE, utils.FALLOCATE_IS_PERCENT = \
+            utils.config_fallocate_value('1%')
+
+        fstatvfs_mock.return_value = self._statvfs_result(1024, 3)
+        with self.assertRaises(OSError) as catcher:
+            utils.fallocate(88, 2048)
+        self.assertEqual(
+            str(catcher.exception),
+            '[Errno %d] FALLOCATE_RESERVE fail 1 <= 1'
+            % errno.ENOSPC)
+        sys_fallocate_mock.assert_not_called()
+
+    def test_all_space_reserved_pct(self, sys_fallocate_mock, fstatvfs_mock):
+        # Filesystem is empty, but our reserve is the whole filesystem, so
+        # any allocation will fail
+        utils.FALLOCATE_RESERVE, utils.FALLOCATE_IS_PERCENT = \
+            utils.config_fallocate_value('100%')
+
+        fstatvfs_mock.return_value = self._statvfs_result(1024, 100)
+        with self.assertRaises(OSError) as catcher:
+            utils.fallocate(88, 0)
+        self.assertEqual(
+            str(catcher.exception),
+            '[Errno %d] FALLOCATE_RESERVE fail 100 <= 100'
+            % errno.ENOSPC)
+        sys_fallocate_mock.assert_not_called()
+
+
+@patch('ctypes.get_errno')
+@patch.object(utils, '_sys_fallocate')
+class TestPunchHole(unittest.TestCase):
+    def test_punch_hole(self, sys_fallocate_mock, get_errno_mock):
+        sys_fallocate_mock.available = True
+        sys_fallocate_mock.return_value = 0
+
+        utils.punch_hole(123, 456, 789)
+
+        calls = sys_fallocate_mock.mock_calls
+        self.assertEqual(len(calls), 1)
+        args = calls[0][1]
+        self.assertEqual(len(args), 4)
+        self.assertEqual(args[0], 123)
+        self.assertEqual(
+            args[1], utils.FALLOC_FL_PUNCH_HOLE | utils.FALLOC_FL_KEEP_SIZE)
+        self.assertEqual(args[2].value, 456)
+        self.assertEqual(args[3].value, 789)
+
+    def test_error(self, sys_fallocate_mock, get_errno_mock):
+        sys_fallocate_mock.available = True
+        sys_fallocate_mock.return_value = -1
+        get_errno_mock.return_value = errno.EISDIR
+
+        with self.assertRaises(OSError) as cm:
+            utils.punch_hole(123, 456, 789)
+        self.assertEqual(cm.exception.errno, errno.EISDIR)
+
+    def test_arg_bounds(self, sys_fallocate_mock, get_errno_mock):
+        sys_fallocate_mock.available = True
+        sys_fallocate_mock.return_value = 0
+
+        with self.assertRaises(ValueError):
+            utils.punch_hole(0, 1, -1)
+        with self.assertRaises(ValueError):
+            utils.punch_hole(0, 1 << 64, 1)
+        with self.assertRaises(ValueError):
+            utils.punch_hole(0, -1, 1)
+        with self.assertRaises(ValueError):
+            utils.punch_hole(0, 1, 0)
+        with self.assertRaises(ValueError):
+            utils.punch_hole(0, 1, 1 << 64)
+        self.assertEqual([], sys_fallocate_mock.mock_calls)
+
+        # sanity check
+        utils.punch_hole(0, 0, 1)
+        self.assertEqual(
+            [mock.call(
+                0, utils.FALLOC_FL_PUNCH_HOLE | utils.FALLOC_FL_KEEP_SIZE,
+                mock.ANY, mock.ANY)],
+            sys_fallocate_mock.mock_calls)
+        # Go confirm the ctypes values separately; apparently == doesn't
+        # work the way you'd expect with ctypes :-/
+        self.assertEqual(sys_fallocate_mock.mock_calls[0][1][2].value, 0)
+        self.assertEqual(sys_fallocate_mock.mock_calls[0][1][3].value, 1)
+
+    def test_no_fallocate(self, sys_fallocate_mock, get_errno_mock):
+        sys_fallocate_mock.available = False
+
+        with self.assertRaises(OSError) as cm:
+            utils.punch_hole(123, 456, 789)
+        self.assertEqual(cm.exception.errno, errno.ENOTSUP)
+
+
+class TestPunchHoleReally(unittest.TestCase):
+    def setUp(self):
+        if not utils._sys_fallocate.available:
+            raise unittest.SkipTest("utils._sys_fallocate not available")
+
+    def test_punch_a_hole(self):
+        with TemporaryFile() as tf:
+            tf.write(b"x" * 64 + b"y" * 64 + b"z" * 64)
+            tf.flush()
+
+            # knock out the first half of the "y"s
+            utils.punch_hole(tf.fileno(), 64, 32)
+
+            tf.seek(0)
+            contents = tf.read(4096)
+            self.assertEqual(
+                contents,
+                b"x" * 64 + b"\0" * 32 + b"y" * 32 + b"z" * 64)
+
+
 class TestWatchdog(unittest.TestCase):
     def test_start_stop(self):
         w = utils.Watchdog()
@@ -8921,3 +9421,23 @@ class TestCooperativeIterator(unittest.TestCase):
         self.assertEqual(list(range(3)), actual)
         actual = do_test(utils.CooperativeIterator(itertools.count(), 0), 0)
         self.assertEqual(list(range(2)), actual)
+
+
+class TestContextPool(unittest.TestCase):
+    def test_context_manager(self):
+        size = 5
+        pool = utils.ContextPool(size)
+        with pool:
+            for _ in range(size):
+                pool.spawn(eventlet.sleep, 10)
+            self.assertEqual(pool.running(), size)
+        self.assertEqual(pool.running(), 0)
+
+    def test_close(self):
+        size = 10
+        pool = utils.ContextPool(size)
+        for _ in range(size):
+            pool.spawn(eventlet.sleep, 10)
+        self.assertEqual(pool.running(), size)
+        pool.close()
+        self.assertEqual(pool.running(), 0)

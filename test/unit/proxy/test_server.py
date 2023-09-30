@@ -515,7 +515,7 @@ class TestController(unittest.TestCase):
 
     def test_get_account_info_returns_values_as_strings(self):
         app = mock.MagicMock()
-        app._pipeline_final_app = app
+        app._pipeline_request_logging_app = app._pipeline_final_app = app
         app.account_existence_skip_cache = 0.0
         memcache = mock.MagicMock()
         memcache.get = mock.MagicMock()
@@ -542,7 +542,7 @@ class TestController(unittest.TestCase):
 
     def test_get_container_info_returns_values_as_strings(self):
         app = mock.MagicMock()
-        app._pipeline_final_app = app
+        app._pipeline_request_logging_app = app._pipeline_final_app = app
         app.container_existence_skip_cache = 0.0
         memcache = mock.MagicMock()
         memcache.get = mock.MagicMock()
@@ -1082,7 +1082,7 @@ class TestProxyServer(unittest.TestCase):
                     elif header == "Content-Length":
                         return str(len(body))
                     else:
-                        return 1
+                        return "1"
 
                 resp = mock.Mock()
                 resp.read.side_effect = [body.encode('ascii'), b'']
@@ -1097,7 +1097,7 @@ class TestProxyServer(unittest.TestCase):
             conn = FakeConn(ip, *args, **kargs)
             return conn
 
-        with mock.patch('swift.proxy.server.Application.iter_nodes',
+        with mock.patch('swift.proxy.controllers.account.NodeIter',
                         fake_iter_nodes):
             with mock.patch('swift.common.bufferedhttp.http_connect_raw',
                             myfake_http_connect_raw):
@@ -1257,7 +1257,7 @@ class TestProxyServer(unittest.TestCase):
                 self.assertTrue(log_kwargs['exc_info'])
                 self.assertIs(caught_exc, log_kwargs['exc_info'][1])
                 incremented_limit_samples.append(
-                    logger.get_increment_counts().get(
+                    logger.statsd_client.get_increment_counts().get(
                         'error_limiter.incremented_limit', 0))
             self.assertEqual([0] * 10 + [1], incremented_limit_samples)
             self.assertEqual(
@@ -1294,7 +1294,7 @@ class TestProxyServer(unittest.TestCase):
                 self.assertIn(expected_msg, line)
                 self.assertIn(node_to_string(node), line)
                 incremented_limit_samples.append(
-                    logger.get_increment_counts().get(
+                    logger.statsd_client.get_increment_counts().get(
                         'error_limiter.incremented_limit', 0))
 
             self.assertEqual([0] * 10 + [1], incremented_limit_samples)
@@ -1310,8 +1310,9 @@ class TestProxyServer(unittest.TestCase):
             line = logger.get_lines_for_level('error')[-2]
             self.assertIn(expected_msg, line)
             self.assertIn(node_to_string(node), line)
-            self.assertEqual(2, logger.get_increment_counts().get(
-                'error_limiter.incremented_limit', 0))
+            self.assertEqual(
+                2, logger.statsd_client.get_increment_counts().get(
+                    'error_limiter.incremented_limit', 0))
             self.assertEqual(
                 ('Node will be error limited for 60.00s: %s' %
                  node_to_string(node)),
@@ -2521,6 +2522,74 @@ class BaseTestObjectController(object):
         self.assertEqual(len(error_lines), 0)  # sanity
         self.assertEqual(len(warn_lines), 0)  # sanity
 
+    @unpatch_policies
+    def test_GET_pipeline(self):
+        conf = _test_context['conf']
+        conf['client_timeout'] = 0.1
+        prosrv = proxy_server.Application(conf, logger=debug_logger('proxy'))
+        with in_process_proxy(
+                prosrv, socket_timeout=conf['client_timeout']) as prolis:
+            self.put_container(self.policy.name, self.policy.name,
+                               prolis=prolis)
+
+            obj = b'0123456' * 11 * 17
+
+            sock = connect_tcp(('localhost', prolis.getsockname()[1]))
+            fd = sock.makefile('rwb')
+            fd.write(('PUT /v1/a/%s/go-get-it HTTP/1.1\r\n'
+                      'Host: localhost\r\n'
+                      'Content-Length: %d\r\n'
+                      'X-Storage-Token: t\r\n'
+                      'X-Object-Meta-Color: chartreuse\r\n'
+                      'Content-Type: application/octet-stream\r\n'
+                      '\r\n' % (
+                          self.policy.name,
+                          len(obj),
+                      )).encode('ascii'))
+            fd.write(obj)
+            fd.flush()
+            headers = readuntil2crlfs(fd)
+            exp = b'HTTP/1.1 201'
+            self.assertEqual(headers[:len(exp)], exp)
+
+            fd.write(('GET /v1/a/%s/go-get-it HTTP/1.1\r\n'
+                      'Host: localhost\r\n'
+                      'X-Storage-Token: t\r\n'
+                      '\r\n' % self.policy.name).encode('ascii'))
+            fd.flush()
+            headers = readuntil2crlfs(fd)
+            exp = b'HTTP/1.1 200'
+            self.assertEqual(headers[:len(exp)], exp)
+            for line in headers.splitlines():
+                if b'Content-Length' in line:
+                    h, v = line.split()
+                    content_length = int(v.strip())
+                    break
+            else:
+                self.fail("Didn't find content-length in %r" % (headers,))
+
+            gotten_obj = fd.read(content_length)
+            self.assertEqual(gotten_obj, obj)
+
+            sleep(0.3)  # client_timeout should kick us off
+
+            fd.write(('GET /v1/a/%s/go-get-it HTTP/1.1\r\n'
+                      'Host: localhost\r\n'
+                      'X-Storage-Token: t\r\n'
+                      '\r\n' % self.policy.name).encode('ascii'))
+            fd.flush()
+            # makefile is a little weird, but this is disconnected
+            self.assertEqual(b'', fd.read())
+            # I expected this to raise a socket error
+            self.assertEqual(b'', sock.recv(1024))
+            # ... but we ARE disconnected
+            with self.assertRaises(socket.error) as caught:
+                sock.send(b'test')
+            self.assertEqual(caught.exception.errno, errno.EPIPE)
+            # and logging confirms we've timed out
+            last_debug_msg = prosrv.logger.get_lines_for_level('debug')[-1]
+            self.assertIn('timed out', last_debug_msg)
+
 
 @patch_policies([StoragePolicy(0, 'zero', True,
                                object_ring=FakeRing(base_port=3000))])
@@ -2538,6 +2607,7 @@ class TestReplicatedObjectController(
             logger=self.logger,
             account_ring=FakeRing(),
             container_ring=FakeRing())
+        self.policy = POLICIES[0]
         super(TestReplicatedObjectController, self).setUp()
 
     def tearDown(self):
@@ -3540,7 +3610,7 @@ class TestReplicatedObjectController(
             error_node = object_ring.get_part_nodes(1)[0]
             self.app.error_limit(error_node, 'test')
             self.assertEqual(
-                1, self.logger.get_increment_counts().get(
+                1, self.logger.statsd_client.get_increment_counts().get(
                     'error_limiter.forced_limit', 0))
             line = self.logger.get_lines_for_level('error')[-1]
             self.assertEqual(
@@ -3549,7 +3619,7 @@ class TestReplicatedObjectController(
 
             # no error limited checking yet.
             self.assertEqual(
-                0, self.logger.get_increment_counts().get(
+                0, self.logger.statsd_client.get_increment_counts().get(
                     'error_limiter.is_limited', 0))
             set_http_connect(200, 200,        # account, container
                              201, 201, 201,   # 3 working backends
@@ -3561,7 +3631,7 @@ class TestReplicatedObjectController(
             self.assertTrue(res.status.startswith('201 '))
             # error limited happened during PUT.
             self.assertEqual(
-                1, self.logger.get_increment_counts().get(
+                1, self.logger.statsd_client.get_increment_counts().get(
                     'error_limiter.is_limited', 0))
 
         # this is kind of a hokey test, but in FakeRing, the port is even when
@@ -4259,9 +4329,13 @@ class TestReplicatedObjectController(
                 resp = req.get_response(self.app)
 
             self.assertEqual(resp.status_int, 202)
-            stats = self.app.logger.get_increment_counts()
+            stats = self.app.logger.statsd_client.get_increment_counts()
             self.assertEqual(
-                {'object.shard_updating.cache.disabled.200': 1},
+                {'account.info.cache.disabled.200': 1,
+                 'account.info.infocache.hit': 2,
+                 'container.info.cache.disabled.200': 1,
+                 'container.info.infocache.hit': 1,
+                 'object.shard_updating.cache.disabled.200': 1},
                 stats)
             backend_requests = fake_conn.requests
             # verify statsd prefix is not mutated
@@ -4352,12 +4426,18 @@ class TestReplicatedObjectController(
                 resp = req.get_response(self.app)
 
             self.assertEqual(resp.status_int, 202)
-            stats = self.app.logger.get_increment_counts()
-            self.assertEqual({'account.info.cache.miss': 1,
-                              'container.info.cache.miss': 1,
+            stats = self.app.logger.statsd_client.get_increment_counts()
+            self.assertEqual({'account.info.cache.miss.200': 1,
+                              'account.info.infocache.hit': 2,
+                              'container.info.cache.miss.200': 1,
+                              'container.info.infocache.hit': 1,
                               'object.shard_updating.cache.miss.200': 1},
                              stats)
             self.assertEqual([], self.app.logger.log_dict['set_statsd_prefix'])
+            info_lines = self.logger.get_lines_for_level('info')
+            self.assertIn(
+                'Caching updating shards for shard-updating-v2/a/c (3 shards)',
+                info_lines)
 
             backend_requests = fake_conn.requests
             account_request = backend_requests[0]
@@ -4459,9 +4539,12 @@ class TestReplicatedObjectController(
                 resp = req.get_response(self.app)
 
             self.assertEqual(resp.status_int, 202)
-            stats = self.app.logger.get_increment_counts()
-            self.assertEqual({'account.info.cache.miss': 1,
-                              'container.info.cache.miss': 1,
+
+            stats = self.app.logger.statsd_client.get_increment_counts()
+            self.assertEqual({'account.info.cache.miss.200': 1,
+                              'account.info.infocache.hit': 1,
+                              'container.info.cache.miss.200': 1,
+                              'container.info.infocache.hit': 1,
                               'object.shard_updating.cache.hit': 1}, stats)
             # verify statsd prefix is not mutated
             self.assertEqual([], self.app.logger.log_dict['set_statsd_prefix'])
@@ -4555,8 +4638,13 @@ class TestReplicatedObjectController(
 
             # verify request hitted infocache.
             self.assertEqual(resp.status_int, 202)
-            stats = self.app.logger.get_increment_counts()
-            self.assertEqual({'object.shard_updating.infocache.hit': 1}, stats)
+
+            stats = self.app.logger.statsd_client.get_increment_counts()
+            self.assertEqual({'account.info.cache.disabled.200': 1,
+                              'account.info.infocache.hit': 1,
+                              'container.info.cache.disabled.200': 1,
+                              'container.info.infocache.hit': 1,
+                              'object.shard_updating.infocache.hit': 1}, stats)
             # verify statsd prefix is not mutated
             self.assertEqual([], self.app.logger.log_dict['set_statsd_prefix'])
 
@@ -4652,9 +4740,12 @@ class TestReplicatedObjectController(
                 resp = req.get_response(self.app)
 
             self.assertEqual(resp.status_int, 202)
-            stats = self.app.logger.get_increment_counts()
-            self.assertEqual({'account.info.cache.miss': 1,
-                              'container.info.cache.miss': 1,
+
+            stats = self.app.logger.statsd_client.get_increment_counts()
+            self.assertEqual({'account.info.cache.miss.200': 1,
+                              'account.info.infocache.hit': 1,
+                              'container.info.cache.miss.200': 1,
+                              'container.info.infocache.hit': 1,
                               'object.shard_updating.cache.hit': 1}, stats)
 
             # cached shard ranges are still there
@@ -4695,13 +4786,17 @@ class TestReplicatedObjectController(
                 resp = req.get_response(self.app)
 
             self.assertEqual(resp.status_int, 202)
-            stats = self.app.logger.get_increment_counts()
-            self.assertEqual({'account.info.cache.miss': 1,
-                              'account.info.cache.hit': 1,
-                              'container.info.cache.miss': 1,
+
+            stats = self.app.logger.statsd_client.get_increment_counts()
+            self.assertEqual({'account.info.cache.miss.200': 1,
+                              'account.info.infocache.hit': 1,
+                              'container.info.cache.miss.200': 1,
+                              'container.info.infocache.hit': 2,
+                              'object.shard_updating.cache.hit': 1,
                               'container.info.cache.hit': 1,
-                              'object.shard_updating.cache.skip.200': 1,
-                              'object.shard_updating.cache.hit': 1}, stats)
+                              'account.info.cache.hit': 1,
+                              'object.shard_updating.cache.skip.200': 1},
+                             stats)
             # verify statsd prefix is not mutated
             self.assertEqual([], self.app.logger.log_dict['set_statsd_prefix'])
 
@@ -4760,12 +4855,14 @@ class TestReplicatedObjectController(
                 resp = req.get_response(self.app)
 
             self.assertEqual(resp.status_int, 202)
-            stats = self.app.logger.get_increment_counts()
+            stats = self.app.logger.statsd_client.get_increment_counts()
             self.assertEqual(stats, {
                 'account.info.cache.hit': 2,
-                'account.info.cache.miss': 1,
+                'account.info.cache.miss.200': 1,
+                'account.info.infocache.hit': 1,
                 'container.info.cache.hit': 2,
-                'container.info.cache.miss': 1,
+                'container.info.cache.miss.200': 1,
+                'container.info.infocache.hit': 3,
                 'object.shard_updating.cache.skip.200': 1,
                 'object.shard_updating.cache.hit': 1,
                 'object.shard_updating.cache.error.200': 1})
@@ -4804,9 +4901,13 @@ class TestReplicatedObjectController(
                 resp = req.get_response(self.app)
 
             self.assertEqual(resp.status_int, 202)
-            stats = self.app.logger.get_increment_counts()
+            stats = self.app.logger.statsd_client.get_increment_counts()
             self.assertEqual(
-                {'object.shard_updating.cache.disabled.404': 1},
+                {'account.info.cache.disabled.200': 1,
+                 'account.info.infocache.hit': 2,
+                 'container.info.cache.disabled.200': 1,
+                 'container.info.infocache.hit': 1,
+                 'object.shard_updating.cache.disabled.404': 1},
                 stats)
 
             backend_requests = fake_conn.requests
@@ -5371,9 +5472,9 @@ class TestReplicatedObjectController(
                                                          'container',
                                                          'object')
                 collected_nodes = []
-                for node in self.app.iter_nodes(object_ring, partition,
-                                                self.logger,
-                                                request=Request.blank('')):
+                for node in proxy_base.NodeIter(
+                        'object', self.app, object_ring, partition,
+                        self.logger, request=Request.blank('')):
                     collected_nodes.append(node)
                 self.assertEqual(len(collected_nodes), 5)
 
@@ -5383,9 +5484,9 @@ class TestReplicatedObjectController(
                                                          'container',
                                                          'object')
                 collected_nodes = []
-                for node in self.app.iter_nodes(object_ring, partition,
-                                                self.logger,
-                                                request=Request.blank('')):
+                for node in proxy_base.NodeIter(
+                        'object', self.app, object_ring, partition,
+                        self.logger, request=Request.blank('')):
                     collected_nodes.append(node)
                 self.assertEqual(len(collected_nodes), 9)
 
@@ -5398,13 +5499,14 @@ class TestReplicatedObjectController(
                                                          'container',
                                                          'object')
                 collected_nodes = []
-                for node in self.app.iter_nodes(object_ring, partition,
-                                                self.logger,
-                                                request=Request.blank('')):
+                for node in proxy_base.NodeIter(
+                        'object', self.app, object_ring, partition,
+                        self.logger, request=Request.blank('')):
                     collected_nodes.append(node)
                 self.assertEqual(len(collected_nodes), 7)
                 self.assertEqual(self.app.logger.log_dict['warning'], [])
-                self.assertEqual(self.app.logger.get_increments(), [])
+                self.assertEqual(
+                    self.app.logger.statsd_client.get_increments(), [])
 
                 # one error-limited primary node -> one handoff warning
                 self.app.log_handoffs = True
@@ -5415,17 +5517,17 @@ class TestReplicatedObjectController(
                                 last_error=(2 ** 63 - 1))
 
                 collected_nodes = []
-                for node in self.app.iter_nodes(object_ring, partition,
-                                                self.logger,
-                                                request=Request.blank('')):
+                for node in proxy_base.NodeIter(
+                        'object', self.app, object_ring, partition,
+                        self.logger, request=Request.blank('')):
                     collected_nodes.append(node)
                 self.assertEqual(len(collected_nodes), 7)
                 self.assertEqual(
                     self.app.logger.get_lines_for_level('warning'), [
                         'Handoff requested (5)'])
                 self.assertEqual(
-                    self.app.logger.get_increments(),
-                    ['error_limiter.is_limited', 'handoff_count'])
+                    self.app.logger.statsd_client.get_increments(),
+                    ['error_limiter.is_limited', 'object.handoff_count'])
 
                 # two error-limited primary nodes -> two handoff warnings
                 self.app.log_handoffs = True
@@ -5437,9 +5539,9 @@ class TestReplicatedObjectController(
                                     last_error=(2 ** 63 - 1))
 
                 collected_nodes = []
-                for node in self.app.iter_nodes(object_ring, partition,
-                                                self.logger,
-                                                request=Request.blank('')):
+                for node in proxy_base.NodeIter(
+                        'object', self.app, object_ring, partition,
+                        self.logger, request=Request.blank('')):
                     collected_nodes.append(node)
                 self.assertEqual(len(collected_nodes), 7)
                 self.assertEqual(
@@ -5447,9 +5549,9 @@ class TestReplicatedObjectController(
                         'Handoff requested (5)',
                         'Handoff requested (6)',
                     ])
-                stats = self.app.logger.get_increment_counts()
+                stats = self.app.logger.statsd_client.get_increment_counts()
                 self.assertEqual(2, stats.get('error_limiter.is_limited', 0))
-                self.assertEqual(2, stats.get('handoff_count', 0))
+                self.assertEqual(2, stats.get('object.handoff_count', 0))
 
                 # all error-limited primary nodes -> four handoff warnings,
                 # plus a handoff-all metric
@@ -5463,9 +5565,9 @@ class TestReplicatedObjectController(
                                     last_error=(2 ** 63 - 1))
 
                 collected_nodes = []
-                for node in self.app.iter_nodes(object_ring, partition,
-                                                self.logger,
-                                                request=Request.blank('')):
+                for node in proxy_base.NodeIter(
+                        'object', self.app, object_ring, partition,
+                        self.logger, request=Request.blank('')):
                     collected_nodes.append(node)
                 self.assertEqual(len(collected_nodes), 10)
                 self.assertEqual(
@@ -5475,10 +5577,10 @@ class TestReplicatedObjectController(
                         'Handoff requested (9)',
                         'Handoff requested (10)',
                     ])
-                stats = self.app.logger.get_increment_counts()
+                stats = self.app.logger.statsd_client.get_increment_counts()
                 self.assertEqual(4, stats.get('error_limiter.is_limited', 0))
-                self.assertEqual(4, stats.get('handoff_count', 0))
-                self.assertEqual(1, stats.get('handoff_all_count', 0))
+                self.assertEqual(4, stats.get('object.handoff_count', 0))
+                self.assertEqual(1, stats.get('object.handoff_all_count', 0))
 
             finally:
                 object_ring.max_more_nodes = 0
@@ -5494,8 +5596,9 @@ class TestReplicatedObjectController(
         with mock.patch.object(self.app, 'sort_nodes',
                                side_effect=fake_sort_nodes):
             object_ring = self.app.get_object_ring(None)
-            for node in self.app.iter_nodes(object_ring, 0, self.logger,
-                                            request=Request.blank('')):
+            for node in proxy_base.NodeIter(
+                    'object', self.app, object_ring, 0, self.logger,
+                    request=Request.blank('')):
                 pass
             self.assertEqual(called, [
                 mock.call(object_ring.get_part_nodes(0), policy=None)
@@ -5505,39 +5608,43 @@ class TestReplicatedObjectController(
         with mock.patch.object(self.app, 'sort_nodes',
                                lambda n, *args, **kwargs: n):
             object_ring = self.app.get_object_ring(None)
-            first_nodes = list(self.app.iter_nodes(
-                object_ring, 0, self.logger, request=Request.blank('')))
-            second_nodes = list(self.app.iter_nodes(
-                object_ring, 0, self.logger, request=Request.blank('')))
+            first_nodes = list(proxy_base.NodeIter(
+                'object', self.app, object_ring, 0, self.logger,
+                request=Request.blank('')))
+            second_nodes = list(proxy_base.NodeIter(
+                'object', self.app, object_ring, 0, self.logger,
+                request=Request.blank('')))
             self.assertIn(first_nodes[0], second_nodes)
 
             self.assertEqual(
-                0, self.logger.get_increment_counts().get(
+                0, self.logger.statsd_client.get_increment_counts().get(
                     'error_limiter.is_limited', 0))
             self.assertEqual(
-                0, self.logger.get_increment_counts().get(
+                0, self.logger.statsd_client.get_increment_counts().get(
                     'error_limiter.forced_limit', 0))
 
             self.app.error_limit(first_nodes[0], 'test')
             self.assertEqual(
-                1, self.logger.get_increment_counts().get(
+                1, self.logger.statsd_client.get_increment_counts().get(
                     'error_limiter.forced_limit', 0))
             line = self.logger.get_lines_for_level('error')[-1]
             self.assertEqual(
                 ('Node will be error limited for 60.00s: %s, error: %s'
                  % (node_to_string(first_nodes[0]), 'test')), line)
 
-            second_nodes = list(self.app.iter_nodes(
-                object_ring, 0, self.logger, request=Request.blank('')))
+            second_nodes = list(proxy_base.NodeIter(
+                'object', self.app, object_ring, 0, self.logger,
+                request=Request.blank('')))
             self.assertNotIn(first_nodes[0], second_nodes)
             self.assertEqual(
-                1, self.logger.get_increment_counts().get(
+                1, self.logger.statsd_client.get_increment_counts().get(
                     'error_limiter.is_limited', 0))
-            third_nodes = list(self.app.iter_nodes(
-                object_ring, 0, self.logger, request=Request.blank('')))
+            third_nodes = list(proxy_base.NodeIter(
+                'object', self.app, object_ring, 0, self.logger,
+                request=Request.blank('')))
             self.assertNotIn(first_nodes[0], third_nodes)
             self.assertEqual(
-                2, self.logger.get_increment_counts().get(
+                2, self.logger.statsd_client.get_increment_counts().get(
                     'error_limiter.is_limited', 0))
 
     def test_iter_nodes_gives_extra_if_error_limited_inline(self):
@@ -5547,11 +5654,13 @@ class TestReplicatedObjectController(
                 mock.patch.object(self.app, 'request_node_count',
                                   lambda r: 6), \
                 mock.patch.object(object_ring, 'max_more_nodes', 99):
-            first_nodes = list(self.app.iter_nodes(
-                object_ring, 0, self.logger, request=Request.blank('')))
+            first_nodes = list(proxy_base.NodeIter(
+                'object', self.app, object_ring, 0, self.logger,
+                request=Request.blank('')))
             second_nodes = []
-            for node in self.app.iter_nodes(object_ring, 0, self.logger,
-                                            request=Request.blank('')):
+            for node in proxy_base.NodeIter(
+                    'object', self.app, object_ring, 0, self.logger,
+                    request=Request.blank('')):
                 if not second_nodes:
                     self.app.error_limit(node, 'test')
                 second_nodes.append(node)
@@ -5568,9 +5677,9 @@ class TestReplicatedObjectController(
                                lambda n, *args, **kwargs: n), \
                 mock.patch.object(self.app, 'request_node_count',
                                   lambda r: 3):
-            got_nodes = list(self.app.iter_nodes(
-                object_ring, 0, self.logger, Request.blank(''),
-                node_iter=iter(node_list)))
+            got_nodes = list(proxy_base.NodeIter(
+                'object', self.app, object_ring, 0, self.logger,
+                Request.blank(''), node_iter=iter(node_list)))
         self.assertEqual(expected[:3], got_nodes)
 
         req = Request.blank('/v1/a/c')
@@ -5580,8 +5689,9 @@ class TestReplicatedObjectController(
                                lambda n, *args, **kwargs: n), \
                 mock.patch.object(self.app, 'request_node_count',
                                   lambda r: 1000000):
-            got_nodes = list(self.app.iter_nodes(
-                object_ring, 0, self.logger, req, node_iter=iter(node_list)))
+            got_nodes = list(proxy_base.NodeIter(
+                'object', self.app, object_ring, 0, self.logger, req,
+                node_iter=iter(node_list)))
         self.assertEqual(expected, got_nodes)
 
     def test_iter_nodes_with_replication_network(self):
@@ -5595,8 +5705,9 @@ class TestReplicatedObjectController(
                                lambda n, *args, **kwargs: n), \
                 mock.patch.object(self.app, 'request_node_count',
                                   lambda r: 3):
-            got_nodes = list(self.app.iter_nodes(
-                object_ring, 0, self.logger, req, node_iter=iter(node_list)))
+            got_nodes = list(proxy_base.NodeIter(
+                'object', self.app, object_ring, 0, self.logger, req,
+                node_iter=iter(node_list)))
         expected = [dict(n, use_replication=True) for n in node_list]
         self.assertEqual(expected[:3], got_nodes)
         req = Request.blank(
@@ -5606,8 +5717,9 @@ class TestReplicatedObjectController(
                                lambda n, *args, **kwargs: n), \
                 mock.patch.object(self.app, 'request_node_count',
                                   lambda r: 13):
-            got_nodes = list(self.app.iter_nodes(
-                object_ring, 0, self.logger, req, node_iter=iter(node_list)))
+            got_nodes = list(proxy_base.NodeIter(
+                'object', self.app, object_ring, 0, self.logger, req,
+                node_iter=iter(node_list)))
         self.assertEqual(expected, got_nodes)
 
     def test_best_response_sets_headers(self):
@@ -8195,73 +8307,6 @@ class BaseTestECObjectController(BaseTestObjectController):
             os.rename(self.ec_policy.object_ring.serialized_path + '.bak',
                       self.ec_policy.object_ring.serialized_path)
 
-    def test_GET_ec_pipeline(self):
-        conf = _test_context['conf']
-        conf['client_timeout'] = 0.1
-        prosrv = proxy_server.Application(conf, logger=debug_logger('proxy'))
-        with in_process_proxy(
-                prosrv, socket_timeout=conf['client_timeout']) as prolis:
-            self.put_container(self.ec_policy.name, self.ec_policy.name,
-                               prolis=prolis)
-
-            obj = b'0123456' * 11 * 17
-
-            sock = connect_tcp(('localhost', prolis.getsockname()[1]))
-            fd = sock.makefile('rwb')
-            fd.write(('PUT /v1/a/%s/go-get-it HTTP/1.1\r\n'
-                      'Host: localhost\r\n'
-                      'Content-Length: %d\r\n'
-                      'X-Storage-Token: t\r\n'
-                      'X-Object-Meta-Color: chartreuse\r\n'
-                      'Content-Type: application/octet-stream\r\n'
-                      '\r\n' % (
-                          self.ec_policy.name,
-                          len(obj),
-                      )).encode('ascii'))
-            fd.write(obj)
-            fd.flush()
-            headers = readuntil2crlfs(fd)
-            exp = b'HTTP/1.1 201'
-            self.assertEqual(headers[:len(exp)], exp)
-
-            fd.write(('GET /v1/a/%s/go-get-it HTTP/1.1\r\n'
-                      'Host: localhost\r\n'
-                      'X-Storage-Token: t\r\n'
-                      '\r\n' % self.ec_policy.name).encode('ascii'))
-            fd.flush()
-            headers = readuntil2crlfs(fd)
-            exp = b'HTTP/1.1 200'
-            self.assertEqual(headers[:len(exp)], exp)
-            for line in headers.splitlines():
-                if b'Content-Length' in line:
-                    h, v = line.split()
-                    content_length = int(v.strip())
-                    break
-            else:
-                self.fail("Didn't find content-length in %r" % (headers,))
-
-            gotten_obj = fd.read(content_length)
-            self.assertEqual(gotten_obj, obj)
-
-            sleep(0.3)  # client_timeout should kick us off
-
-            fd.write(('GET /v1/a/%s/go-get-it HTTP/1.1\r\n'
-                      'Host: localhost\r\n'
-                      'X-Storage-Token: t\r\n'
-                      '\r\n' % self.ec_policy.name).encode('ascii'))
-            fd.flush()
-            # makefile is a little weird, but this is disconnected
-            self.assertEqual(b'', fd.read())
-            # I expected this to raise a socket error
-            self.assertEqual(b'', sock.recv(1024))
-            # ... but we ARE disconnected
-            with self.assertRaises(socket.error) as caught:
-                sock.send(b'test')
-            self.assertEqual(caught.exception.errno, errno.EPIPE)
-            # and logging confirms we've timed out
-            last_debug_msg = prosrv.logger.get_lines_for_level('debug')[-1]
-            self.assertIn('timed out', last_debug_msg)
-
     def test_ec_client_disconnect(self):
         prolis = _test_sockets[0]
 
@@ -8492,7 +8537,7 @@ class BaseTestECObjectController(BaseTestObjectController):
 class TestECObjectController(BaseTestECObjectController, unittest.TestCase):
     def setUp(self):
         skip_if_no_xattrs()
-        self.ec_policy = POLICIES[3]
+        self.policy = self.ec_policy = POLICIES[3]
         super(TestECObjectController, self).setUp()
 
 
@@ -8500,7 +8545,7 @@ class TestECDuplicationObjectController(
         BaseTestECObjectController, unittest.TestCase):
     def setUp(self):
         skip_if_no_xattrs()
-        self.ec_policy = POLICIES[4]
+        self.policy = self.ec_policy = POLICIES[4]
         super(TestECDuplicationObjectController, self).setUp()
 
 
@@ -10045,6 +10090,38 @@ class TestContainerController(unittest.TestCase):
                                   call['method'], key, call['headers']))
                 self.assertEqual(value, call['headers'][key])
 
+    def test_PUT_autocreate_account_utf8(self):
+        with save_globals():
+            controller = proxy_server.ContainerController(
+                self.app, wsgi_to_str('\xe2\x98\x83'),
+                wsgi_to_str('\xe2\x98\x83'))
+
+            def test_status_map(statuses, expected, headers=None, **kwargs):
+                set_http_connect(*statuses, **kwargs)
+                req = Request.blank('/v1/a/c', {}, headers=headers)
+                req.content_length = 0
+                self.app.update_request(req)
+                res = controller.PUT(req)
+                expected = str(expected)
+                self.assertEqual(res.status[:len(expected)], expected)
+
+            self.app.account_autocreate = True
+            calls = []
+            callback = _make_callback_func(calls)
+
+            # all goes according to plan
+            test_status_map(
+                (404, 404, 404,   # account_info fails on 404
+                 201, 201, 201,   # PUT account
+                 200,             # account_info success
+                 201, 201, 201),  # put container success
+                201, missing_container=True,
+                give_connect=callback)
+
+            self.assertEqual(10, len(calls))
+            for call in calls[3:6]:
+                self.assertEqual(wsgi_to_str('/\xe2\x98\x83'), call['path'])
+
     def test_POST(self):
         with save_globals():
             controller = proxy_server.ContainerController(self.app, 'account',
@@ -11580,6 +11657,15 @@ class TestAccountControllerFakeGetResponse(unittest.TestCase):
                                          'QUERY_STRING': 'format=\xff\xfe'})
             resp = req.get_response(self.app)
             self.assertEqual(400, resp.status_int)
+
+    def test_GET_autocreate_utf8(self):
+        with save_globals():
+            set_http_connect(*([404] * 100))  # nonexistent: all backends 404
+            req = Request.blank('/v1/\xe2\x98\x83',
+                                environ={'REQUEST_METHOD': 'GET',
+                                         'PATH_INFO': '/v1/\xe2\x98\x83'})
+            resp = req.get_response(self.app)
+            self.assertEqual(204, resp.status_int)
 
     def test_account_acl_header_access(self):
         acl = {

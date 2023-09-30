@@ -158,6 +158,7 @@ from swift.common.http import is_success, is_client_error, HTTP_NOT_FOUND, \
 from swift.common.request_helpers import get_sys_meta_prefix, \
     copy_header_subset, get_reserved_name, split_reserved_name, \
     constrain_req_limit
+from swift.common.middleware import app_property
 from swift.common.middleware.symlink import TGT_OBJ_SYMLINK_HDR, \
     TGT_ETAG_SYSMETA_SYMLINK_HDR, SYMLOOP_EXTEND, ALLOW_RESERVED_NAMES, \
     TGT_BYTES_SYSMETA_SYMLINK_HDR, TGT_ACCT_SYMLINK_HDR
@@ -1165,12 +1166,22 @@ class ContainerContext(ObjectVersioningContext):
             params['prefix'] = get_reserved_name(params['prefix'])
 
         # NB: no end_marker support (yet)
-        versions_req.params = {
-            k: params.get(k, '')
-            for k in ('prefix', 'marker', 'limit', 'delimiter', 'reverse')}
-        versions_resp = versions_req.get_response(self.app)
+        if get_container_info(versions_req.environ, self.app,
+                              swift_source='OV')['status'] == 404:
+            # we don't usually like to LBYL like this, but 404s tend to be
+            # expensive (since we check all primaries and a bunch of handoffs)
+            # and we expect this to be a reasonably common way to listing
+            # objects since it's more complete from the user's perspective
+            # (see also: s3api and that client ecosystem)
+            versions_resp = None
+        else:
+            versions_req.params = {
+                k: params.get(k, '') for k in (
+                    'prefix', 'marker', 'limit', 'delimiter', 'reverse')}
+            versions_resp = versions_req.get_response(self.app)
 
-        if versions_resp.status_int == HTTP_NOT_FOUND:
+        if versions_resp is None \
+                or versions_resp.status_int == HTTP_NOT_FOUND:
             subdir_listing = [{'subdir': s} for s in subdir_set]
             broken_listing = []
             for item in current_versions.values():
@@ -1378,6 +1389,12 @@ class ObjectVersioningMiddleware(object):
         self.app = app
         self.conf = conf
         self.logger = get_logger(conf, log_route='object_versioning')
+
+    # Pass these along so get_container_info will have the configured
+    # odds to skip cache
+    _pipeline_final_app = app_property('_pipeline_final_app')
+    _pipeline_request_logging_app = app_property(
+        '_pipeline_request_logging_app')
 
     def account_request(self, req, api_version, account, start_response):
         account_ctx = AccountContext(self.app, self.logger)
