@@ -48,8 +48,7 @@ from swift.common.utils import (
     normalize_delete_at_timestamp, public, get_expirer_container,
     document_iters_to_http_response_body, parse_content_range,
     quorum_size, reiterate, close_if_possible, safe_json_loads, md5,
-    ShardRange, find_namespace, cache_from_env, NamespaceBoundList,
-    CooperativeIterator)
+    NamespaceBoundList, CooperativeIterator)
 from swift.common.bufferedhttp import http_connect
 from swift.common.constraints import check_metadata, check_object_creation
 from swift.common import constraints
@@ -64,21 +63,22 @@ from swift.common.http import (
     HTTP_SERVICE_UNAVAILABLE, HTTP_INSUFFICIENT_STORAGE,
     HTTP_PRECONDITION_FAILED, HTTP_CONFLICT, HTTP_UNPROCESSABLE_ENTITY,
     HTTP_REQUESTED_RANGE_NOT_SATISFIABLE, HTTP_NOT_FOUND)
-from swift.common.memcached import MemcacheConnectionError
 from swift.common.storage_policy import (POLICIES, REPL_POLICY, EC_POLICY,
                                          ECDriverError, PolicyError)
 from swift.proxy.controllers.base import Controller, delay_denial, \
     cors_validation, update_headers, bytes_to_skip, ByteCountEnforcer, \
     record_cache_op_metrics, get_cache_key, GetterBase, GetterSource, \
-    is_good_source, NodeIter
+    is_good_source, NodeIter, get_namespaces_from_cache, \
+    set_namespaces_in_cache
 from swift.common.swob import HTTPAccepted, HTTPBadRequest, HTTPNotFound, \
     HTTPPreconditionFailed, HTTPRequestEntityTooLarge, HTTPRequestTimeout, \
     HTTPServerError, HTTPServiceUnavailable, HTTPClientDisconnect, \
     HTTPUnprocessableEntity, Response, HTTPException, \
     HTTPRequestedRangeNotSatisfiable, Range, HTTPInternalServerError, \
-    normalize_etag
+    normalize_etag, str_to_wsgi
 from swift.common.request_helpers import update_etag_is_at_header, \
-    resolve_etag_is_at_header, validate_internal_obj, get_ip_port
+    resolve_etag_is_at_header, validate_internal_obj, get_ip_port, \
+    is_open_expired
 
 
 def check_content_type(req):
@@ -251,6 +251,8 @@ class BaseObjectController(Controller):
         policy = POLICIES.get_by_index(policy_index)
         obj_ring = self.app.get_object_ring(policy_index)
         req.headers['X-Backend-Storage-Policy-Index'] = policy_index
+        if is_open_expired(self.app, req):
+            req.headers['X-Backend-Open-Expired'] = 'true'
         if 'swift.authorize' in req.environ:
             aresp = req.environ['swift.authorize'](req)
             if aresp:
@@ -282,47 +284,32 @@ class BaseObjectController(Controller):
         """Handler for HTTP HEAD requests."""
         return self.GETorHEAD(req)
 
-    def _get_cached_updating_namespaces(
-            self, infocache, memcache, cache_key):
+    def _get_updating_namespaces(
+            self, req, account, container, includes=None):
         """
-        Fetch cached updating namespaces of updating shard ranges from
-        infocache and memcache.
+        Fetch namespaces in 'updating' states from given `account/container`.
+        If `includes` is given then the shard range for that object name is
+        requested, otherwise all namespaces are requested.
 
-        :param infocache: the infocache instance.
-        :param memcache: an instance of a memcache client,
-                         :class:`swift.common.memcached.MemcacheRing`.
-        :param cache_key: the cache key for both infocache and memcache.
-        :return: a tuple of (an instance of NamespaceBoundList, cache state)
+        :param req: original Request instance.
+        :param account: account from which namespaces should be fetched.
+        :param container: container from which namespaces should be fetched.
+        :param includes: (optional) restricts the list of fetched namespaces
+            to those which include the given name.
+        :return: a list of instances of :class:`swift.common.utils.Namespace`,
+            or None if there was a problem fetching the namespaces.
         """
-        # try get namespaces from infocache first
-        namespace_list = infocache.get(cache_key)
-        if namespace_list:
-            return namespace_list, 'infocache_hit'
-
-        # then try get them from memcache
-        if not memcache:
-            return None, 'disabled'
-        skip_chance = self.app.container_updating_shard_ranges_skip_cache
-        if skip_chance and random.random() < skip_chance:
-            return None, 'skip'
-        try:
-            namespaces = memcache.get(cache_key, raise_on_error=True)
-            cache_state = 'hit' if namespaces else 'miss'
-        except MemcacheConnectionError:
-            namespaces = None
-            cache_state = 'error'
-
-        if namespaces:
-            if six.PY2:
-                # json.loads() in memcache.get will convert json 'string' to
-                # 'unicode' with python2, here we cast 'unicode' back to 'str'
-                namespaces = [
-                    [lower.encode('utf-8'), name.encode('utf-8')]
-                    for lower, name in namespaces]
-            namespace_list = NamespaceBoundList(namespaces)
-        else:
-            namespace_list = None
-        return namespace_list, cache_state
+        params = req.params.copy()
+        params.pop('limit', None)
+        params['format'] = 'json'
+        params['states'] = 'updating'
+        headers = {'X-Backend-Record-Type': 'shard',
+                   'X-Backend-Record-Shard-Format': 'namespace'}
+        if includes:
+            params['includes'] = str_to_wsgi(includes)
+        listing, response = self._get_container_listing(
+            req, account, container, headers=headers, params=params)
+        return self._parse_namespaces(req, listing, response), response
 
     def _get_update_shard_caching_disabled(self, req, account, container, obj):
         """
@@ -333,17 +320,17 @@ class BaseObjectController(Controller):
         :param account: account from which shard ranges should be fetched.
         :param container: container from which shard ranges should be fetched.
         :param obj: object getting updated.
-        :return: an instance of :class:`swift.common.utils.ShardRange`,
+        :return: an instance of :class:`swift.common.utils.Namespace`,
             or None if the update should go back to the root
         """
         # legacy behavior requests container server for includes=obj
-        shard_ranges, response = self._get_shard_ranges(
-            req, account, container, states='updating', includes=obj)
+        namespaces, response = self._get_updating_namespaces(
+            req, account, container, includes=obj)
         record_cache_op_metrics(
             self.logger, self.server_type.lower(), 'shard_updating',
             'disabled', response)
-        # there will be only one shard range in the list if any
-        return shard_ranges[0] if shard_ranges else None
+        # there will be only one Namespace in the list if any
+        return namespaces[0] if namespaces else None
 
     def _get_update_shard(self, req, account, container, obj):
         """
@@ -357,7 +344,7 @@ class BaseObjectController(Controller):
         :param account: account from which shard ranges should be fetched.
         :param container: container from which shard ranges should be fetched.
         :param obj: object getting updated.
-        :return: an instance of :class:`swift.common.utils.ShardRange`,
+        :return: an instance of :class:`swift.common.utils.Namespace`,
             or None if the update should go back to the root
         """
         if not self.app.recheck_updating_shard_ranges:
@@ -368,50 +355,43 @@ class BaseObjectController(Controller):
         # caching is enabled, try to get from caches
         response = None
         cache_key = get_cache_key(account, container, shard='updating')
-        infocache = req.environ.setdefault('swift.infocache', {})
-        memcache = cache_from_env(req.environ, True)
-        cached_namespaces, cache_state = self._get_cached_updating_namespaces(
-            infocache, memcache, cache_key)
-        if cached_namespaces:
-            # found cached namespaces in either infocache or memcache
-            infocache[cache_key] = cached_namespaces
-            namespace = cached_namespaces.get_namespace(obj)
-            update_shard = ShardRange(
-                name=namespace.name, timestamp=0, lower=namespace.lower,
-                upper=namespace.upper)
-        else:
-            # pull full set of updating shard ranges from backend
-            shard_ranges, response = self._get_shard_ranges(
-                req, account, container, states='updating')
-            if shard_ranges:
+        skip_chance = self.app.container_updating_shard_ranges_skip_cache
+        ns_bound_list, get_cache_state = get_namespaces_from_cache(
+            req, cache_key, skip_chance)
+        if not ns_bound_list:
+            # namespaces not found in either infocache or memcache so pull full
+            # set of updating shard ranges from backend
+            namespaces, response = self._get_updating_namespaces(
+                req, account, container)
+            if namespaces:
                 # only store the list of namespace lower bounds and names into
                 # infocache and memcache.
-                cached_namespaces = NamespaceBoundList.parse(
-                    shard_ranges)
-                infocache[cache_key] = cached_namespaces
-                if memcache:
+                ns_bound_list = NamespaceBoundList.parse(namespaces)
+                set_cache_state = set_namespaces_in_cache(
+                    req, cache_key, ns_bound_list,
+                    self.app.recheck_updating_shard_ranges)
+                record_cache_op_metrics(
+                    self.logger, self.server_type.lower(), 'shard_updating',
+                    set_cache_state, None)
+                if set_cache_state == 'set':
                     self.logger.info(
                         'Caching updating shards for %s (%d shards)',
-                        cache_key, len(cached_namespaces.bounds))
-                    memcache.set(
-                        cache_key, cached_namespaces.bounds,
-                        time=self.app.recheck_updating_shard_ranges)
-            update_shard = find_namespace(obj, shard_ranges or [])
+                        cache_key, len(namespaces))
         record_cache_op_metrics(
             self.logger, self.server_type.lower(), 'shard_updating',
-            cache_state, response)
-        return update_shard
+            get_cache_state, response)
+        return ns_bound_list.get_namespace(obj) if ns_bound_list else None
 
     def _get_update_target(self, req, container_info):
         # find the sharded container to which we'll send the update
         db_state = container_info.get('sharding_state', 'unsharded')
         if db_state in ('sharded', 'sharding'):
-            shard_range = self._get_update_shard(
+            update_shard_ns = self._get_update_shard(
                 req, self.account_name, self.container_name, self.object_name)
-            if shard_range:
+            if update_shard_ns:
                 partition, nodes = self.app.container_ring.get_nodes(
-                    shard_range.account, shard_range.container)
-                return partition, nodes, shard_range.name
+                    update_shard_ns.account, update_shard_ns.container)
+                return partition, nodes, update_shard_ns.name
 
         return container_info['partition'], container_info['nodes'], None
 
@@ -425,6 +405,8 @@ class BaseObjectController(Controller):
         container_partition, container_nodes, container_path = \
             self._get_update_target(req, container_info)
         req.acl = container_info['write_acl']
+        if is_open_expired(self.app, req):
+            req.headers['X-Backend-Open-Expired'] = 'true'
         if 'swift.authorize' in req.environ:
             aresp = req.environ['swift.authorize'](req)
             if aresp:
@@ -466,14 +448,15 @@ class BaseObjectController(Controller):
         headers = [self.generate_request_headers(req, additional=req.headers)
                    for _junk in range(n_outgoing)]
 
-        def set_container_update(index, container):
+        def set_container_update(index, container_node):
+            ip, port = get_ip_port(container_node, headers[index])
             headers[index]['X-Container-Partition'] = container_partition
             headers[index]['X-Container-Host'] = csv_append(
                 headers[index].get('X-Container-Host'),
-                '%(ip)s:%(port)s' % container)
+                '%(ip)s:%(port)s' % {'ip': ip, 'port': port})
             headers[index]['X-Container-Device'] = csv_append(
                 headers[index].get('X-Container-Device'),
-                container['device'])
+                container_node['device'])
             if container_path:
                 headers[index]['X-Backend-Quoted-Container-Path'] = quote(
                     container_path)
@@ -486,11 +469,12 @@ class BaseObjectController(Controller):
                 # will eat the update and move it as a misplaced object.
 
         def set_delete_at_headers(index, delete_at_node):
+            ip, port = get_ip_port(delete_at_node, headers[index])
             headers[index]['X-Delete-At-Container'] = delete_at_container
             headers[index]['X-Delete-At-Partition'] = delete_at_partition
             headers[index]['X-Delete-At-Host'] = csv_append(
                 headers[index].get('X-Delete-At-Host'),
-                '%(ip)s:%(port)s' % delete_at_node)
+                '%(ip)s:%(port)s' % {'ip': ip, 'port': port})
             headers[index]['X-Delete-At-Device'] = csv_append(
                 headers[index].get('X-Delete-At-Device'),
                 delete_at_node['device'])
@@ -2489,9 +2473,10 @@ class ECFragGetter(GetterBase):
                  backend_headers, header_provider, logger_thread_locals,
                  logger):
         super(ECFragGetter, self).__init__(
-            app=app, req=req, node_iter=node_iter,
-            partition=partition, policy=policy, path=path,
-            backend_headers=backend_headers, logger=logger)
+            app=app, req=req, node_iter=node_iter, partition=partition,
+            policy=policy, path=path, backend_headers=backend_headers,
+            node_timeout=app.recoverable_node_timeout,
+            resource_type='EC fragment', logger=logger)
         self.header_provider = header_provider
         self.fragment_size = policy.fragment_size
         self.skip_bytes = 0
@@ -2499,39 +2484,13 @@ class ECFragGetter(GetterBase):
         self.status = self.reason = self.body = self.source_headers = None
         self._source_iter = None
 
-    def _get_next_response_part(self):
-        node_timeout = self.app.recoverable_node_timeout
-
-        while True:
-            # the loop here is to resume if trying to parse
-            # multipart/byteranges response raises a ChunkReadTimeout
-            # and resets the source_parts_iter
-            try:
-                with WatchdogTimeout(self.app.watchdog, node_timeout,
-                                     ChunkReadTimeout):
-                    # If we don't have a multipart/byteranges response,
-                    # but just a 200 or a single-range 206, then this
-                    # performs no IO, and just returns source (or
-                    # raises StopIteration).
-                    # Otherwise, this call to next() performs IO when
-                    # we have a multipart/byteranges response; as it
-                    # will read the MIME boundary and part headers.
-                    start_byte, end_byte, length, headers, part = next(
-                        self.source.parts_iter)
-                return (start_byte, end_byte, length, headers, part)
-            except ChunkReadTimeout:
-                if not self._replace_source(
-                        'Trying to read next part of EC multi-part GET '
-                        '(retrying)'):
-                    raise
-
     def _iter_bytes_from_response_part(self, part_file, nbytes):
         buf = b''
         part_file = ByteCountEnforcer(part_file, nbytes)
         while True:
             try:
                 with WatchdogTimeout(self.app.watchdog,
-                                     self.app.recoverable_node_timeout,
+                                     self.node_timeout,
                                      ChunkReadTimeout):
                     chunk = part_file.read(self.app.object_chunk_size)
                     # NB: this append must be *inside* the context
@@ -2585,7 +2544,7 @@ class ECFragGetter(GetterBase):
                 if not chunk:
                     break
 
-    def _iter_parts_from_response(self, req):
+    def _iter_parts_from_response(self):
         try:
             part_iter = None
             try:
@@ -2596,7 +2555,7 @@ class ECFragGetter(GetterBase):
                     except StopIteration:
                         # it seems this is the only way out of the loop; not
                         # sure why the req.environ update is always needed
-                        req.environ['swift.non_client_disconnect'] = True
+                        self.req.environ['swift.non_client_disconnect'] = True
                         break
                     # skip_bytes compensates for the backend request range
                     # expansion done in _convert_range
@@ -2640,7 +2599,8 @@ class ECFragGetter(GetterBase):
                     if end is not None and begin is not None:
                         if end - begin + 1 == self.bytes_used_from_backend:
                             warn = False
-            if not req.environ.get('swift.non_client_disconnect') and warn:
+            if (warn and
+                    not self.req.environ.get('swift.non_client_disconnect')):
                 self.logger.warning(
                     'Client disconnected on read of EC frag %r', self.path)
             raise
@@ -2661,7 +2621,7 @@ class ECFragGetter(GetterBase):
         else:
             return HeaderKeyDict()
 
-    def _make_node_request(self, node, node_timeout):
+    def _make_node_request(self, node):
         # make a backend request; return a response if it has an acceptable
         # status code, otherwise None
         self.logger.thread_locals = self.logger_thread_locals
@@ -2678,7 +2638,7 @@ class ECFragGetter(GetterBase):
                     query_string=self.req.query_string)
             self.app.set_node_timing(node, time.time() - start_node_timing)
 
-            with Timeout(node_timeout):
+            with Timeout(self.node_timeout):
                 possible_source = conn.getresponse()
                 # See NOTE: swift_conn at top of file about this.
                 possible_source.swift_conn = conn
@@ -2734,9 +2694,7 @@ class ECFragGetter(GetterBase):
     def _source_gen(self):
         self.status = self.reason = self.body = self.source_headers = None
         for node in self.node_iter:
-            source = self._make_node_request(
-                node, self.app.recoverable_node_timeout)
-
+            source = self._make_node_request(node)
             if source:
                 yield GetterSource(self.app, source, node)
             else:
@@ -2760,11 +2718,10 @@ class ECFragGetter(GetterBase):
                 return True
         return False
 
-    def response_parts_iter(self, req):
+    def response_parts_iter(self):
         """
         Create an iterator over a single fragment response body.
 
-        :param req: a ``swob.Request``.
         :return: an interator that yields chunks of bytes from a fragment
             response body.
         """
@@ -2776,7 +2733,7 @@ class ECFragGetter(GetterBase):
         else:
             if source:
                 self.source = source
-                it = self._iter_parts_from_response(req)
+                it = self._iter_parts_from_response()
         return it
 
 
@@ -2796,7 +2753,7 @@ class ECObjectController(BaseObjectController):
                               policy, req.swift_entity_path, backend_headers,
                               header_provider, logger_thread_locals,
                               self.logger)
-        return (getter, getter.response_parts_iter(req))
+        return getter, getter.response_parts_iter()
 
     def _convert_range(self, req, policy):
         """

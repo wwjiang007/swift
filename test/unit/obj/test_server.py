@@ -49,7 +49,7 @@ from test.unit import mocked_http_conn, \
 from swift.obj import server as object_server
 from swift.obj import updater
 from swift.obj import diskfile
-from swift.common import utils, bufferedhttp
+from swift.common import utils, bufferedhttp, http_protocol
 from swift.common.header_key_dict import HeaderKeyDict
 from swift.common.utils import hash_path, mkdirs, normalize_timestamp, \
     NullLogger, storage_directory, public, replication, encode_timestamps, \
@@ -185,16 +185,6 @@ class TestObjectController(BaseTestCase):
         self.assertEqual(app.container_update_timeout, 0.0)
         self.assertEqual(app.auto_create_account_prefix, '.')
         self.assertEqual(self.logger.get_lines_for_level('warning'), [])
-
-        conf['auto_create_account_prefix'] = '-'
-        app = object_server.ObjectController(conf, logger=self.logger)
-        self.assertEqual(app.auto_create_account_prefix, '-')
-        self.assertEqual(self.logger.get_lines_for_level('warning'), [
-            'Option auto_create_account_prefix is deprecated. '
-            'Configure auto_create_account_prefix under the '
-            'swift-constraints section of swift.conf. This option '
-            'will be ignored in a future release.'
-        ])
 
     def check_all_api_methods(self, obj_name='o', alt_res=None):
         path = '/sda1/p/a/c/%s' % obj_name
@@ -1149,7 +1139,7 @@ class TestObjectController(BaseTestCase):
                         'X-Backend-Redirect-Timestamp': next(self.ts).internal}
 
         with mocked_http_conn(301, headers=[resp_headers]) as conn, \
-                mock.patch('swift.common.utils.HASH_PATH_PREFIX', b''),\
+                mock.patch('swift.common.utils.HASH_PATH_PREFIX', b''), \
                 fake_spawn():
             resp = req.get_response(self.object_controller)
 
@@ -4356,7 +4346,8 @@ class TestObjectController(BaseTestCase):
         reader_mock = mock.Mock(keep_cache=False)
         with mock.patch('swift.obj.diskfile.BaseDiskFile.reader', reader_mock):
             resp = req.get_response(obj_controller)
-            reader_mock.assert_called_with(keep_cache=True)
+            reader_mock.assert_called_with(
+                keep_cache=True, cooperative_period=0)
         self.assertEqual(resp.status_int, 200)
         etag = '"%s"' % md5(b'VERIFY', usedforsecurity=False).hexdigest()
         self.assertEqual(dict(resp.headers), {
@@ -4379,7 +4370,8 @@ class TestObjectController(BaseTestCase):
         reader_mock = mock.Mock(keep_cache=False)
         with mock.patch('swift.obj.diskfile.BaseDiskFile.reader', reader_mock):
             resp = req.get_response(obj_controller)
-            reader_mock.assert_called_with(keep_cache=True)
+            reader_mock.assert_called_with(
+                keep_cache=True, cooperative_period=0)
         self.assertEqual(resp.status_int, 200)
 
         # Request headers have 'X-Storage-Token'.
@@ -4389,7 +4381,8 @@ class TestObjectController(BaseTestCase):
         reader_mock = mock.Mock(keep_cache=False)
         with mock.patch('swift.obj.diskfile.BaseDiskFile.reader', reader_mock):
             resp = req.get_response(obj_controller)
-            reader_mock.assert_called_with(keep_cache=True)
+            reader_mock.assert_called_with(
+                keep_cache=True, cooperative_period=0)
         self.assertEqual(resp.status_int, 200)
 
         # Request headers have both 'X-Auth-Token' and 'X-Storage-Token'.
@@ -4400,7 +4393,8 @@ class TestObjectController(BaseTestCase):
         reader_mock = mock.Mock(keep_cache=False)
         with mock.patch('swift.obj.diskfile.BaseDiskFile.reader', reader_mock):
             resp = req.get_response(obj_controller)
-            reader_mock.assert_called_with(keep_cache=True)
+            reader_mock.assert_called_with(
+                keep_cache=True, cooperative_period=0)
         self.assertEqual(resp.status_int, 200)
 
     def test_GET_keep_cache_private_config_false(self):
@@ -4428,7 +4422,8 @@ class TestObjectController(BaseTestCase):
         reader_mock = mock.Mock(keep_cache=False)
         with mock.patch('swift.obj.diskfile.BaseDiskFile.reader', reader_mock):
             resp = req.get_response(obj_controller)
-            reader_mock.assert_called_with(keep_cache=True)
+            reader_mock.assert_called_with(
+                keep_cache=True, cooperative_period=0)
         self.assertEqual(resp.status_int, 200)
         etag = '"%s"' % md5(b'VERIFY', usedforsecurity=False).hexdigest()
         self.assertEqual(dict(resp.headers), {
@@ -4451,7 +4446,8 @@ class TestObjectController(BaseTestCase):
         reader_mock = mock.Mock(keep_cache=False)
         with mock.patch('swift.obj.diskfile.BaseDiskFile.reader', reader_mock):
             resp = req.get_response(obj_controller)
-            reader_mock.assert_called_with(keep_cache=False)
+            reader_mock.assert_called_with(
+                keep_cache=False, cooperative_period=0)
         self.assertEqual(resp.status_int, 200)
 
         # Request headers have 'X-Storage-Token'.
@@ -4461,7 +4457,8 @@ class TestObjectController(BaseTestCase):
         reader_mock = mock.Mock(keep_cache=False)
         with mock.patch('swift.obj.diskfile.BaseDiskFile.reader', reader_mock):
             resp = req.get_response(obj_controller)
-            reader_mock.assert_called_with(keep_cache=False)
+            reader_mock.assert_called_with(
+                keep_cache=False, cooperative_period=0)
         self.assertEqual(resp.status_int, 200)
 
         # Request headers have both 'X-Auth-Token' and 'X-Storage-Token'.
@@ -4472,7 +4469,8 @@ class TestObjectController(BaseTestCase):
         reader_mock = mock.Mock(keep_cache=False)
         with mock.patch('swift.obj.diskfile.BaseDiskFile.reader', reader_mock):
             resp = req.get_response(obj_controller)
-            reader_mock.assert_called_with(keep_cache=False)
+            reader_mock.assert_called_with(
+                keep_cache=False, cooperative_period=0)
         self.assertEqual(resp.status_int, 200)
 
     def test_GET_keep_cache_slo_manifest_no_config(self):
@@ -4502,7 +4500,8 @@ class TestObjectController(BaseTestCase):
         reader_mock = mock.Mock(keep_cache=False)
         with mock.patch('swift.obj.diskfile.BaseDiskFile.reader', reader_mock):
             resp = req.get_response(obj_controller)
-            reader_mock.assert_called_with(keep_cache=False)
+            reader_mock.assert_called_with(
+                keep_cache=False, cooperative_period=0)
         self.assertEqual(resp.status_int, 200)
         etag = '"%s"' % md5(b'VERIFY', usedforsecurity=False).hexdigest()
         self.assertEqual(dict(resp.headers), {
@@ -4547,7 +4546,8 @@ class TestObjectController(BaseTestCase):
         reader_mock = mock.Mock(keep_cache=False)
         with mock.patch('swift.obj.diskfile.BaseDiskFile.reader', reader_mock):
             resp = req.get_response(obj_controller)
-            reader_mock.assert_called_with(keep_cache=False)
+            reader_mock.assert_called_with(
+                keep_cache=False, cooperative_period=0)
         self.assertEqual(resp.status_int, 200)
         etag = '"%s"' % md5(b'VERIFY', usedforsecurity=False).hexdigest()
         self.assertEqual(dict(resp.headers), {
@@ -4592,7 +4592,8 @@ class TestObjectController(BaseTestCase):
         reader_mock = mock.Mock(keep_cache=False)
         with mock.patch('swift.obj.diskfile.BaseDiskFile.reader', reader_mock):
             resp = req.get_response(obj_controller)
-            reader_mock.assert_called_with(keep_cache=True)
+            reader_mock.assert_called_with(
+                keep_cache=True, cooperative_period=0)
         self.assertEqual(resp.status_int, 200)
         etag = '"%s"' % md5(b'VERIFY', usedforsecurity=False).hexdigest()
         self.assertEqual(dict(resp.headers), {
@@ -4636,7 +4637,8 @@ class TestObjectController(BaseTestCase):
         reader_mock = mock.Mock(keep_cache=False)
         with mock.patch('swift.obj.diskfile.BaseDiskFile.reader', reader_mock):
             resp = req.get_response(obj_controller)
-            reader_mock.assert_called_with(keep_cache=False)
+            reader_mock.assert_called_with(
+                keep_cache=False, cooperative_period=0)
         self.assertEqual(resp.status_int, 200)
         etag = '"%s"' % md5(b'VERIFY', usedforsecurity=False).hexdigest()
         self.assertEqual(dict(resp.headers), {
@@ -4651,6 +4653,107 @@ class TestObjectController(BaseTestCase):
                 '%a, %d %b %Y %H:%M:%S GMT',
                 gmtime(math.ceil(float(timestamp)))),
         })
+
+    def test_GET_cooperative_period_config(self):
+        # Test config of 'cooperative_period' gets passed to DiskFile reader.
+        conf = {'devices': self.testdir, 'mount_check': 'false',
+                'container_update_timeout': 0.0,
+                'cooperative_period': '99'}
+        obj_controller = object_server.ObjectController(
+            conf, logger=self.logger)
+
+        timestamp = normalize_timestamp(time())
+        req = Request.blank('/sda1/p/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
+                            headers={'X-Timestamp': timestamp,
+                                     'Content-Type': 'application/x-test'})
+        req.body = b'7 bytes'
+        resp = req.get_response(obj_controller)
+        self.assertEqual(resp.status_int, 201)
+
+        req = Request.blank('/sda1/p/a/c/o',
+                            headers={'Content-Type': 'application/x-test',
+                                     'X-Auth-Token': '2340lsdfhhjl02lxfjj'})
+        with mock.patch(
+            "swift.obj.diskfile.BaseDiskFile.reader"
+        ) as reader_mock:
+            resp = req.get_response(obj_controller)
+        reader_mock.assert_called_with(keep_cache=False, cooperative_period=99)
+        self.assertEqual(resp.status_int, 200)
+
+        # Test DiskFile reader actually sleeps when reading chunks. When
+        # cooperative_period is 1, disk reader sleeps once AFTER each next().
+        conf['cooperative_period'] = '1'
+        obj_controller = object_server.ObjectController(
+            conf, logger=self.logger)
+
+        req = Request.blank('/sda1/p/a/c/o',
+                            environ={'REQUEST_METHOD': 'GET'},
+                            headers={'Range': 'bytes=1-6'})
+        with mock.patch('swift.common.utils.sleep') as mock_sleep:
+            resp = req.get_response(obj_controller)
+            self.assertEqual(resp.status_int, 206)
+            self.assertEqual('bytes 1-6/7', resp.headers.get('Content-Range'))
+            self.assertEqual(b' bytes', resp.body)
+        self.assertEqual(1, mock_sleep.call_count)
+
+        # Test DiskFile reader actually sleeps when reading chunks. And verify
+        # number of sleeps when 'disk_chunk_size' is set.
+        conf['cooperative_period'] = '2'
+        conf['disk_chunk_size'] = 2
+        obj_controller = object_server.ObjectController(
+            conf, logger=self.logger)
+
+        req = Request.blank('/sda1/p/a/c/o',
+                            environ={'REQUEST_METHOD': 'GET'})
+        with mock.patch('swift.common.utils.sleep') as mock_sleep:
+            resp = req.get_response(obj_controller)
+            self.assertEqual(resp.status_int, 200)
+            self.assertEqual(b'7 bytes', resp.body)
+        self.assertEqual(2, mock_sleep.call_count)
+
+        conf['cooperative_period'] = '2'
+        conf['disk_chunk_size'] = 3
+        obj_controller = object_server.ObjectController(
+            conf, logger=self.logger)
+
+        req = Request.blank('/sda1/p/a/c/o',
+                            environ={'REQUEST_METHOD': 'GET'})
+        with mock.patch('swift.common.utils.sleep') as mock_sleep:
+            resp = req.get_response(obj_controller)
+            self.assertEqual(resp.status_int, 200)
+            self.assertEqual(b'7 bytes', resp.body)
+        self.assertEqual(1, mock_sleep.call_count)
+
+        # Test DiskFile reader won't sleep with cooperative_period set as 0.
+        conf['cooperative_period'] = '0'
+        obj_controller = object_server.ObjectController(
+            conf, logger=self.logger)
+
+        req = Request.blank('/sda1/p/a/c/o',
+                            environ={'REQUEST_METHOD': 'GET'},
+                            headers={'Range': 'bytes=1-6'})
+        with mock.patch('swift.common.utils.sleep') as mock_sleep:
+            resp = req.get_response(obj_controller)
+            self.assertEqual(resp.status_int, 206)
+            self.assertEqual('bytes 1-6/7', resp.headers.get('Content-Range'))
+            self.assertEqual(b' bytes', resp.body)
+        self.assertFalse(mock_sleep.called)
+
+        # Test DiskFile reader won't sleep with default cooperative_period
+        # which is also 0.
+        conf.pop('cooperative_period')
+        obj_controller = object_server.ObjectController(
+            conf, logger=self.logger)
+
+        req = Request.blank('/sda1/p/a/c/o',
+                            environ={'REQUEST_METHOD': 'GET'},
+                            headers={'Range': 'bytes=1-6'})
+        with mock.patch('swift.common.utils.sleep') as mock_sleep:
+            resp = req.get_response(obj_controller)
+            self.assertEqual(resp.status_int, 206)
+            self.assertEqual('bytes 1-6/7', resp.headers.get('Content-Range'))
+            self.assertEqual(b' bytes', resp.body)
+        self.assertFalse(mock_sleep.called)
 
     @mock.patch("time.time", mock_time)
     def test_DELETE(self):
@@ -5312,7 +5415,7 @@ class TestObjectController(BaseTestCase):
         listener = listen_zero()
         port = listener.getsockname()[1]
         killer = spawn(wsgi.server, listener, self.object_controller,
-                       NullLogger())
+                       NullLogger(), protocol=http_protocol.SwiftHttpProtocol)
         sock = connect_tcp(('localhost', port))
         fd = sock.makefile('rwb')
         s = 'PUT /sda1/p/a/c/o HTTP/1.1\r\nHost: localhost\r\n' \
@@ -6906,19 +7009,24 @@ class TestObjectController(BaseTestCase):
                          utils.Timestamp(now))
 
         # ...unless X-Backend-Replication is sent
-        expected = {
-            'GET': b'TEST',
-            'HEAD': b'',
-        }
-        for meth, expected_body in expected.items():
-            req = Request.blank(
-                '/sda1/p/a/c/o', method=meth,
-                headers={'X-Timestamp':
-                         normalize_timestamp(delete_at_timestamp + 1),
-                         'X-Backend-Replication': 'True'})
-            resp = req.get_response(self.object_controller)
-            self.assertEqual(resp.status_int, 200)
-            self.assertEqual(expected_body, resp.body)
+        req = Request.blank(
+            '/sda1/p/a/c/o', method='GET',
+            headers={'X-Timestamp':
+                     normalize_timestamp(delete_at_timestamp + 1),
+                     'X-Backend-Replication': 'True'})
+        resp = req.get_response(self.object_controller)
+        self.assertEqual(resp.status_int, 200)
+        self.assertEqual(b'TEST', resp.body)
+
+        # ...or x-backend-open-expired is sent
+        req = Request.blank(
+            '/sda1/p/a/c/o', method='GET',
+            headers={'X-Timestamp':
+                     normalize_timestamp(delete_at_timestamp + 1),
+                     'x-backend-open-expired': 'True'})
+        resp = req.get_response(self.object_controller)
+        self.assertEqual(resp.status_int, 200)
+        self.assertEqual(b'TEST', resp.body)
 
     def test_HEAD_but_expired(self):
         # We have an object that expires in the future
@@ -6958,7 +7066,27 @@ class TestObjectController(BaseTestCase):
         self.assertEqual(resp.headers['X-Backend-Timestamp'],
                          utils.Timestamp(now))
 
+        # It should be accessible with x-backend-open-expired
+        req = Request.blank(
+            '/sda1/p/a/c/o',
+            environ={'REQUEST_METHOD': 'HEAD'},
+            headers={'X-Timestamp': normalize_timestamp(
+                delete_at_timestamp + 2), 'x-backend-open-expired': 'true'})
+        resp = req.get_response(self.object_controller)
+        self.assertEqual(resp.status_int, 200)
+
+        # It should be accessible with x-backend-replication
+        req = Request.blank(
+            '/sda1/p/a/c/o',
+            environ={'REQUEST_METHOD': 'HEAD'},
+            headers={'X-Timestamp': normalize_timestamp(
+                delete_at_timestamp + 2), 'x-backend-replication': 'true'})
+        resp = req.get_response(self.object_controller)
+        self.assertEqual(resp.status_int, 200)
+        self.assertEqual(b'', resp.body)
+
     def test_POST_but_expired(self):
+        # We have an object that expires in the future
         now = time()
         delete_at_timestamp = int(now + 100)
         delete_at_container = str(
@@ -6966,57 +7094,152 @@ class TestObjectController(BaseTestCase):
             self.object_controller.expiring_objects_container_divisor *
             self.object_controller.expiring_objects_container_divisor)
 
-        # We recreate the test object every time to ensure a clean test; a
-        # POST may change attributes of the object, so it's not safe to
-        # re-use.
-        def recreate_test_object(when):
-            req = Request.blank(
-                '/sda1/p/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
-                headers={'X-Timestamp': normalize_timestamp(when),
-                         'X-Delete-At': str(delete_at_timestamp),
-                         'X-Delete-At-Container': delete_at_container,
-                         'Content-Length': '4',
-                         'Content-Type': 'application/octet-stream'})
-            req.body = 'TEST'
-            resp = req.get_response(self.object_controller)
-            self.assertEqual(resp.status_int, 201)
+        # PUT the object
+        req = Request.blank(
+            '/sda1/p/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
+            headers={'X-Timestamp': normalize_timestamp(now),
+                     'X-Delete-At': str(delete_at_timestamp),
+                     'X-Delete-At-Container': delete_at_container,
+                     'Content-Length': '4',
+                     'Content-Type': 'application/octet-stream'})
+        req.body = b'TEST'
+        resp = req.get_response(self.object_controller)
+        self.assertEqual(resp.status_int, 201)
 
-        # You can POST to a not-yet-expired object
-        recreate_test_object(now)
-        the_time = now + 1
+        # It's accessible since it expires in the future
+        the_time = now + 2
         req = Request.blank(
             '/sda1/p/a/c/o',
             environ={'REQUEST_METHOD': 'POST'},
-            headers={'X-Timestamp': normalize_timestamp(the_time)})
+            headers={'X-Timestamp': normalize_timestamp(the_time),
+                     'X-Delete-At': str(delete_at_timestamp)})
         resp = req.get_response(self.object_controller)
         self.assertEqual(resp.status_int, 202)
 
-        # You cannot POST to an expired object
-        now += 2
-        recreate_test_object(now)
+        # It's not accessible now since it expires in the past
         the_time = delete_at_timestamp + 1
         req = Request.blank(
             '/sda1/p/a/c/o',
             environ={'REQUEST_METHOD': 'POST'},
-            headers={'X-Timestamp': normalize_timestamp(the_time)})
+            headers={'X-Timestamp': normalize_timestamp(the_time),
+                     'X-Delete-At': str(delete_at_timestamp + 100)})
         resp = req.get_response(self.object_controller)
         self.assertEqual(resp.status_int, 404)
 
-        # ...unless sending an x-backend-replication header...which lets you
-        # modify x-delete-at
-        now += 2
-        recreate_test_object(now)
+        # It should be accessible with x-backend-open-expired
+        req = Request.blank(
+            '/sda1/p/a/c/o',
+            environ={'REQUEST_METHOD': 'HEAD'},
+            headers={'X-Timestamp': normalize_timestamp(
+                delete_at_timestamp + 2), 'x-backend-open-expired': 'true'})
+        resp = req.get_response(self.object_controller)
+        self.assertEqual(resp.status_int, 200)
+        self.assertEqual(resp.headers.get('x-delete-at'),
+                         str(delete_at_timestamp))
+
+    def test_POST_with_x_backend_open_expired(self):
+        now = time()
+        delete_at_timestamp = int(now + 100)
+        delete_at_container = str(
+            delete_at_timestamp /
+            self.object_controller.expiring_objects_container_divisor *
+            self.object_controller.expiring_objects_container_divisor)
+
+        # Create the object at x-delete-at
+        req = Request.blank(
+            '/sda1/p/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
+            headers={'X-Timestamp': normalize_timestamp(now),
+                     'X-Delete-At': str(delete_at_timestamp),
+                     'X-Delete-At-Container': delete_at_container,
+                     'Content-Length': '4',
+                     'Content-Type': 'application/octet-stream'})
+        req.body = 'TEST'
+        resp = req.get_response(self.object_controller)
+        self.assertEqual(resp.status_int, 201)
+
+        # You can POST to an expired object with a much later x-delete-at
+        # with x-backend-open-expired
         the_time = delete_at_timestamp + 2
+        new_delete_at_timestamp = int(delete_at_timestamp + 100)
+        req = Request.blank(
+            '/sda1/p/a/c/o',
+            environ={'REQUEST_METHOD': 'POST'},
+            headers={'X-Timestamp': normalize_timestamp(the_time),
+                     'x-delete-at': str(new_delete_at_timestamp),
+                     'x-backend-open-expired': 'true'})
+        resp = req.get_response(self.object_controller)
+        self.assertEqual(resp.status_int, 202)
+
+        # Verify the later x-delete-at
+        the_time = delete_at_timestamp + 2
+        req = Request.blank(
+            '/sda1/p/a/c/o',
+            environ={'REQUEST_METHOD': 'HEAD'},
+            headers={'X-Timestamp': normalize_timestamp(the_time),
+                     'x-backend-open-expired': 'false'})
+        resp = req.get_response(self.object_controller)
+        self.assertEqual(resp.status_int, 200)
+        self.assertEqual(resp.headers.get('x-delete-at'),
+                         str(new_delete_at_timestamp))
+
+        # Verify object has expired
+        # We have no x-delete-at in response
+        the_time = new_delete_at_timestamp + 1
+        req = Request.blank(
+            '/sda1/p/a/c/o',
+            environ={'REQUEST_METHOD': 'HEAD'},
+            headers={'X-Timestamp': normalize_timestamp(the_time),
+                     'x-backend-open-expired': 'false'})
+        resp = req.get_response(self.object_controller)
+        self.assertEqual(resp.status_int, 404)
+        self.assertIsNone(resp.headers.get('x-delete-at'))
+
+        # But, it works with x-backend-open-expired set to true
+        req = Request.blank(
+            '/sda1/p/a/c/o',
+            environ={'REQUEST_METHOD': 'HEAD'},
+            headers={'X-Timestamp': normalize_timestamp(the_time),
+                     'x-backend-open-expired': 'true'})
+        resp = req.get_response(self.object_controller)
+        self.assertEqual(resp.status_int, 200)
+        self.assertEqual(resp.headers.get('x-delete-at'),
+                         str(new_delete_at_timestamp))
+
+    def test_POST_with_x_backend_replication(self):
+        now = time()
+        delete_at_timestamp = int(now + 100)
+        delete_at_container = str(
+            delete_at_timestamp /
+            self.object_controller.expiring_objects_container_divisor *
+            self.object_controller.expiring_objects_container_divisor)
+
+        # Create object with future x-delete-at
+        req = Request.blank(
+            '/sda1/p/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
+            headers={'X-Timestamp': normalize_timestamp(now),
+                     'X-Delete-At': str(delete_at_timestamp),
+                     'X-Delete-At-Container': delete_at_container,
+                     'Content-Length': '4',
+                     'Content-Type': 'application/octet-stream'})
+        req.body = 'TEST'
+        resp = req.get_response(self.object_controller)
+        self.assertEqual(resp.status_int, 201)
+
+        # sending an x-backend-replication header lets you
+        # modify x-delete-at, even when object is expired
+        the_time = delete_at_timestamp + 2
+        new_delete_at_timestamp = delete_at_timestamp + 100
         req = Request.blank(
             '/sda1/p/a/c/o',
             environ={'REQUEST_METHOD': 'POST'},
             headers={'X-Timestamp': normalize_timestamp(the_time),
                      'x-backend-replication': 'true',
-                     'x-delete-at': str(delete_at_timestamp + 100)})
+                     'x-delete-at': str(new_delete_at_timestamp)})
         resp = req.get_response(self.object_controller)
         self.assertEqual(resp.status_int, 202)
+
         # ...so the object becomes accessible again even without an
-        # x-backend-replication header
+        # x-backend-replication or x-backend-open-expired header
         the_time = delete_at_timestamp + 3
         req = Request.blank(
             '/sda1/p/a/c/o',
@@ -7025,6 +7248,50 @@ class TestObjectController(BaseTestCase):
                      'x-delete-at': str(delete_at_timestamp + 101)})
         resp = req.get_response(self.object_controller)
         self.assertEqual(resp.status_int, 202)
+
+    def test_POST_invalid_headers(self):
+        now = time()
+        delete_at_timestamp = int(now + 100)
+        delete_at_container = str(
+            delete_at_timestamp /
+            self.object_controller.expiring_objects_container_divisor *
+            self.object_controller.expiring_objects_container_divisor)
+
+        # Create the object at x-delete-at
+        req = Request.blank(
+            '/sda1/p/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
+            headers={'X-Timestamp': normalize_timestamp(now),
+                     'X-Delete-At': str(delete_at_timestamp),
+                     'X-Delete-At-Container': delete_at_container,
+                     'Content-Length': '4',
+                     'Content-Type': 'application/octet-stream'})
+        req.body = 'TEST'
+        resp = req.get_response(self.object_controller)
+        self.assertEqual(resp.status_int, 201)
+
+        # You cannot send an x-delete-at that is in the past with a POST even
+        # when x-backend-open-expired is sent
+        the_time = delete_at_timestamp + 75
+        req = Request.blank(
+            '/sda1/p/a/c/o',
+            environ={'REQUEST_METHOD': 'POST'},
+            headers={'X-Timestamp': normalize_timestamp(the_time),
+                     'x-backend-open-expired': 'true',
+                     'x-delete-at': str(delete_at_timestamp - 50)})
+        resp = req.get_response(self.object_controller)
+        self.assertEqual(resp.status_int, 400)
+
+        # Object server always ignores x-open-expired and
+        # only understands x-backend-open-expired on expired objects
+        the_time = delete_at_timestamp + 2
+        req = Request.blank(
+            '/sda1/p/a/c/o',
+            environ={'REQUEST_METHOD': 'POST'},
+            headers={'X-Timestamp': normalize_timestamp(the_time),
+                     'x-open-expired': 'true',
+                     'x-delete-at': str(delete_at_timestamp + 100)})
+        resp = req.get_response(self.object_controller)
+        self.assertEqual(resp.status_int, 404)
 
     def test_DELETE_can_skip_updating_expirer_queue(self):
         policy = POLICIES.get_by_index(0)
@@ -7765,9 +8032,7 @@ class TestObjectController(BaseTestCase):
         def fake_fallocate(fd, size):
             raise OSError(errno.ENOSPC, os.strerror(errno.ENOSPC))
 
-        orig_fallocate = diskfile.fallocate
-        try:
-            diskfile.fallocate = fake_fallocate
+        with mock.patch.object(diskfile, 'fallocate', fake_fallocate):
             timestamp = normalize_timestamp(time())
             body_reader = IgnoredBody()
             req = Request.blank(
@@ -7781,8 +8046,118 @@ class TestObjectController(BaseTestCase):
             resp = req.get_response(self.object_controller)
             self.assertEqual(resp.status_int, 507)
             self.assertFalse(body_reader.read_called)
-        finally:
-            diskfile.fallocate = orig_fallocate
+
+    def test_chunked_PUT_with_full_drive(self):
+
+        class IgnoredBody(object):
+
+            def __init__(self):
+                self.read_called = False
+
+            def read(self, size=-1):
+                if not self.read_called:
+                    self.read_called = True
+                    return b'VERIFY'
+                return b''
+
+        with mock.patch.object(diskfile, 'fs_has_free_space',
+                               return_value=False):
+            timestamp = normalize_timestamp(time())
+            body_reader = IgnoredBody()
+            req = Request.blank(
+                '/sda1/p/a/c/o',
+                environ={'REQUEST_METHOD': 'PUT',
+                         'wsgi.input': body_reader},
+                headers={'X-Timestamp': timestamp,
+                         'Transfer-Encoding': 'chunked',
+                         'Content-Type': 'application/octet-stream',
+                         'Expect': '100-continue'})
+            resp = req.get_response(self.object_controller)
+            self.assertEqual(resp.status_int, 507)
+            self.assertFalse(body_reader.read_called)
+
+    def test_POST_with_full_drive(self):
+        ts_iter = make_timestamp_iter()
+        timestamp = next(ts_iter).internal
+        req = Request.blank(
+            '/sda1/p/a/c/o',
+            environ={'REQUEST_METHOD': 'PUT'},
+            body=b'VERIFY',
+            headers={'X-Timestamp': timestamp,
+                     'Content-Type': 'application/octet-stream'})
+        resp = req.get_response(self.object_controller)
+        self.assertEqual(resp.status_int, 201)
+
+        with mock.patch.object(diskfile, 'fs_has_free_space',
+                               return_value=False):
+            timestamp = next(ts_iter).internal
+            req = Request.blank(
+                '/sda1/p/a/c/o',
+                environ={'REQUEST_METHOD': 'POST'},
+                headers={'X-Timestamp': timestamp,
+                         'Content-Type': 'application/octet-stream'})
+            resp = req.get_response(self.object_controller)
+            self.assertEqual(resp.status_int, 507)
+
+    def test_DELETE_with_full_drive(self):
+        timestamp = normalize_timestamp(time())
+        req = Request.blank(
+            '/sda1/p/a/c/o',
+            environ={'REQUEST_METHOD': 'PUT'},
+            body=b'VERIFY',
+            headers={'X-Timestamp': timestamp,
+                     'Content-Type': 'application/octet-stream'})
+        resp = req.get_response(self.object_controller)
+        self.assertEqual(resp.status_int, 201)
+
+        with mock.patch.object(diskfile, 'fs_has_free_space',
+                               return_value=False):
+            timestamp = normalize_timestamp(time())
+            req = Request.blank(
+                '/sda1/p/a/c/o',
+                method='DELETE',
+                body=b'',
+                headers={'X-Timestamp': timestamp})
+            resp = req.get_response(self.object_controller)
+            self.assertEqual(resp.status_int, 204)
+
+    def test_chunked_DELETE_with_full_drive(self):
+        timestamp = normalize_timestamp(time())
+        req = Request.blank(
+            '/sda1/p/a/c/o',
+            environ={'REQUEST_METHOD': 'PUT'},
+            body=b'VERIFY',
+            headers={'X-Timestamp': timestamp,
+                     'Content-Type': 'application/octet-stream'})
+        resp = req.get_response(self.object_controller)
+        self.assertEqual(resp.status_int, 201)
+
+        class IgnoredBody(object):
+
+            def __init__(self):
+                self.read_called = False
+
+            def read(self, size=-1):
+                if not self.read_called:
+                    self.read_called = True
+                    return b'VERIFY'
+                return b''
+
+        with mock.patch.object(diskfile, 'fs_has_free_space',
+                               return_value=False):
+            timestamp = normalize_timestamp(time())
+            body_reader = IgnoredBody()
+            req = Request.blank(
+                '/sda1/p/a/c/o',
+                environ={'REQUEST_METHOD': 'DELETE',
+                         'wsgi.input': body_reader},
+                headers={'X-Timestamp': timestamp,
+                         'Transfer-Encoding': 'chunked',
+                         'Content-Type': 'application/octet-stream',
+                         'Expect': '100-continue'})
+            resp = req.get_response(self.object_controller)
+            self.assertEqual(resp.status_int, 204)
+            self.assertFalse(body_reader.read_called)
 
     def test_global_conf_callback_does_nothing(self):
         preloaded_app_conf = {}

@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import mock
+import time
 import unittest
 from io import BytesIO
 from logging.handlers import SysLogHandler
@@ -21,22 +22,23 @@ from logging.handlers import SysLogHandler
 import six
 from six.moves.urllib.parse import unquote
 
-from swift.common.utils import get_logger, split_path, StatsdClient
+from swift.common.utils import get_logger, split_path
+from swift.common.statsd_client import StatsdClient
 from swift.common.middleware import proxy_logging
 from swift.common.registry import register_sensitive_header, \
     register_sensitive_param, get_sensitive_headers
-from swift.common.swob import Request, Response
+from swift.common.swob import Request, Response, HTTPServiceUnavailable
 from swift.common import constraints, registry
 from swift.common.storage_policy import StoragePolicy
 from test.debug_logger import debug_logger
 from test.unit import patch_policies
-from test.unit.common.middleware.helpers import FakeAppThatExcepts
+from test.unit.common.middleware.helpers import FakeAppThatExcepts, FakeSwift
 
 
 class FakeApp(object):
 
     def __init__(self, body=None, response_str='200 OK', policy_idx='0',
-                 chunked=False):
+                 chunked=False, environ_updates=None):
         if body is None:
             body = [b'FAKE APP']
         elif isinstance(body, six.binary_type):
@@ -46,6 +48,7 @@ class FakeApp(object):
         self.response_str = response_str
         self.policy_idx = policy_idx
         self.chunked = chunked
+        self.environ_updates = environ_updates or {}
 
     def __call__(self, env, start_response):
         try:
@@ -65,10 +68,11 @@ class FakeApp(object):
         if is_container_or_object_req and self.policy_idx is not None:
             headers.append(('X-Backend-Storage-Policy-Index',
                            str(self.policy_idx)))
-
         start_response(self.response_str, headers)
         while env['wsgi.input'].read(5):
             pass
+        # N.B. mw can set this anytime before the resp is finished
+        env.update(self.environ_updates)
         return self.body
 
 
@@ -232,11 +236,16 @@ class TestProxyLogging(unittest.TestCase):
                 self.assertEqual(b'7654321', b''.join(iter_response))
                 self.assertTiming('%s.GET.321.timing' % exp_type, app,
                                   exp_timing=2.71828182846 * 1000)
+                self.assertTiming('%s.GET.321.first-byte.timing'
+                                  % exp_type, app, exp_timing=0.5 * 1000)
                 if exp_type == 'object':
                     # Object operations also return stats by policy
                     # In this case, the value needs to match the timing for GET
                     self.assertTiming('%s.policy.0.GET.321.timing' % exp_type,
                                       app, exp_timing=2.71828182846 * 1000)
+                    self.assertTiming(
+                        '%s.policy.0.GET.321.first-byte.timing'
+                        % exp_type, app, exp_timing=0.5 * 1000)
                     self.assertUpdateStats([('%s.GET.321.xfer' % exp_type,
                                              4 + 7),
                                             ('object.policy.0.GET.321.xfer',
@@ -404,6 +413,112 @@ class TestProxyLogging(unittest.TestCase):
         self.assertEqual(log_parts[6], '200')
         self.assertEqual(resp_body, b'FAKE APP')
         self.assertEqual(log_parts[11], str(len(resp_body)))
+
+    def test_object_error(self):
+        swift = FakeSwift()
+        self.logger = debug_logger()
+        app = proxy_logging.ProxyLoggingMiddleware(swift, {},
+                                                   logger=self.logger)
+        swift.register('GET', '/v1/a/c/o', HTTPServiceUnavailable, {}, None)
+        req = Request.blank('/v1/a/c/o')
+        start = time.time()
+        ttfb = start + 0.2
+        end = ttfb + 0.5
+        with mock.patch("swift.common.middleware.proxy_logging.time.time",
+                        side_effect=[start, ttfb, end]):
+            resp = req.get_response(app)
+            self.assertEqual(503, resp.status_int)
+            # we have to consume the resp body to trigger logging
+            self.assertIn(b'Service Unavailable', resp.body)
+            log_parts = self._log_parts(app)
+        self.assertEqual(log_parts[3], 'GET')
+        self.assertEqual(log_parts[4], '/v1/a/c/o')
+        self.assertEqual(log_parts[5], 'HTTP/1.0')
+        self.assertEqual(log_parts[6], '503')
+        # we can also expect error metrics
+        self.assertTiming('object.GET.503.timing', app,
+                          exp_timing=700.0)
+        self.assertTiming('object.GET.503.first-byte.timing', app,
+                          exp_timing=200.0)
+
+    def test_basic_error(self):
+        swift = FakeSwift()
+        self.logger = debug_logger()
+        app = proxy_logging.ProxyLoggingMiddleware(swift, {},
+                                                   logger=self.logger)
+        swift.register('GET', '/path', HTTPServiceUnavailable, {}, None)
+        req = Request.blank('/path')
+        start = time.time()
+        ttfb = start + 0.2
+        end = ttfb + 0.5
+        with mock.patch("swift.common.middleware.proxy_logging.time.time",
+                        side_effect=[start, ttfb, end]):
+            resp = req.get_response(app)
+            self.assertEqual(503, resp.status_int)
+            # we have to consume the resp body to trigger logging
+            self.assertIn(b'Service Unavailable', resp.body)
+            log_parts = self._log_parts(app)
+        self.assertEqual(log_parts[3], 'GET')
+        self.assertEqual(log_parts[4], '/path')
+        self.assertEqual(log_parts[5], 'HTTP/1.0')
+        self.assertEqual(log_parts[6], '503')
+        # we can also expect error metrics
+        self.assertTiming('UNKNOWN.GET.503.timing', app,
+                          exp_timing=700.0)
+        self.assertTiming('UNKNOWN.GET.503.first-byte.timing', app,
+                          exp_timing=200.0)
+
+    def test_middleware_exception(self):
+        self.logger = debug_logger()
+        app = proxy_logging.ProxyLoggingMiddleware(
+            FakeAppThatExcepts(), {}, logger=self.logger)
+        req = Request.blank('/path')
+        start = time.time()
+        ttfb = start + 0.2
+        with mock.patch("swift.common.middleware.proxy_logging.time.time",
+                        side_effect=[start, ttfb]), \
+                self.assertRaises(Exception):
+            req.get_response(app)
+        log_parts = self._log_parts(app)
+        self.assertEqual(log_parts[3], 'GET')
+        self.assertEqual(log_parts[4], '/path')
+        self.assertEqual(log_parts[5], 'HTTP/1.0')
+        self.assertEqual(log_parts[6], '500')
+        # we can also expect error metrics
+        self.assertTiming('UNKNOWN.GET.500.timing', app,
+                          exp_timing=200.0)
+
+    def test_middleware_error(self):
+        class ErrorFakeApp(object):
+
+            def __call__(self, env, start_response):
+                env['swift.source'] = 'FA'
+                resp = HTTPServiceUnavailable()
+                return resp(env, start_response)
+
+        self.logger = debug_logger()
+        app = proxy_logging.ProxyLoggingMiddleware(ErrorFakeApp(), {},
+                                                   logger=self.logger)
+        req = Request.blank('/path')
+        start = time.time()
+        ttfb = start + 0.2
+        end = ttfb + 0.5
+        with mock.patch("swift.common.middleware.proxy_logging.time.time",
+                        side_effect=[start, ttfb, end]):
+            resp = req.get_response(app)
+            self.assertEqual(503, resp.status_int)
+            # we have to consume the resp body to trigger logging
+            self.assertIn(b'Service Unavailable', resp.body)
+            log_parts = self._log_parts(app)
+        self.assertEqual(log_parts[3], 'GET')
+        self.assertEqual(log_parts[4], '/path')
+        self.assertEqual(log_parts[5], 'HTTP/1.0')
+        self.assertEqual(log_parts[6], '503')
+        # we can also expect error metrics
+        self.assertTiming('FA.GET.503.timing', app,
+                          exp_timing=700.0)
+        self.assertTiming('FA.GET.503.first-byte.timing', app,
+                          exp_timing=200.0)
 
     def test_basic_req_second_time(self):
         app = proxy_logging.ProxyLoggingMiddleware(FakeApp(), {})
@@ -790,6 +905,193 @@ class TestProxyLogging(unittest.TestCase):
         log_parts = self._log_parts(app)
         self.assertEqual(log_parts[6], '499')
         self.assertEqual(log_parts[10], '-')  # read length
+
+    def test_environ_has_proxy_logging_status(self):
+        conf = {'log_msg_template':
+                '{method} {path} {status_int} {wire_status_int}'}
+
+        def do_test(environ_updates):
+            fake_app = FakeApp(body=[b'Slow Down'],
+                               response_str='503 Slow Down',
+                               environ_updates=environ_updates)
+            app = proxy_logging.ProxyLoggingMiddleware(fake_app, conf)
+            app.access_logger = debug_logger()
+            req = Request.blank('/v1/a/c')
+            captured_start_resp = mock.MagicMock()
+            try:
+                resp = app(req.environ, captured_start_resp)
+                b''.join(resp)  # read body
+            except IOError:
+                pass
+            captured_start_resp.assert_called_once_with(
+                '503 Slow Down', mock.ANY, None)
+            return self._log_parts(app)
+
+        # control case, logged status == wire status
+        environ_updates = {}
+        self.assertEqual(do_test(environ_updates),
+                         ['GET', '/v1/a/c', '503', '503'])
+
+        # logged status is forced to other value
+        environ_updates = {'swift.proxy_logging_status': 429}
+        self.assertEqual(do_test(environ_updates),
+                         ['GET', '/v1/a/c', '429', '503'])
+
+        environ_updates = {'swift.proxy_logging_status': '429'}
+        self.assertEqual(do_test(environ_updates),
+                         ['GET', '/v1/a/c', '429', '503'])
+
+        environ_updates = {'swift.proxy_logging_status': None}
+        self.assertEqual(do_test(environ_updates),
+                         ['GET', '/v1/a/c', '-', '503'])
+
+        # middleware should use an int like the docs tell them too, but we
+        # won't like ... "blow up" or anything
+        environ_updates = {'swift.proxy_logging_status': ''}
+        self.assertEqual(do_test(environ_updates),
+                         ['GET', '/v1/a/c', '-', '503'])
+
+        environ_updates = {'swift.proxy_logging_status': True}
+        self.assertEqual(do_test(environ_updates),
+                         ['GET', '/v1/a/c', 'True', '503'])
+
+        environ_updates = {'swift.proxy_logging_status': False}
+        self.assertEqual(do_test(environ_updates),
+                         ['GET', '/v1/a/c', '-', '503'])
+
+        environ_updates = {'swift.proxy_logging_status': 'parsing ok'}
+        self.assertEqual(do_test(environ_updates),
+                         ['GET', '/v1/a/c', 'parsing%20ok', '503'])
+
+    def test_body_iter_updates_environ_proxy_logging_status(self):
+        conf = {'log_msg_template':
+                '{method} {path} {status_int} {wire_status_int}'}
+
+        def do_test(req, body_iter, updated_status):
+            fake_app = FakeApp(body=body_iter,
+                               response_str='205 Weird')
+            app = proxy_logging.ProxyLoggingMiddleware(fake_app, conf)
+            app.access_logger = debug_logger()
+            captured_start_resp = mock.MagicMock()
+            try:
+                resp = app(req.environ, captured_start_resp)
+                b''.join(resp)  # read body
+            except IOError:
+                pass
+            captured_start_resp.assert_called_once_with(
+                '205 Weird', mock.ANY, None)
+            self.assertEqual(self._log_parts(app),
+                             ['GET', '/v1/a/c', updated_status, '205'])
+
+        # sanity
+        req = Request.blank('/v1/a/c')
+        do_test(req, [b'normal', b'chunks'], '205')
+
+        def update_in_middle_chunk_gen():
+            yield b'foo'
+            yield b'bar'
+            req.environ['swift.proxy_logging_status'] = 209
+            yield b'baz'
+
+        req = Request.blank('/v1/a/c')
+        do_test(req, update_in_middle_chunk_gen(), '209')
+
+        def update_in_finally_chunk_gen():
+            try:
+                for i in range(3):
+                    yield ('foo%s' % i).encode()
+            finally:
+                req.environ['swift.proxy_logging_status'] = 210
+
+        req = Request.blank('/v1/a/c')
+        do_test(req, update_in_finally_chunk_gen(), '210')
+
+    def test_environ_has_proxy_logging_status_unread_body(self):
+        conf = {'log_msg_template':
+                '{method} {path} {status_int} {wire_status_int}'}
+
+        def do_test(environ_updates):
+            fake_app = FakeApp(body=[b'Slow Down'],
+                               response_str='503 Slow Down',
+                               environ_updates=environ_updates)
+            app = proxy_logging.ProxyLoggingMiddleware(fake_app, conf)
+            app.access_logger = debug_logger()
+            req = Request.blank('/v1/a/c')
+            captured_start_resp = mock.MagicMock()
+            resp = app(req.environ, captured_start_resp)
+            # read first chunk
+            next(resp)
+            resp.close()  # raise a GeneratorExit in middleware app_iter loop
+            captured_start_resp.assert_called_once_with(
+                '503 Slow Down', mock.ANY, None)
+            return self._log_parts(app)
+
+        # control case, logged status is 499
+        environ_updates = {}
+        self.assertEqual(do_test(environ_updates),
+                         ['GET', '/v1/a/c', '499', '503'])
+
+        # logged status is forced to 499 despite swift.proxy_logging_status
+        environ_updates = {'swift.proxy_logging_status': '429'}
+        self.assertEqual(do_test(environ_updates),
+                         ['GET', '/v1/a/c', '499', '503'])
+
+    def test_environ_has_proxy_logging_status_and_app_explodes(self):
+        # verify exception overrides proxy_logging_status
+        conf = {'log_msg_template':
+                '{method} {path} {status_int} {wire_status_int}'}
+
+        class ExplodingFakeApp(object):
+
+            def __call__(self, env, start_response):
+                # this is going to be so great!
+                env['swift.proxy_logging_status'] = '456'
+                start_response('568 Bespoke', [('X-Special', 'fun')])
+                raise Exception('oops!')
+
+        fake_app = ExplodingFakeApp()
+        app = proxy_logging.ProxyLoggingMiddleware(fake_app, conf)
+        app.access_logger = debug_logger()
+        req = Request.blank('/v1/a/c')
+        captured_start_resp = mock.MagicMock()
+        with self.assertRaises(Exception) as cm:
+            app(req.environ, captured_start_resp)
+        captured_start_resp.assert_not_called()
+        self.assertEqual('oops!', str(cm.exception))
+        self.assertEqual(self._log_parts(app),
+                         ['GET', '/v1/a/c', '500', '500'])
+
+    def test_environ_has_proxy_logging_status_and_body_explodes(self):
+        # verify exception overrides proxy_logging_status
+        conf = {'log_msg_template':
+                '{method} {path} {status_int} {wire_status_int}'}
+
+        def exploding_body():
+            yield 'some'
+            yield 'stuff'
+            raise Exception('oops!')
+
+        class ExplodingFakeApp(object):
+
+            def __call__(self, env, start_response):
+                # this is going to be so great!
+                env['swift.proxy_logging_status'] = '456'
+                start_response('568 Bespoke', [('X-Special', 'fun')])
+                return exploding_body()
+
+        fake_app = ExplodingFakeApp()
+        app = proxy_logging.ProxyLoggingMiddleware(fake_app, conf)
+        app.access_logger = debug_logger()
+        req = Request.blank('/v1/a/c')
+        captured_start_resp = mock.MagicMock()
+        app_iter = app(req.environ, captured_start_resp)
+        with self.assertRaises(Exception) as cm:
+            b''.join(app_iter)
+        captured_start_resp.assert_called_once_with(
+            '568 Bespoke', [('X-Special', 'fun')], None)
+        self.assertEqual('oops!', str(cm.exception))
+        self.assertEqual(self._log_parts(app),
+                         ['GET', '/v1/a/c', '500', '568'])
 
     def test_app_exception(self):
         app = proxy_logging.ProxyLoggingMiddleware(

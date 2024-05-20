@@ -369,6 +369,30 @@ class TestTempURL(unittest.TestCase):
         sig = hmac.new(key, hmac_body, hashlib.sha256).hexdigest()
         self.assert_valid_sig(expires, query_path, [key], sig, prefix=prefix)
 
+    def test_get_valid_with_prefix_and_staticweb(self):
+        method = 'GET'
+        expires = int(time() + 86400)
+        prefix = 'p1/p2/'
+        sig_path = 'prefix:/v1/a/c/' + prefix
+        query_path = '/v1/a/c/' + prefix + 'o'
+        key = b'abc'
+        hmac_body = ('%s\n%i\n%s' %
+                     (method, expires, sig_path)).encode('utf-8')
+        sig = hmac.new(key, hmac_body, hashlib.sha512).hexdigest()
+        req = self._make_request(query_path, keys=[key], environ={
+            'QUERY_STRING': 'temp_url_sig=%s&temp_url_expires=%s&'
+            'temp_url_prefix=%s' % (sig, expires, prefix)})
+        self.tempurl.app = FakeApp(iter([('200 Ok', {
+            'X-Backend-Content-Generator': 'staticweb'}, b'123')]))
+        resp = req.get_response(self.tempurl)
+        self.assertEqual(resp.status_int, 200)
+        # This is the key thing: if the response came from staticweb, assume
+        # the client is a browser and doesn't want a download prompt
+        self.assertEqual(resp.headers['content-disposition'], 'inline')
+        self.assertIn('expires', resp.headers)
+        self.assertEqual(req.environ['swift.authorize_override'], True)
+        self.assertEqual(req.environ['REMOTE_USER'], '.wsgi.tempurl')
+
     def test_get_valid_with_prefix_empty(self):
         method = 'GET'
         expires = int(time() + 86400)
@@ -1016,9 +1040,14 @@ class TestTempURL(unittest.TestCase):
                 self.assertIn(b'not allowed', resp.body)
                 self.assertIn(hdr.encode('utf-8'), resp.body)
 
-    def test_removed_incoming_header(self):
-        self.tempurl = tempurl.filter_factory({
-            'incoming_remove_headers': 'x-remove-this'})(self.auth)
+    def test_removed_incoming_header_defaults(self):
+        self.tempurl = tempurl.filter_factory({})(self.auth)
+
+        swift_info = registry.get_swift_info()
+        self.assertIn('tempurl', swift_info)
+        incoming_remove_headers = \
+            swift_info['tempurl']['incoming_remove_headers']
+
         method = 'GET'
         expires = int(time() + 86400)
         path = '/v1/a/c/o'
@@ -1027,12 +1056,33 @@ class TestTempURL(unittest.TestCase):
         sig = hmac.new(key, hmac_body, hashlib.sha256).hexdigest()
         req = self._make_request(
             path, keys=[key],
-            headers={'x-remove-this': 'value'},
+            headers={k: 'test_value' for k in incoming_remove_headers},
+            environ={'QUERY_STRING': 'temp_url_sig=%s&temp_url_expires=%s' % (
+                sig, expires)})
+        resp = req.get_response(self.tempurl)
+        self.assertEqual(resp.status_int, 404)
+        for incoming_remove_header in incoming_remove_headers:
+            self.assertNotIn(incoming_remove_header, self.app.request.headers)
+
+    def test_removed_incoming_header(self):
+        self.tempurl = tempurl.filter_factory({
+            'incoming_remove_headers': 'x-remove-this'
+        })(self.auth)
+        method = 'GET'
+        expires = int(time() + 86400)
+        path = '/v1/a/c/o'
+        key = b'abc'
+        hmac_body = ('%s\n%i\n%s' % (method, expires, path)).encode('utf-8')
+        sig = hmac.new(key, hmac_body, hashlib.sha256).hexdigest()
+        req = self._make_request(
+            path, keys=[key],
+            headers={'x-remove-this': 'value', 'x-open-expired': 'true'},
             environ={'QUERY_STRING': 'temp_url_sig=%s&temp_url_expires=%s' % (
                 sig, expires)})
         resp = req.get_response(self.tempurl)
         self.assertEqual(resp.status_int, 404)
         self.assertNotIn('x-remove-this', self.app.request.headers)
+        self.assertIn('x-open-expired', self.app.request.headers)
 
     def test_removed_incoming_headers_match(self):
         self.tempurl = tempurl.filter_factory({
@@ -1198,6 +1248,16 @@ class TestTempURL(unittest.TestCase):
         self.assertEqual(self.tempurl._get_path_parts({
             'REQUEST_METHOD': 'GET', 'PATH_INFO': '/v1/a/c/'}),
             (None, None, None))
+        self.assertEqual(
+            self.tempurl._get_path_parts(
+                {'REQUEST_METHOD': 'GET', 'PATH_INFO': '/v1/a/c/'},
+                allow_container_root=True),
+            ('a', 'c', ''))
+        self.assertEqual(
+            self.tempurl._get_path_parts(
+                {'REQUEST_METHOD': 'GET', 'PATH_INFO': '/v1/a/c/'},
+                allow_container_root=False),
+            (None, None, None))
         self.assertEqual(self.tempurl._get_path_parts({
             'REQUEST_METHOD': 'GET', 'PATH_INFO': '/v1/a/c//////'}),
             (None, None, None))
@@ -1224,71 +1284,88 @@ class TestTempURL(unittest.TestCase):
         s = 'f5d5051bddf5df7e27c628818738334f'
         e_ts = int(time() + 86400)
         e_8601 = strftime(tempurl.EXPIRES_ISO8601_FORMAT, gmtime(e_ts))
-        for e in (e_ts, e_8601):
+        for e in (str(e_ts), e_8601):
             self.assertEqual(
-                self.tempurl._get_temp_url_info(
+                tempurl.get_temp_url_info(
                     {'QUERY_STRING': 'temp_url_sig=%s&temp_url_expires=%s' % (
                         s, e)}),
-                (s, e_ts, None, None, None, None))
+                (s, e, None, None, None, None))
             self.assertEqual(
-                self.tempurl._get_temp_url_info(
+                tempurl.get_temp_url_info(
                     {'QUERY_STRING':
                      'temp_url_sig=%s&temp_url_expires=%s&temp_url_prefix=%s'
                      % (s, e, 'prefix')}),
-                (s, e_ts, 'prefix', None, None, None))
+                (s, e, 'prefix', None, None, None))
             self.assertEqual(
-                self.tempurl._get_temp_url_info(
+                tempurl.get_temp_url_info(
                     {'QUERY_STRING': 'temp_url_sig=%s&temp_url_expires=%s&'
                      'filename=bobisyouruncle' % (s, e)}),
-                (s, e_ts, None, 'bobisyouruncle', None, None))
+                (s, e, None, 'bobisyouruncle', None, None))
             self.assertEqual(
-                self.tempurl._get_temp_url_info({}),
+                tempurl.get_temp_url_info({}),
                 (None, None, None, None, None, None))
             self.assertEqual(
-                self.tempurl._get_temp_url_info(
+                tempurl.get_temp_url_info(
                     {'QUERY_STRING': 'temp_url_expires=%s' % e}),
-                (None, e_ts, None, None, None, None))
+                (None, e, None, None, None, None))
             self.assertEqual(
-                self.tempurl._get_temp_url_info(
+                tempurl.get_temp_url_info(
                     {'QUERY_STRING': 'temp_url_sig=%s' % s}),
                 (s, None, None, None, None, None))
             self.assertEqual(
-                self.tempurl._get_temp_url_info(
+                tempurl.get_temp_url_info(
                     {'QUERY_STRING': 'temp_url_sig=%s&temp_url_expires=bad' % (
                         s)}),
-                (s, 0, None, None, None, None))
+                (s, 'bad', None, None, None, None))
             self.assertEqual(
-                self.tempurl._get_temp_url_info(
+                tempurl.get_temp_url_info(
                     {'QUERY_STRING': 'temp_url_sig=%s&temp_url_expires=%s&'
                      'inline=' % (s, e)}),
-                (s, e_ts, None, None, True, None))
+                (s, e, None, None, True, None))
             self.assertEqual(
-                self.tempurl._get_temp_url_info(
+                tempurl.get_temp_url_info(
                     {'QUERY_STRING': 'temp_url_sig=%s&temp_url_expires=%s&'
                      'filename=bobisyouruncle&inline=' % (s, e)}),
-                (s, e_ts, None, 'bobisyouruncle', True, None))
+                (s, e, None, 'bobisyouruncle', True, None))
             self.assertEqual(
-                self.tempurl._get_temp_url_info(
+                tempurl.get_temp_url_info(
                     {'QUERY_STRING': 'temp_url_sig=%s&temp_url_expires=%s&'
                      'filename=bobisyouruncle&inline='
                      '&temp_url_ip_range=127.0.0.1' % (s, e)}),
-                (s, e_ts, None, 'bobisyouruncle', True, '127.0.0.1'))
+                (s, e, None, 'bobisyouruncle', True, '127.0.0.1'))
 
         e_ts = int(time() - 1)
         e_8601 = strftime(tempurl.EXPIRES_ISO8601_FORMAT, gmtime(e_ts))
-        for e in (e_ts, e_8601):
+        for e in (str(e_ts), e_8601):
             self.assertEqual(
-                self.tempurl._get_temp_url_info(
+                tempurl.get_temp_url_info(
                     {'QUERY_STRING': 'temp_url_sig=%s&temp_url_expires=%s' % (
                         s, e)}),
-                (s, 0, None, None, None, None))
-        # Offsets not supported (yet?).
+                (s, e, None, None, None, None))
         e_8601 = strftime('%Y-%m-%dT%H:%M:%S+0000', gmtime(e_ts))
         self.assertEqual(
-            self.tempurl._get_temp_url_info(
+            tempurl.get_temp_url_info(
                 {'QUERY_STRING': 'temp_url_sig=%s&temp_url_expires=%s' % (
-                    s, e_8601)}),
-            (s, 0, None, None, None, None))
+                    s, e_8601.replace('+', '%2B'))}),
+            (s, e_8601, None, None, None, None))
+
+    def test_normalize_temp_url_expires(self):
+        e_ts = int(time() + 86400)
+        self.assertEqual(e_ts, tempurl.normalize_temp_url_expires(e_ts))
+        self.assertEqual(e_ts, tempurl.normalize_temp_url_expires(str(e_ts)))
+
+        e_8601 = strftime(tempurl.EXPIRES_ISO8601_FORMAT, gmtime(e_ts))
+        self.assertEqual(e_ts, tempurl.normalize_temp_url_expires(e_8601))
+        # Offsets not supported (yet?).
+        e_8601 = strftime('%Y-%m-%dT%H:%M:%S+0000', gmtime(e_ts))
+        self.assertEqual(0, tempurl.normalize_temp_url_expires(e_8601))
+
+        self.assertEqual(None, tempurl.normalize_temp_url_expires(None))
+        self.assertEqual(0, tempurl.normalize_temp_url_expires('bad'))
+        e_ts = int(time() - 1)
+        self.assertEqual(0, tempurl.normalize_temp_url_expires(e_ts))
+        e_8601 = strftime(tempurl.EXPIRES_ISO8601_FORMAT, gmtime(e_ts))
+        self.assertEqual(0, tempurl.normalize_temp_url_expires(e_8601))
 
     def test_get_hmacs(self):
         self.assertEqual(
@@ -1618,7 +1695,7 @@ class TestSwiftInfo(unittest.TestCase):
         self.assertEqual(set(info['methods']),
                          set(('GET', 'HEAD', 'PUT', 'POST', 'DELETE')))
         self.assertEqual(set(info['incoming_remove_headers']),
-                         set(('x-timestamp',)))
+                         set(('x-timestamp', 'x-open-expired',)))
         self.assertEqual(set(info['incoming_allow_headers']), set())
         self.assertEqual(set(info['outgoing_remove_headers']),
                          set(('x-object-meta-*',)))
@@ -1658,7 +1735,7 @@ class TestSwiftInfo(unittest.TestCase):
         self.assertEqual(set(info['methods']),
                          set(('GET', 'HEAD', 'PUT', 'POST', 'DELETE')))
         self.assertEqual(set(info['incoming_remove_headers']),
-                         set(('x-timestamp',)))
+                         set(('x-timestamp', 'x-open-expired',)))
         self.assertEqual(set(info['incoming_allow_headers']), set())
         self.assertEqual(set(info['outgoing_remove_headers']),
                          set(('x-object-meta-*',)))

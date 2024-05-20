@@ -36,7 +36,8 @@ import six
 from swift.common.exceptions import LockTimeout
 from swift.container.backend import ContainerBroker, \
     update_new_item_from_existing, UNSHARDED, SHARDING, SHARDED, \
-    COLLAPSED, SHARD_LISTING_STATES, SHARD_UPDATE_STATES, sift_shard_ranges
+    COLLAPSED, SHARD_LISTING_STATES, SHARD_UPDATE_STATES, sift_shard_ranges, \
+    merge_shards
 from swift.common.db import DatabaseAlreadyExists, GreenDBConnection, \
     TombstoneReclaimer, GreenDBCursor
 from swift.common.request_helpers import get_reserved_name
@@ -1747,9 +1748,8 @@ class TestContainerBroker(test_db.TestDbBase):
         # Add the 'shard_range' table back to the database, but it doesn't
         # have any shard range row in it yet.
         self._add_shard_range_table(broker)
-        shard_ranges = broker.get_shard_ranges(
-            include_deleted=True, states=None, include_own=True)
-        self.assertEqual(shard_ranges, [])
+        self.assertFalse(broker.get_shard_ranges(
+            include_deleted=True, states=None, include_own=True))
         self.assertFalse(broker.has_other_shard_ranges())
 
         # Insert its 'own_shard_range' into this test database.
@@ -4236,6 +4236,29 @@ class TestContainerBroker(test_db.TestDbBase):
         check_bad_value([''])
         check_bad_value('active')
 
+    def _check_get_sr(self, broker, expected_sr, **kwargs):
+        """
+        Get shard ranges from ``broker`` per parameters ``kwargs``, and check
+        returned shard ranges against expected shard ranges.
+        """
+        actual_sr = broker.get_shard_ranges(**kwargs)
+        self.assertEqual([dict(sr) for sr in expected_sr],
+                         [dict(sr) for sr in actual_sr])
+
+    def _check_get_ns(self, broker, expected_ns, **kwargs):
+        actual_ns = broker.get_namespaces(**kwargs)
+        self.assertEqual(expected_ns, actual_ns)
+
+    def _check_get_sr_and_ns(self, broker, expected_sr, **kwargs):
+        """
+        For those 'get_shard_ranges' calls who's params are compatible with
+        'get_namespaces', call both of them to cross-check each other.
+        """
+        self._check_get_sr(broker, expected_sr, **kwargs)
+        expected_ns = [Namespace(sr.name, sr.lower, sr.upper)
+                       for sr in expected_sr]
+        self._check_get_ns(broker, expected_ns, **kwargs)
+
     @with_tempdir
     def test_get_shard_ranges(self, tempdir):
         db_path = os.path.join(tempdir, 'container.db')
@@ -4243,20 +4266,18 @@ class TestContainerBroker(test_db.TestDbBase):
         broker.initialize(next(self.ts).internal, 0)
 
         # no rows
-        self.assertFalse(broker.get_shard_ranges())
+        self._check_get_sr_and_ns(broker, expected_sr=[])
         # check that a default own shard range is not generated
-        self.assertFalse(broker.get_shard_ranges(include_own=True))
+        self._check_get_sr(broker, expected_sr=[], include_own=True)
 
         # merge row for own shard range
         own_shard_range = ShardRange(broker.path, next(self.ts), 'l', 'u',
                                      state=ShardRange.SHARDING)
         broker.merge_shard_ranges([own_shard_range])
-        self.assertFalse(broker.get_shard_ranges())
-        self.assertFalse(broker.get_shard_ranges(include_own=False))
-
-        actual = broker.get_shard_ranges(include_own=True)
-        self.assertEqual([dict(sr) for sr in [own_shard_range]],
-                         [dict(sr) for sr in actual])
+        self._check_get_sr(broker, expected_sr=[])
+        self._check_get_sr(broker, expected_sr=[], include_own=False)
+        self._check_get_sr(
+            broker, expected_sr=[own_shard_range], include_own=True)
 
         # merge rows for other shard ranges
         shard_ranges = [
@@ -4271,100 +4292,85 @@ class TestContainerBroker(test_db.TestDbBase):
             ShardRange('.a/c5', next(self.ts), 'h', 'j', deleted=1)
         ]
         broker.merge_shard_ranges(shard_ranges)
-        actual = broker.get_shard_ranges()
         undeleted = shard_ranges[:3] + shard_ranges[4:5]
-        self.assertEqual([dict(sr) for sr in undeleted],
-                         [dict(sr) for sr in actual])
+        self._check_get_sr_and_ns(broker, expected_sr=undeleted)
 
-        actual = broker.get_shard_ranges(include_deleted=True)
-        self.assertEqual([dict(sr) for sr in shard_ranges],
-                         [dict(sr) for sr in actual])
+        self._check_get_sr(
+            broker, expected_sr=shard_ranges, include_deleted=True)
 
-        actual = broker.get_shard_ranges(reverse=True)
-        self.assertEqual([dict(sr) for sr in reversed(undeleted)],
-                         [dict(sr) for sr in actual])
+        self._check_get_sr_and_ns(
+            broker, reverse=True, expected_sr=list(reversed(undeleted)))
+        self._check_get_sr_and_ns(
+            broker, marker='c', end_marker='e', expected_sr=shard_ranges[1:3])
+        self._check_get_sr_and_ns(
+            broker, marker='c', end_marker='e', states=[ShardRange.ACTIVE],
+            expected_sr=shard_ranges[2:3])
+        self._check_get_sr_and_ns(broker, marker='e', end_marker='e',
+                                  expected_sr=[])
 
-        actual = broker.get_shard_ranges(marker='c', end_marker='e')
-        self.assertEqual([dict(sr) for sr in shard_ranges[1:3]],
-                         [dict(sr) for sr in actual])
-
-        actual = broker.get_shard_ranges(marker='c', end_marker='e',
-                                         states=ShardRange.ACTIVE)
-        self.assertEqual([dict(sr) for sr in shard_ranges[2:3]],
-                         [dict(sr) for sr in actual])
-
-        actual = broker.get_shard_ranges(marker='e', end_marker='e')
-        self.assertFalse([dict(sr) for sr in actual])
+        # check state filtering...
+        self._check_get_sr_and_ns(
+            broker, states=[ShardRange.FOUND], expected_sr=shard_ranges[:2])
 
         # includes overrides include_own
-        actual = broker.get_shard_ranges(includes='b', include_own=True)
-        self.assertEqual([dict(shard_ranges[0])], [dict(sr) for sr in actual])
+        self._check_get_sr(broker, expected_sr=[shard_ranges[0]],
+                           includes='b', include_own=True)
         # ... unless they coincide
-        actual = broker.get_shard_ranges(includes='t', include_own=True)
-        self.assertEqual([dict(own_shard_range)], [dict(sr) for sr in actual])
+        self._check_get_sr(broker, expected_sr=[own_shard_range],
+                           includes='t', include_own=True)
 
         # exclude_others overrides includes
-        actual = broker.get_shard_ranges(includes='b', exclude_others=True)
-        self.assertFalse(actual)
+        self._check_get_sr(broker, expected_sr=[],
+                           includes='b', exclude_others=True)
 
         # include_deleted overrides includes
-        actual = broker.get_shard_ranges(includes='i', include_deleted=True)
-        self.assertEqual([dict(shard_ranges[-1])], [dict(sr) for sr in actual])
-        actual = broker.get_shard_ranges(includes='i', include_deleted=False)
-        self.assertFalse(actual)
+        self._check_get_sr(broker, expected_sr=[shard_ranges[-1]],
+                           includes='i', include_deleted=True)
+        self._check_get_sr(broker, expected_sr=[],
+                           includes='i', include_deleted=False)
 
         # includes overrides marker/end_marker
-        actual = broker.get_shard_ranges(includes='b', marker='e',
-                                         end_marker='')
-        self.assertEqual([dict(shard_ranges[0])], [dict(sr) for sr in actual])
+        self._check_get_sr_and_ns(
+            broker, marker='e', end_marker='', includes='b',
+            expected_sr=[shard_ranges[0]])
 
-        actual = broker.get_shard_ranges(includes='b', marker=Namespace.MAX)
-        self.assertEqual([dict(shard_ranges[0])], [dict(sr) for sr in actual])
+        self._check_get_sr_and_ns(
+            broker, includes='b', marker=Namespace.MAX,
+            expected_sr=[shard_ranges[0]])
 
         # end_marker is Namespace.MAX
-        actual = broker.get_shard_ranges(marker='e', end_marker='')
-        self.assertEqual([dict(sr) for sr in undeleted[2:]],
-                         [dict(sr) for sr in actual])
-
-        actual = broker.get_shard_ranges(marker='e', end_marker='',
-                                         reverse=True)
-        self.assertEqual([dict(sr) for sr in reversed(undeleted[:3])],
-                         [dict(sr) for sr in actual])
+        self._check_get_sr_and_ns(
+            broker, marker='e', end_marker='', expected_sr=undeleted[2:])
+        self._check_get_sr_and_ns(
+            broker, marker='e', end_marker='', reverse=True,
+            expected_sr=list(reversed(undeleted[:3])))
 
         # marker is Namespace.MIN
-        actual = broker.get_shard_ranges(marker='', end_marker='d')
-        self.assertEqual([dict(sr) for sr in shard_ranges[:2]],
-                         [dict(sr) for sr in actual])
-
-        actual = broker.get_shard_ranges(marker='', end_marker='d',
-                                         reverse=True, include_deleted=True)
-        self.assertEqual([dict(sr) for sr in reversed(shard_ranges[2:])],
-                         [dict(sr) for sr in actual])
+        self._check_get_sr_and_ns(
+            broker, marker='', end_marker='d', expected_sr=shard_ranges[:2])
+        self._check_get_sr(broker,
+                           expected_sr=list(reversed(shard_ranges[2:])),
+                           marker='', end_marker='d',
+                           reverse=True, include_deleted=True)
 
         # marker, end_marker span entire namespace
-        actual = broker.get_shard_ranges(marker='', end_marker='')
-        self.assertEqual([dict(sr) for sr in undeleted],
-                         [dict(sr) for sr in actual])
+        self._check_get_sr_and_ns(
+            broker, marker='', end_marker='', expected_sr=undeleted)
 
         # marker, end_marker override include_own
-        actual = broker.get_shard_ranges(marker='', end_marker='k',
-                                         include_own=True)
-        self.assertEqual([dict(sr) for sr in undeleted],
-                         [dict(sr) for sr in actual])
-        actual = broker.get_shard_ranges(marker='u', end_marker='',
-                                         include_own=True)
-        self.assertFalse(actual)
+        self._check_get_sr(broker, expected_sr=undeleted,
+                           marker='', end_marker='k', include_own=True)
+        self._check_get_sr(broker, expected_sr=[],
+                           marker='u', end_marker='', include_own=True)
         # ...unless they coincide
-        actual = broker.get_shard_ranges(marker='t', end_marker='',
-                                         include_own=True)
-        self.assertEqual([dict(own_shard_range)], [dict(sr) for sr in actual])
+        self._check_get_sr(broker, expected_sr=[own_shard_range],
+                           marker='t', end_marker='', include_own=True)
 
         # null namespace cases
-        actual = broker.get_shard_ranges(end_marker=Namespace.MIN)
-        self.assertFalse(actual)
-
-        actual = broker.get_shard_ranges(marker=Namespace.MAX)
-        self.assertFalse(actual)
+        self._check_get_sr_and_ns(
+            broker, end_marker=Namespace.MIN, expected_sr=[])
+        self._check_get_sr_and_ns(
+            broker, marker=Namespace.MAX, expected_sr=[])
 
         orig_execute = GreenDBConnection.execute
         mock_call_args = []
@@ -4375,9 +4381,7 @@ class TestContainerBroker(test_db.TestDbBase):
 
         with mock.patch('swift.common.db.GreenDBConnection.execute',
                         mock_execute):
-            actual = broker.get_shard_ranges(includes='f')
-        self.assertEqual([dict(sr) for sr in shard_ranges[2:3]],
-                         [dict(sr) for sr in actual])
+            self._check_get_sr(broker, shard_ranges[2:3], includes='f')
         self.assertEqual(1, len(mock_call_args))
         # verify that includes keyword plumbs through to an SQL condition
         self.assertIn("WHERE deleted=0 AND name != ? AND lower < ? AND "
@@ -4387,65 +4391,57 @@ class TestContainerBroker(test_db.TestDbBase):
         mock_call_args = []
         with mock.patch('swift.common.db.GreenDBConnection.execute',
                         mock_execute):
-            actual = broker.get_shard_ranges(marker='c', end_marker='d')
-        self.assertEqual([dict(sr) for sr in shard_ranges[1:2]],
-                         [dict(sr) for sr in actual])
+            self._check_get_sr(broker, shard_ranges[1:2],
+                               marker='c', end_marker='d')
         self.assertEqual(1, len(mock_call_args))
         # verify that marker & end_marker plumb through to an SQL condition
         self.assertIn("WHERE deleted=0 AND name != ? AND lower < ? AND "
                       "(upper = '' OR upper > ?)", mock_call_args[0][1])
         self.assertEqual(['a/c', 'd', 'c'], mock_call_args[0][2])
 
-        actual = broker.get_shard_ranges(includes='i')
-        self.assertFalse(actual)
-
-        actual = broker.get_shard_ranges(
-            states=[ShardRange.CREATED, ShardRange.ACTIVE])
-        self.assertEqual(
-            [dict(sr) for sr in [shard_ranges[2], shard_ranges[4]]],
-            [dict(sr) for sr in actual])
+        self._check_get_sr_and_ns(broker, includes='i', expected_sr=[])
+        self._check_get_sr_and_ns(
+            broker, states=[ShardRange.CREATED, ShardRange.ACTIVE],
+            expected_sr=[shard_ranges[2], shard_ranges[4]])
 
         # fill gaps
         filler = own_shard_range.copy()
         filler.lower = 'h'
-        actual = broker.get_shard_ranges(fill_gaps=True)
-        self.assertEqual([dict(sr) for sr in undeleted + [filler]],
-                         [dict(sr) for sr in actual])
-        actual = broker.get_shard_ranges(fill_gaps=True, marker='a')
-        self.assertEqual([dict(sr) for sr in undeleted + [filler]],
-                         [dict(sr) for sr in actual])
-        actual = broker.get_shard_ranges(fill_gaps=True, end_marker='z')
-        self.assertEqual([dict(sr) for sr in undeleted + [filler]],
-                         [dict(sr) for sr in actual])
-        actual = broker.get_shard_ranges(fill_gaps=True, end_marker='k')
+        self._check_get_sr_and_ns(
+            broker, fill_gaps=True, expected_sr=undeleted + [filler])
+        self._check_get_sr_and_ns(
+            broker, fill_gaps=True, marker='a',
+            expected_sr=undeleted + [filler])
+        self._check_get_sr_and_ns(
+            broker, fill_gaps=True, end_marker='z',
+            expected_sr=undeleted + [filler])
         filler.upper = 'k'
-        self.assertEqual([dict(sr) for sr in undeleted + [filler]],
-                         [dict(sr) for sr in actual])
+        self._check_get_sr_and_ns(
+            broker, fill_gaps=True, end_marker='k',
+            expected_sr=undeleted + [filler])
+
         # includes overrides fill_gaps
-        actual = broker.get_shard_ranges(includes='b', fill_gaps=True)
-        self.assertEqual([dict(shard_ranges[0])], [dict(sr) for sr in actual])
+        self._check_get_sr_and_ns(
+            broker, includes='b', fill_gaps=True,
+            expected_sr=[shard_ranges[0]])
 
         # no filler needed...
-        actual = broker.get_shard_ranges(fill_gaps=True, end_marker='h')
-        self.assertEqual([dict(sr) for sr in undeleted],
-                         [dict(sr) for sr in actual])
-        actual = broker.get_shard_ranges(fill_gaps=True, end_marker='a')
-        self.assertEqual([], [dict(sr) for sr in actual])
+        self._check_get_sr_and_ns(
+            broker, fill_gaps=True, end_marker='h', expected_sr=undeleted)
+        self._check_get_sr_and_ns(
+            broker, fill_gaps=True, end_marker='a', expected_sr=[])
 
         # get everything
-        actual = broker.get_shard_ranges(include_own=True)
-        self.assertEqual([dict(sr) for sr in undeleted + [own_shard_range]],
-                         [dict(sr) for sr in actual])
+        self._check_get_sr(broker, expected_sr=undeleted + [own_shard_range],
+                           include_own=True)
 
         # get just own range
-        actual = broker.get_shard_ranges(include_own=True, exclude_others=True)
-        self.assertEqual([dict(sr) for sr in [own_shard_range]],
-                         [dict(sr) for sr in actual])
+        self._check_get_sr(broker, expected_sr=[own_shard_range],
+                           include_own=True, exclude_others=True)
 
         # if you ask for nothing you'll get nothing
-        actual = broker.get_shard_ranges(
-            include_own=False, exclude_others=True)
-        self.assertFalse(actual)
+        self._check_get_sr(broker, expected_sr=[],
+                           include_own=False, exclude_others=True)
 
     @with_tempdir
     def test_get_shard_ranges_includes(self, tempdir):
@@ -4462,45 +4458,32 @@ class TestContainerBroker(test_db.TestDbBase):
         broker.initialize(next(self.ts).internal, 0)
         broker.merge_shard_ranges(ranges)
 
-        actual = broker.get_shard_ranges(includes='')
-        self.assertEqual(actual, [])
-        actual = broker.get_shard_ranges(includes=' ')
-        self.assertEqual(actual, [start])
-        actual = broker.get_shard_ranges(includes='b')
-        self.assertEqual(actual, [atof])
-        actual = broker.get_shard_ranges(includes='f')
-        self.assertEqual(actual, [atof])
-        actual = broker.get_shard_ranges(includes='f\x00')
-        self.assertEqual(actual, [ftol])
-        actual = broker.get_shard_ranges(includes='x')
-        self.assertEqual(actual, [rtoz])
-        actual = broker.get_shard_ranges(includes='r')
-        self.assertEqual(actual, [ltor])
-        actual = broker.get_shard_ranges(includes='}')
-        self.assertEqual(actual, [end])
+        self._check_get_sr_and_ns(broker, includes='', expected_sr=[])
+        self._check_get_sr_and_ns(broker, includes=' ', expected_sr=[start])
+        self._check_get_sr_and_ns(broker, includes='b', expected_sr=[atof])
+        self._check_get_sr_and_ns(broker, includes='f', expected_sr=[atof])
+        self._check_get_sr_and_ns(
+            broker, includes='f\x00', expected_sr=[ftol])
+        self._check_get_sr_and_ns(broker, includes='x', expected_sr=[rtoz])
+        self._check_get_sr_and_ns(broker, includes='r', expected_sr=[ltor])
+        self._check_get_sr_and_ns(broker, includes='}', expected_sr=[end])
 
         # add some overlapping sub-shards
         ftoh = ShardRange('a/f-h', ts, 'f', 'h')
         htok = ShardRange('a/h-k', ts, 'h', 'k')
 
         broker.merge_shard_ranges([ftoh, htok])
-        actual = broker.get_shard_ranges(includes='g')
-        self.assertEqual(actual, [ftoh])
-        actual = broker.get_shard_ranges(includes='h')
-        self.assertEqual(actual, [ftoh])
-        actual = broker.get_shard_ranges(includes='k')
-        self.assertEqual(actual, [htok])
-        actual = broker.get_shard_ranges(includes='l')
-        self.assertEqual(actual, [ftol])
-        actual = broker.get_shard_ranges(includes='m')
-        self.assertEqual(actual, [ltor])
+        self._check_get_sr_and_ns(broker, includes='g', expected_sr=[ftoh])
+        self._check_get_sr_and_ns(broker, includes='h', expected_sr=[ftoh])
+        self._check_get_sr_and_ns(broker, includes='k', expected_sr=[htok])
+        self._check_get_sr_and_ns(broker, includes='l', expected_sr=[ftol])
+        self._check_get_sr_and_ns(broker, includes='m', expected_sr=[ltor])
 
         # remove l-r from shard ranges and try and find a shard range for an
         # item in that range.
         ltor.set_deleted(next(self.ts))
         broker.merge_shard_ranges([ltor])
-        actual = broker.get_shard_ranges(includes='p')
-        self.assertEqual(actual, [])
+        self._check_get_sr_and_ns(broker, includes='p', expected_sr=[])
 
     @with_tempdir
     def test_overlap_shard_range_order(self, tempdir):
@@ -4517,29 +4500,13 @@ class TestContainerBroker(test_db.TestDbBase):
                                            string.ascii_letters[1:]))
             for e, epoch in enumerate((epoch0, epoch1))
         ]
+        expected_sr = [sr for sr in shard_ranges]
 
         random.shuffle(shard_ranges)
         for sr in shard_ranges:
             broker.merge_shard_ranges([sr])
 
-        expected = [
-            '.shard_a/shard_0-0',
-            '.shard_a/shard_1-0',
-            '.shard_a/shard_0-1',
-            '.shard_a/shard_1-1',
-            '.shard_a/shard_0-2',
-            '.shard_a/shard_1-2',
-            '.shard_a/shard_0-3',
-            '.shard_a/shard_1-3',
-            '.shard_a/shard_0-4',
-            '.shard_a/shard_1-4',
-            '.shard_a/shard_0-5',
-            '.shard_a/shard_1-5',
-            '.shard_a/shard_0-6',
-            '.shard_a/shard_1-6',
-        ]
-        self.assertEqual(expected, [
-            sr.name for sr in broker.get_shard_ranges()])
+        self._check_get_sr_and_ns(broker, expected_sr)
 
     @with_tempdir
     def test_get_shard_ranges_with_sharding_overlaps(self, tempdir):
@@ -4562,14 +4529,11 @@ class TestContainerBroker(test_db.TestDbBase):
         ]
         broker.merge_shard_ranges(
             random.sample(shard_ranges, len(shard_ranges)))
-        actual = broker.get_shard_ranges()
-        self.assertEqual([dict(sr) for sr in shard_ranges],
-                         [dict(sr) for sr in actual])
+        self._check_get_sr_and_ns(broker, expected_sr=shard_ranges)
 
-        actual = broker.get_shard_ranges(states=SHARD_LISTING_STATES)
-        self.assertEqual(
-            [dict(sr) for sr in shard_ranges[:3] + shard_ranges[4:]],
-            [dict(sr) for sr in actual])
+        self._check_get_sr_and_ns(
+            broker, states=SHARD_LISTING_STATES,
+            expected_sr=shard_ranges[:3] + shard_ranges[4:])
 
         orig_execute = GreenDBConnection.execute
         mock_call_args = []
@@ -4580,22 +4544,17 @@ class TestContainerBroker(test_db.TestDbBase):
 
         with mock.patch('swift.common.db.GreenDBConnection.execute',
                         mock_execute):
-            actual = broker.get_shard_ranges(states=SHARD_UPDATE_STATES,
-                                             includes='e')
-        self.assertEqual([dict(shard_ranges[1])],
-                         [dict(sr) for sr in actual])
+            self._check_get_sr(broker, shard_ranges[1:2],
+                               states=SHARD_UPDATE_STATES, includes='e')
         self.assertEqual(1, len(mock_call_args))
-        # verify that includes keyword plumbs through to an SQL condition
         self.assertIn("WHERE deleted=0 AND state in (?,?,?,?) AND name != ? "
                       "AND lower < ? AND (upper = '' OR upper >= ?)",
                       mock_call_args[0][1])
 
-        actual = broker.get_shard_ranges(states=SHARD_UPDATE_STATES,
-                                         includes='j')
-        self.assertEqual([shard_ranges[2]], actual)
-        actual = broker.get_shard_ranges(states=SHARD_UPDATE_STATES,
-                                         includes='k')
-        self.assertEqual([shard_ranges[3]], actual)
+        self._check_get_sr(broker, shard_ranges[2:3],
+                           states=SHARD_UPDATE_STATES, includes='j')
+        self._check_get_sr(broker, shard_ranges[3:4],
+                           states=SHARD_UPDATE_STATES, includes='k')
 
     @with_tempdir
     def test_get_shard_ranges_with_shrinking_overlaps(self, tempdir):
@@ -4614,13 +4573,10 @@ class TestContainerBroker(test_db.TestDbBase):
         ]
         broker.merge_shard_ranges(
             random.sample(shard_ranges, len(shard_ranges)))
-        actual = broker.get_shard_ranges()
-        self.assertEqual([dict(sr) for sr in shard_ranges],
-                         [dict(sr) for sr in actual])
-
-        actual = broker.get_shard_ranges(states=SHARD_UPDATE_STATES,
-                                         includes='l')
-        self.assertEqual([shard_ranges[2]], actual)
+        self._check_get_sr_and_ns(broker, expected_sr=shard_ranges)
+        self._check_get_sr_and_ns(
+            broker, states=SHARD_UPDATE_STATES, includes='l',
+            expected_sr=[shard_ranges[2]])
 
     @with_tempdir
     def test_get_shard_range_rows_with_limit(self, tempdir):
@@ -4673,6 +4629,171 @@ class TestContainerBroker(test_db.TestDbBase):
                                               limit=4)
         self.assertEqual(1, len(actual))
         self.assertEqual(shard_ranges[0], ShardRange(*actual[0]))
+
+    def _setup_broker_with_shard_ranges(self, tempdir,
+                                        own_shard_range, shard_ranges):
+        db_path = os.path.join(tempdir, 'container.db')
+        broker = ContainerBroker(db_path, account='a', container='c')
+        broker.initialize(next(self.ts).internal, 0)
+
+        # no rows
+        self.assertFalse(broker.get_shard_ranges())
+        self.assertFalse(broker.get_namespaces())
+
+        # merge row for own shard range
+        broker.merge_shard_ranges([own_shard_range])
+        self._check_get_sr(broker, [own_shard_range], include_own=True)
+        self.assertFalse(broker.get_namespaces())
+
+        # merge rows for other shard ranges
+        broker.merge_shard_ranges(shard_ranges)
+        return broker
+
+    @with_tempdir
+    def test_get_namespaces(self, tempdir):
+        own_shard_range = ShardRange('a/c', next(
+            self.ts), 'a', 'z', state=ShardRange.SHARDING)
+        shard_ranges = [
+            ShardRange('.a/c0', next(self.ts), 'a',
+                       'c', state=ShardRange.CREATED),
+            ShardRange('.a/c1', next(self.ts), 'c',
+                       'd', state=ShardRange.CREATED),
+            ShardRange('.a/c2', next(self.ts), 'd', 'f',
+                       state=ShardRange.ACTIVE),
+            ShardRange('.a/c3', next(self.ts), 'e', 'f', deleted=1,
+                       state=ShardRange.SHARDING,),
+            ShardRange('.a/c4', next(self.ts), 'f', 'h',
+                       state=ShardRange.SHARDING),
+            ShardRange('.a/c5', next(self.ts), 'h', 'j', deleted=1)
+        ]
+        broker = self._setup_broker_with_shard_ranges(
+            tempdir, own_shard_range, shard_ranges)
+        undeleted = [sr for sr in shard_ranges if not sr.deleted]
+        self._check_get_sr(broker, undeleted)
+
+        # test get all undeleted namespaces with gap filled.
+        expected_ns = [Namespace(sr.name, sr.lower, sr.upper)
+                       for sr in undeleted]
+        filler = [Namespace('a/c', 'h', 'z')]
+        self._check_get_ns(broker, expected_ns + filler, fill_gaps=True)
+        # test get all undeleted namespaces w/o gap filled.
+        self._check_get_sr_and_ns(broker, undeleted)
+
+        orig_execute = GreenDBConnection.execute
+        mock_call_args = []
+
+        def mock_execute(*args, **kwargs):
+            mock_call_args.append(args)
+            return orig_execute(*args, **kwargs)
+
+        with mock.patch('swift.common.db.GreenDBConnection.execute',
+                        mock_execute):
+            self._check_get_ns(broker, expected_ns,
+                               states=[ShardRange.CREATED, ShardRange.ACTIVE,
+                                       ShardRange.SHARDING])
+        self.assertEqual(1, len(mock_call_args))
+        # verify that includes keyword plumbs through to an SQL condition
+        self.assertIn(
+            "WHERE deleted = 0 AND name != ? AND state in (?,?,?)",
+            mock_call_args[0][1])
+        self.assertEqual(set(['a/c', ShardRange.ACTIVE, ShardRange.CREATED,
+                         ShardRange.SHARDING]), set(mock_call_args[0][2]))
+
+        mock_call_args = []
+        with mock.patch('swift.common.db.GreenDBConnection.execute',
+                        mock_execute):
+            self._check_get_ns(broker, expected_ns[2:3], includes='f')
+        self.assertEqual(1, len(mock_call_args))
+        # verify that includes keyword plumbs through to an SQL condition
+        self.assertIn("WHERE deleted = 0 AND name != ? AND lower < ? AND "
+                      "(upper = '' OR upper >= ?)", mock_call_args[0][1])
+        self.assertEqual(['a/c', 'f', 'f'], mock_call_args[0][2])
+
+        mock_call_args = []
+        with mock.patch('swift.common.db.GreenDBConnection.execute',
+                        mock_execute):
+            self._check_get_ns(broker, expected_ns[1:2],
+                               marker='c', end_marker='d')
+        self.assertEqual(1, len(mock_call_args))
+        # verify that marker & end_marker plumb through to an SQL condition
+        self.assertIn("WHERE deleted = 0 AND name != ? AND lower < ? AND "
+                      "(upper = '' OR upper > ?)", mock_call_args[0][1])
+        self.assertEqual(['a/c', 'd', 'c'], mock_call_args[0][2])
+
+    @with_tempdir
+    def test_get_namespaces_state_filtering(self, tempdir):
+        own_shard_range = ShardRange('a/c', next(
+            self.ts), 'a', 'z', state=ShardRange.SHARDING)
+        shard_ranges = [
+            ShardRange('.a/c0', next(self.ts), 'a', 'c',
+                       state=ShardRange.CREATED),
+            ShardRange('.a/c1', next(self.ts), 'c', 'd',
+                       state=ShardRange.CREATED),
+            ShardRange('.a/c2', next(self.ts), 'd', 'f',
+                       state=ShardRange.SHARDING),
+            ShardRange('.a/c2a', next(self.ts), 'd', 'e',
+                       state=ShardRange.ACTIVE),
+            ShardRange('.a/c2b', next(self.ts), 'e', 'f',
+                       state=ShardRange.ACTIVE, ),
+            ShardRange('.a/c3', next(self.ts), 'f', 'h',
+                       state=ShardRange.SHARDING),
+            ShardRange('.a/c4', next(self.ts), 'h', 'j', deleted=1,
+                       state=ShardRange.SHARDED)
+        ]
+        broker = self._setup_broker_with_shard_ranges(
+            tempdir, own_shard_range, shard_ranges)
+
+        def do_test(states, expected_sr):
+            self._check_get_sr_and_ns(broker, expected_sr, states=states)
+            expected_ns = [Namespace(sr.name, sr.lower, sr.upper)
+                           for sr in expected_sr]
+            filler_lower = expected_sr[-1].upper if expected_sr else 'a'
+            filler = [Namespace('a/c', filler_lower, 'z')]
+            self._check_get_ns(broker, expected_ns + filler,
+                               states=states, fill_gaps=True)
+
+        do_test([ShardRange.CREATED], shard_ranges[:2])
+        do_test([ShardRange.CREATED, ShardRange.ACTIVE],
+                shard_ranges[:2] + shard_ranges[3:5])
+        # this case verifies that state trumps lower for ordering...
+        do_test([ShardRange.ACTIVE, ShardRange.SHARDING],
+                shard_ranges[3:5] + shard_ranges[2:3] + shard_ranges[5:6])
+        do_test([ShardRange.CREATED, ShardRange.ACTIVE, ShardRange.SHARDING],
+                shard_ranges[:2] + shard_ranges[3:5] + shard_ranges[2:3] +
+                shard_ranges[5:6])
+        do_test([ShardRange.SHARDED], [])
+
+    @with_tempdir
+    def test_get_namespaces_root_container_fill_gap(self, tempdir):
+        # Test GET namespaces from a root container with full namespace.
+        own_shard_range = ShardRange('a/c', next(
+            self.ts), '', '', state=ShardRange.SHARDED)
+        shard_ranges = [
+            ShardRange('.a/c0', next(self.ts), '',
+                       'a', state=ShardRange.CREATED),
+            ShardRange('.a/c1', next(self.ts), 'a',
+                       'c', state=ShardRange.CREATED),
+            ShardRange('.a/c2', next(self.ts), 'c',
+                       'd', state=ShardRange.CREATED),
+            ShardRange('.a/c3', next(self.ts), 'd', 'f',
+                       state=ShardRange.ACTIVE),
+            ShardRange('.a/c4', next(self.ts), 'f', 'h',
+                       state=ShardRange.SHARDING),
+            ShardRange('.a/c5', next(self.ts), 'h', '',
+                       state=ShardRange.SHARDING),
+        ]
+        broker = self._setup_broker_with_shard_ranges(
+            tempdir, own_shard_range, shard_ranges)
+        undeleted = [sr for sr in shard_ranges if not sr.deleted]
+        self._check_get_sr_and_ns(broker, undeleted, fill_gaps=True)
+
+        # test optimization will skip ``get_own_shard_range`` call.
+        with mock.patch.object(
+                broker, 'get_own_shard_range') as mock_get_own_sr:
+            self._check_get_ns(broker, undeleted, fill_gaps=True)
+        mock_get_own_sr.assert_not_called()
+        # test get all undeleted namespaces w/o gap filled.
+        self._check_get_sr_and_ns(broker, undeleted)
 
     @with_tempdir
     def test_get_own_shard_range(self, tempdir):
@@ -6856,11 +6977,180 @@ class TestUpdateNewItemFromExisting(unittest.TestCase):
 
 
 class TestModuleFunctions(unittest.TestCase):
+    def setUp(self):
+        super(TestModuleFunctions, self).setUp()
+        self.ts_iter = make_timestamp_iter()
+        self.ts = [next(self.ts_iter).internal for _ in range(10)]
+
+    def test_merge_shards_existing_none(self):
+        data = dict(ShardRange('a/o', self.ts[1]), reported=True)
+        exp_data = dict(data)
+        self.assertTrue(merge_shards(data, None))
+        self.assertEqual(exp_data, data)
+
+    def test_merge_shards_existing_ts_lt(self):
+        existing = dict(ShardRange('a/o', self.ts[0]))
+        data = dict(ShardRange('a/o', self.ts[1]), reported=True)
+        exp_data = dict(data, reported=False)
+        self.assertTrue(merge_shards(data, existing))
+        self.assertEqual(exp_data, data)
+
+    def test_merge_shards_existing_ts_gt(self):
+        existing = dict(ShardRange('a/o', self.ts[1]))
+        data = dict(ShardRange('a/o', self.ts[0]), reported=True)
+        exp_data = dict(data)
+        self.assertFalse(merge_shards(data, existing))
+        self.assertEqual(exp_data, data)
+
+        # existing timestamp trumps data state_timestamp
+        data = dict(ShardRange('a/o', self.ts[0]), state=ShardRange.ACTIVE,
+                    state_timestamp=self.ts[2])
+        exp_data = dict(data)
+        self.assertFalse(merge_shards(data, existing))
+        self.assertEqual(exp_data, data)
+
+        # existing timestamp trumps data meta_timestamp
+        data = dict(ShardRange('a/o', self.ts[0]), state=ShardRange.ACTIVE,
+                    meta_timestamp=self.ts[2])
+        exp_data = dict(data)
+        self.assertFalse(merge_shards(data, existing))
+        self.assertEqual(exp_data, data)
+
+    def test_merge_shards_existing_ts_eq_merge_reported(self):
+        existing = dict(ShardRange('a/o', self.ts[0]))
+        data = dict(ShardRange('a/o', self.ts[0]), reported=False)
+        exp_data = dict(data)
+        self.assertFalse(merge_shards(data, existing))
+        self.assertEqual(exp_data, data)
+
+        data = dict(ShardRange('a/o', self.ts[0]), reported=True)
+        exp_data = dict(data)
+        self.assertTrue(merge_shards(data, existing))
+        self.assertEqual(exp_data, data)
+
+    def test_merge_shards_existing_ts_eq_retain_bounds(self):
+        existing = dict(ShardRange('a/o', self.ts[0]))
+        data = dict(ShardRange('a/o', self.ts[0]), lower='l', upper='u')
+        exp_data = dict(data, lower='', upper='')
+        self.assertFalse(merge_shards(data, existing))
+        self.assertEqual(exp_data, data)
+
+    def test_merge_shards_existing_ts_eq_retain_deleted(self):
+        existing = dict(ShardRange('a/o', self.ts[0]))
+        data = dict(ShardRange('a/o', self.ts[0]), deleted=1)
+        exp_data = dict(data, deleted=0)
+        self.assertFalse(merge_shards(data, existing))
+        self.assertEqual(exp_data, data)
+
+    def test_merge_shards_existing_ts_eq_meta_ts_gte(self):
+        existing = dict(
+            ShardRange('a/o', self.ts[0], meta_timestamp=self.ts[1],
+                       object_count=1, bytes_used=2, tombstones=3))
+        data = dict(
+            ShardRange('a/o', self.ts[0], meta_timestamp=self.ts[1],
+                       object_count=10, bytes_used=20, tombstones=30))
+        exp_data = dict(data, object_count=1, bytes_used=2, tombstones=3)
+        self.assertFalse(merge_shards(data, existing))
+        self.assertEqual(exp_data, data)
+
+        existing = dict(
+            ShardRange('a/o', self.ts[0], meta_timestamp=self.ts[2],
+                       object_count=1, bytes_used=2, tombstones=3))
+        exp_data = dict(data, object_count=1, bytes_used=2, tombstones=3,
+                        meta_timestamp=self.ts[2])
+        self.assertFalse(merge_shards(data, existing))
+        self.assertEqual(exp_data, data)
+
+    def test_merge_shards_existing_ts_eq_meta_ts_lt(self):
+        existing = dict(
+            ShardRange('a/o', self.ts[0], meta_timestamp=self.ts[1],
+                       object_count=1, bytes_used=2, tombstones=3,
+                       epoch=self.ts[3]))
+        data = dict(
+            ShardRange('a/o', self.ts[0], meta_timestamp=self.ts[2],
+                       object_count=10, bytes_used=20, tombstones=30,
+                       epoch=None))
+        exp_data = dict(data, epoch=self.ts[3])
+        self.assertTrue(merge_shards(data, existing))
+        self.assertEqual(exp_data, data)
+
+    def test_merge_shards_existing_ts_eq_state_ts_eq(self):
+        # data has more advanced state
+        existing = dict(
+            ShardRange('a/o', self.ts[0], state_timestamp=self.ts[1],
+                       state=ShardRange.CREATED, epoch=self.ts[4]))
+        data = dict(
+            ShardRange('a/o', self.ts[0], state_timestamp=self.ts[1],
+                       state=ShardRange.ACTIVE, epoch=self.ts[5]))
+        exp_data = dict(data)
+        self.assertTrue(merge_shards(data, existing))
+        self.assertEqual(exp_data, data)
+
+        # data has less advanced state
+        existing = dict(
+            ShardRange('a/o', self.ts[0], state_timestamp=self.ts[1],
+                       state=ShardRange.CREATED, epoch=self.ts[4]))
+        data = dict(
+            ShardRange('a/o', self.ts[0], state_timestamp=self.ts[1],
+                       state=ShardRange.FOUND, epoch=self.ts[5]))
+        exp_data = dict(data, state=ShardRange.CREATED, epoch=self.ts[4])
+        self.assertFalse(merge_shards(data, existing))
+        self.assertEqual(exp_data, data)
+
+    def test_merge_shards_existing_ts_eq_state_ts_gt(self):
+        existing = dict(
+            ShardRange('a/o', self.ts[0], state_timestamp=self.ts[2],
+                       state=ShardRange.CREATED, epoch=self.ts[4]))
+        data = dict(
+            ShardRange('a/o', self.ts[0], state_timestamp=self.ts[1],
+                       state=ShardRange.ACTIVE, epoch=self.ts[5]))
+        exp_data = dict(data, state_timestamp=self.ts[2],
+                        state=ShardRange.CREATED, epoch=self.ts[4])
+        self.assertFalse(merge_shards(data, existing))
+        self.assertEqual(exp_data, data)
+
+    def test_merge_shards_existing_ts_eq_state_ts_lt(self):
+        existing = dict(
+            ShardRange('a/o', self.ts[0], state_timestamp=self.ts[0],
+                       state=ShardRange.CREATED, epoch=self.ts[4]))
+        data = dict(
+            ShardRange('a/o', self.ts[0], state_timestamp=self.ts[1],
+                       state=ShardRange.ACTIVE, epoch=self.ts[5]))
+        exp_data = dict(data)
+        self.assertTrue(merge_shards(data, existing))
+        self.assertEqual(exp_data, data)
+
+    def test_merge_shards_epoch_reset(self):
+        # not sure if these scenarios are realistic, but we have seen epoch
+        # resets in prod
+        # same timestamps, data has more advanced state but no epoch
+        existing = dict(
+            ShardRange('a/o', self.ts[0], state_timestamp=self.ts[1],
+                       state=ShardRange.CREATED, epoch=self.ts[4]))
+        data = dict(
+            ShardRange('a/o', self.ts[0], state_timestamp=self.ts[1],
+                       state=ShardRange.ACTIVE, epoch=None))
+        exp_data = dict(data)
+        self.assertTrue(merge_shards(data, existing))
+        self.assertEqual(exp_data, data)
+        self.assertIsNone(exp_data['epoch'])
+
+        # data has more advanced state_timestamp but no epoch
+        existing = dict(
+            ShardRange('a/o', self.ts[0], state_timestamp=self.ts[1],
+                       state=ShardRange.CREATED, epoch=self.ts[4]))
+        data = dict(
+            ShardRange('a/o', self.ts[0], state_timestamp=self.ts[2],
+                       state=ShardRange.FOUND, epoch=None))
+        exp_data = dict(data)
+        self.assertTrue(merge_shards(data, existing))
+        self.assertEqual(exp_data, data)
+        self.assertIsNone(exp_data['epoch'])
+
     def test_sift_shard_ranges(self):
-        ts_iter = make_timestamp_iter()
         existing_shards = {}
-        sr1 = dict(ShardRange('a/o', next(ts_iter).internal))
-        sr2 = dict(ShardRange('a/o2', next(ts_iter).internal))
+        sr1 = dict(ShardRange('a/o', next(self.ts_iter).internal))
+        sr2 = dict(ShardRange('a/o2', next(self.ts_iter).internal))
         new_shard_ranges = [sr1, sr2]
 
         # first empty existing shards will just add the shards
@@ -6874,7 +7164,7 @@ class TestModuleFunctions(unittest.TestCase):
         # if there is a newer version in the existing shards then it won't be
         # added to to_add
         existing_shards['a/o'] = dict(
-            ShardRange('a/o', next(ts_iter).internal))
+            ShardRange('a/o', next(self.ts_iter).internal))
         to_add, to_delete = sift_shard_ranges(new_shard_ranges,
                                               existing_shards)
         self.assertEqual([sr2], list(to_add))
@@ -6882,7 +7172,7 @@ class TestModuleFunctions(unittest.TestCase):
 
         # But if a newer version is in new_shard_ranges then the old will be
         # added to to_delete and new is added to to_add.
-        sr1['timestamp'] = next(ts_iter).internal
+        sr1['timestamp'] = next(self.ts_iter).internal
         to_add, to_delete = sift_shard_ranges(new_shard_ranges,
                                               existing_shards)
         self.assertEqual(2, len(to_add))

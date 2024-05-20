@@ -14,7 +14,7 @@
 # limitations under the License.
 import json
 import random
-from argparse import Namespace
+import argparse
 
 import eventlet
 import os
@@ -47,7 +47,7 @@ from swift.container.sharder import ContainerSharder, sharding_enabled, \
     update_own_shard_range_stats
 from swift.common.utils import ShardRange, Timestamp, hash_path, \
     encode_timestamps, parse_db_filename, quorum_size, Everything, md5, \
-    ShardName
+    ShardName, Namespace
 from test import annotate_failure
 
 from test.debug_logger import debug_logger
@@ -205,6 +205,7 @@ class TestSharder(BaseTestSharder):
             '/etc/swift/internal-client.conf', 'Swift Container Sharder', 3,
             use_replication_network=True,
             global_conf={'log_name': 'container-sharder-ic'})
+        self.assertEqual(self.logger.get_lines_for_level('warning'), [])
 
         # non-default shard_container_threshold influences other defaults
         conf = {'shard_container_threshold': 20000000}
@@ -219,6 +220,7 @@ class TestSharder(BaseTestSharder):
             '/etc/swift/internal-client.conf', 'Swift Container Sharder', 3,
             use_replication_network=True,
             global_conf={'log_name': 'container-sharder-ic'})
+        self.assertEqual(self.logger.get_lines_for_level('warning'), [])
 
         # non-default values
         conf = {
@@ -238,7 +240,6 @@ class TestSharder(BaseTestSharder):
             'request_tries': 2,
             'internal_client_conf_path': '/etc/swift/my-sharder-ic.conf',
             'recon_cache_path': '/var/cache/swift-alt',
-            'auto_create_account_prefix': '...',
             'auto_shard': 'yes',
             'recon_candidates_limit': 10,
             'recon_sharded_timeout': 7200,
@@ -265,7 +266,7 @@ class TestSharder(BaseTestSharder):
             'cleave_batch_size': 4,
             'shard_scanner_batch_size': 8,
             'rcache': '/var/cache/swift-alt/container.recon',
-            'shards_account_prefix': '...shards_',
+            'shards_account_prefix': '.shards_',
             'auto_shard': True,
             'recon_candidates_limit': 10,
             'recon_sharded_timeout': 7200,
@@ -280,24 +281,14 @@ class TestSharder(BaseTestSharder):
             '/etc/swift/my-sharder-ic.conf', 'Swift Container Sharder', 2,
             use_replication_network=True,
             global_conf={'log_name': 'container-sharder-ic'})
-        self.assertEqual(self.logger.get_lines_for_level('warning'), [
-            'Option auto_create_account_prefix is deprecated. '
-            'Configure auto_create_account_prefix under the '
-            'swift-constraints section of swift.conf. This option '
-            'will be ignored in a future release.'])
+        self.assertEqual(self.logger.get_lines_for_level('warning'), [])
 
         expected.update({'shard_replication_quorum': 3,
                          'existing_shard_replication_quorum': 3})
         conf.update({'shard_replication_quorum': 4,
                      'existing_shard_replication_quorum': 4})
         self._do_test_init(conf, expected)
-        warnings = self.logger.get_lines_for_level('warning')
-        self.assertEqual(warnings[:1], [
-            'Option auto_create_account_prefix is deprecated. '
-            'Configure auto_create_account_prefix under the '
-            'swift-constraints section of swift.conf. This option '
-            'will be ignored in a future release.'])
-        self.assertEqual(warnings[1:], [
+        self.assertEqual(self.logger.get_lines_for_level('warning'), [
             'shard_replication_quorum of 4 exceeds replica count 3, '
             'reducing to 3',
             'existing_shard_replication_quorum of 4 exceeds replica count 3, '
@@ -516,6 +507,48 @@ class TestSharder(BaseTestSharder):
         do_test('info')
         do_test('warning')
         do_test('error')
+
+    def test_periodic_warning(self):
+        now = [time.time()]
+
+        def mock_time():
+            return now[0]
+
+        with mock.patch('swift.container.sharder.time.time', mock_time):
+            with self._mock_sharder() as sharder:
+                sharder.periodic_warnings_interval = 5
+                broker1 = self._make_broker(container='c1')
+                broker2 = self._make_broker(container='c2')
+                for i in range(5):
+                    sharder.periodic_warning(broker1, 'periodic warning 1')
+                    sharder.periodic_warning(broker1, 'periodic warning 1a')
+                    sharder.periodic_warning(broker2, 'periodic warning 2')
+                    now[0] += 1
+                sharder.warning(broker1, 'normal warning')
+                sharder.periodic_warning(broker1, 'periodic warning 1')
+                sharder.periodic_warning(broker1, 'periodic warning 1a')
+                sharder.periodic_warning(broker2, 'periodic warning 2')
+                sharder.warning(broker1, 'normal warning')
+                for i in range(10):
+                    sharder.periodic_warning(broker1, 'periodic warning 1')
+                    sharder.periodic_warning(broker1, 'periodic warning 1a')
+                    sharder.periodic_warning(broker2, 'periodic warning 2')
+                    now[0] += 1
+        lines = self.logger.get_lines_for_level('warning')
+        self.assertEqual(11, len(lines))
+        self.assertEqual(
+            ['periodic warning 1, path: a/c1, db: %s' % broker1.db_file,
+             'periodic warning 1a, path: a/c1, db: %s' % broker1.db_file,
+             'periodic warning 2, path: a/c2, db: %s' % broker2.db_file,
+             'normal warning, path: a/c1, db: %s' % broker1.db_file,
+             'periodic warning 1, path: a/c1, db: %s' % broker1.db_file,
+             'periodic warning 1a, path: a/c1, db: %s' % broker1.db_file,
+             'periodic warning 2, path: a/c2, db: %s' % broker2.db_file,
+             'normal warning, path: a/c1, db: %s' % broker1.db_file,
+             'periodic warning 1, path: a/c1, db: %s' % broker1.db_file,
+             'periodic warning 1a, path: a/c1, db: %s' % broker1.db_file,
+             'periodic warning 2, path: a/c2, db: %s' % broker2.db_file],
+            lines)
 
     def _assert_stats(self, expected, sharder, category):
         # assertEqual doesn't work with a stats defaultdict so copy to a dict
@@ -1228,6 +1261,10 @@ class TestSharder(BaseTestSharder):
         do_test('')
         do_test(json.dumps({}))
         do_test(json.dumps([{'account': 'a', 'container': 'c'}]))
+        do_test(json.dumps([dict(Namespace('a/c', 'l', 'u'))]))
+        sr_dict = dict(ShardRange('a/c', next(self.ts_iter), 'l', 'u'))
+        sr_dict.pop('object_count')
+        do_test(json.dumps([sr_dict]))
 
     def test_fetch_shard_ranges_ok(self):
         def do_test(mock_resp_body, params):
@@ -1246,7 +1283,8 @@ class TestSharder(BaseTestSharder):
 
         expected_headers = {'X-Backend-Record-Type': 'shard',
                             'X-Backend-Include-Deleted': 'False',
-                            'X-Backend-Override-Deleted': 'true'}
+                            'X-Backend-Override-Deleted': 'true',
+                            'X-Backend-Record-Shard-Format': 'full'}
         broker = self._make_broker()
         shard_ranges = self._make_shard_ranges((('', 'm'), ('m', '')))
 
@@ -2774,9 +2812,18 @@ class TestSharder(BaseTestSharder):
             [{'remote_id': retiring_db_id, 'sync_point': len(objects)}],
             shard_broker.get_syncs())
         self.assertEqual(objects[5:], shard_broker.get_objects())
+        lines = self.logger.get_lines_for_level('warning')
+        self.assertEqual(1, len(lines))
+        self.assertIn(
+            'Failed to sufficiently replicate cleaved shard %s'
+            % shard_ranges[1].name, lines[0])
+        self.assertIn('1 successes, 2 required', lines[0])
+        self.assertIn('shard db: %s' % expected_shard_dbs[1], lines[0])
+        self.assertIn('db: %s' % broker.db_file, lines[0])
 
         # repeat - second shard range cleaves fully because its previously
         # cleaved shard db no longer exists
+        self.logger.clear()
         unlink_files(expected_shard_dbs)
         merge_items_calls = []
         with mock.patch('swift.container.backend.ContainerBroker.merge_items',
@@ -2814,6 +2861,7 @@ class TestSharder(BaseTestSharder):
             [{'remote_id': retiring_db_id, 'sync_point': len(objects)}],
             shard_broker.get_syncs())
         self.assertEqual(objects[5:], shard_broker.get_objects())
+        self.assertFalse(self.logger.get_lines_for_level('warning'))
 
     def test_shard_replication_quorum_failures(self):
         broker = self._make_broker()
@@ -4234,9 +4282,9 @@ class TestSharder(BaseTestSharder):
         lines = sharder.logger.get_lines_for_level('warning')
         shard_ranges = broker.get_shard_ranges()
         self.assertIn('Refused to remove misplaced objects for dest %s'
-                      % shard_ranges[2], lines[0])
+                      % shard_ranges[2].name, lines[0])
         self.assertIn('Refused to remove misplaced objects for dest %s'
-                      % shard_ranges[3], lines[1])
+                      % shard_ranges[3].name, lines[1])
         self.assertFalse(lines[2:])
 
         # they will be moved again on next cycle
@@ -4319,6 +4367,14 @@ class TestSharder(BaseTestSharder):
         # ... and nothing else moved
         self.assertFalse(os.path.exists(expected_dbs[0]))
         self.assertFalse(os.path.exists(expected_dbs[4]))
+        lines = self.logger.get_lines_for_level('warning')
+        self.assertEqual(1, len(lines))
+        self.assertIn(
+            'Failed to sufficiently replicate misplaced objects shard %s'
+            % broker.get_shard_ranges()[2].name, lines[0])
+        self.assertIn('1 successes, 2 required', lines[0])
+        self.assertIn('shard db: %s' % expected_dbs[2], lines[0])
+        self.assertIn('db: %s' % broker.db_file, lines[0])
 
     def test_misplaced_objects_insufficient_replication_2_replicas(self):
         broker, objects, expected_dbs = self._setup_misplaced_objects()
@@ -4353,6 +4409,14 @@ class TestSharder(BaseTestSharder):
         # ... and nothing else moved
         self.assertFalse(os.path.exists(expected_dbs[0]))
         self.assertFalse(os.path.exists(expected_dbs[4]))
+        lines = self.logger.get_lines_for_level('warning')
+        self.assertEqual(1, len(lines))
+        self.assertIn(
+            'Failed to sufficiently replicate misplaced objects shard %s'
+            % broker.get_shard_ranges()[3].name, lines[0])
+        self.assertIn('0 successes, 1 required', lines[0])
+        self.assertIn('shard db: %s' % expected_dbs[3], lines[0])
+        self.assertIn('db: %s' % broker.db_file, lines[0])
 
     def test_misplaced_objects_insufficient_replication_4_replicas(self):
         broker, objects, expected_dbs = self._setup_misplaced_objects()
@@ -5030,10 +5094,10 @@ class TestSharder(BaseTestSharder):
             self.assertEqual(2, len(broker.get_shard_ranges()))
             expected_ranges = [
                 ShardRange(
-                    ShardRange.make_path('.int_shards_a', 'c', cont, now, 0),
+                    ShardRange.make_path('.shards_a', 'c', cont, now, 0),
                     now, lower, objects[98][0], 99),
                 ShardRange(
-                    ShardRange.make_path('.int_shards_a', 'c', cont, now, 1),
+                    ShardRange.make_path('.shards_a', 'c', cont, now, 1),
                     now, objects[98][0], upper, 1),
             ]
             self._assert_shard_ranges_equal(expected_ranges,
@@ -5044,8 +5108,7 @@ class TestSharder(BaseTestSharder):
             account, cont, lower, upper)
         with self._mock_sharder(conf={'shard_container_threshold': 199,
                                       'minimum_shard_size': 1,
-                                      'shrink_threshold': 0,
-                                      'auto_create_account_prefix': '.int_'}
+                                      'shrink_threshold': 0}
                                 ) as sharder:
             with mock_timestamp_now() as now:
                 num_found = sharder._find_shard_ranges(broker)
@@ -5061,8 +5124,7 @@ class TestSharder(BaseTestSharder):
         # second invocation finds none
         with self._mock_sharder(conf={'shard_container_threshold': 199,
                                       'minimum_shard_size': 1,
-                                      'shrink_threshold': 0,
-                                      'auto_create_account_prefix': '.int_'}
+                                      'shrink_threshold': 0}
                                 ) as sharder:
             num_found = sharder._find_shard_ranges(broker)
         self.assertEqual(0, num_found)
@@ -5133,10 +5195,10 @@ class TestSharder(BaseTestSharder):
             self.assertEqual(2, len(broker.get_shard_ranges()))
             expected_ranges = [
                 ShardRange(
-                    ShardRange.make_path('.int_shards_a', 'c', cont, now, 0),
+                    ShardRange.make_path('.shards_a', 'c', cont, now, 0),
                     now, lower, objects[98][0], 99),
                 ShardRange(
-                    ShardRange.make_path('.int_shards_a', 'c', cont, now, 1),
+                    ShardRange.make_path('.shards_a', 'c', cont, now, 1),
                     now, objects[98][0], upper, 1),
             ]
             self._assert_shard_ranges_equal(expected_ranges,
@@ -5147,8 +5209,7 @@ class TestSharder(BaseTestSharder):
             account, cont, lower, upper)
         with self._mock_sharder(conf={'shard_container_threshold': 199,
                                       'minimum_shard_size': 1,
-                                      'shrink_threshold': 0,
-                                      'auto_create_account_prefix': '.int_'}
+                                      'shrink_threshold': 0},
                                 ) as sharder:
             with mock_timestamp_now() as now:
                 num_found = sharder._find_shard_ranges(broker)
@@ -5162,8 +5223,7 @@ class TestSharder(BaseTestSharder):
         self.assertGreaterEqual(stats['max_time'], stats['min_time'])
 
         # second invocation finds none
-        with self._mock_sharder(conf={'shard_container_threshold': 199,
-                                      'auto_create_account_prefix': '.int_'}
+        with self._mock_sharder(conf={'shard_container_threshold': 199}
                                 ) as sharder:
             num_found = sharder._find_shard_ranges(broker)
         self.assertEqual(0, num_found)
@@ -6266,8 +6326,9 @@ class TestSharder(BaseTestSharder):
                     as mocked, mock.patch.object(
                         sharder, 'int_client') as mock_swift:
                 mock_response = mock.MagicMock()
-                mock_response.headers = {'x-backend-record-type':
-                                         'shard'}
+                mock_response.headers = {
+                    'x-backend-record-type': 'shard',
+                    'X-Backend-Record-Shard-Format': 'full'}
                 shard_ranges.sort(key=ShardRange.sort_key)
                 mock_response.body = json.dumps(
                     [dict(sr) for sr in shard_ranges])
@@ -6289,7 +6350,8 @@ class TestSharder(BaseTestSharder):
         expected_headers = {'X-Backend-Record-Type': 'shard',
                             'X-Newest': 'true',
                             'X-Backend-Include-Deleted': 'True',
-                            'X-Backend-Override-Deleted': 'true'}
+                            'X-Backend-Override-Deleted': 'true',
+                            'X-Backend-Record-Shard-Format': 'full'}
         params = {'format': 'json', 'marker': marker, 'end_marker': end_marker,
                   'states': 'auditing'}
         mock_swift.make_request.assert_called_once_with(
@@ -6375,7 +6437,8 @@ class TestSharder(BaseTestSharder):
         expected_headers = {'X-Backend-Record-Type': 'shard',
                             'X-Newest': 'true',
                             'X-Backend-Include-Deleted': 'True',
-                            'X-Backend-Override-Deleted': 'true'}
+                            'X-Backend-Override-Deleted': 'true',
+                            'X-Backend-Record-Shard-Format': 'full'}
         params = {'format': 'json', 'marker': 'j', 'end_marker': 'k',
                   'states': 'auditing'}
         mock_swift.make_request.assert_called_once_with(
@@ -6412,7 +6475,8 @@ class TestSharder(BaseTestSharder):
         expected_headers = {'X-Backend-Record-Type': 'shard',
                             'X-Newest': 'true',
                             'X-Backend-Include-Deleted': 'True',
-                            'X-Backend-Override-Deleted': 'true'}
+                            'X-Backend-Override-Deleted': 'true',
+                            'X-Backend-Record-Shard-Format': 'full'}
         params = {'format': 'json', 'marker': 'k', 'end_marker': 't',
                   'states': 'auditing'}
         mock_swift.make_request.assert_called_once_with(
@@ -6549,7 +6613,8 @@ class TestSharder(BaseTestSharder):
             expected_headers = {'X-Backend-Record-Type': 'shard',
                                 'X-Newest': 'true',
                                 'X-Backend-Include-Deleted': 'True',
-                                'X-Backend-Override-Deleted': 'true'}
+                                'X-Backend-Override-Deleted': 'true',
+                                'X-Backend-Record-Shard-Format': 'full'}
             params = {'format': 'json', 'marker': 'k', 'end_marker': 't',
                       'states': 'auditing'}
             mock_swift.make_request.assert_called_once_with(
@@ -6631,7 +6696,8 @@ class TestSharder(BaseTestSharder):
         expected_headers = {'X-Backend-Record-Type': 'shard',
                             'X-Newest': 'true',
                             'X-Backend-Include-Deleted': 'True',
-                            'X-Backend-Override-Deleted': 'true'}
+                            'X-Backend-Override-Deleted': 'true',
+                            'X-Backend-Record-Shard-Format': 'full'}
         params = {'format': 'json', 'marker': 'a', 'end_marker': 'b',
                   'states': 'auditing'}
         mock_swift.make_request.assert_called_once_with(
@@ -7332,7 +7398,8 @@ class TestSharder(BaseTestSharder):
             expected_headers = {'X-Backend-Record-Type': 'shard',
                                 'X-Newest': 'true',
                                 'X-Backend-Include-Deleted': 'True',
-                                'X-Backend-Override-Deleted': 'true'}
+                                'X-Backend-Override-Deleted': 'true',
+                                'X-Backend-Record-Shard-Format': 'full'}
             params = {'format': 'json', 'marker': 'a', 'end_marker': 'd',
                       'states': 'auditing'}
             mock_swift.make_request.assert_called_once_with(
@@ -9641,11 +9708,11 @@ class TestContainerSharderConf(unittest.TestCase):
         # given namespace
         def assert_bad(conf):
             with self.assertRaises(ValueError):
-                ContainerSharderConf.validate_conf(Namespace(**conf))
+                ContainerSharderConf.validate_conf(argparse.Namespace(**conf))
 
         def assert_ok(conf):
             try:
-                ContainerSharderConf.validate_conf(Namespace(**conf))
+                ContainerSharderConf.validate_conf(argparse.Namespace(**conf))
             except ValueError as err:
                 self.fail('Unexpected ValueError: %s' % err)
 

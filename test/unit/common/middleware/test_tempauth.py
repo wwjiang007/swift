@@ -24,7 +24,8 @@ from six.moves.urllib.parse import quote, urlparse
 from swift.common.middleware import tempauth as auth
 from swift.common.middleware.acl import format_acl
 from swift.common.swob import Request, Response, bytes_to_wsgi
-from swift.common.utils import split_path, StatsdClient
+from swift.common.statsd_client import StatsdClient
+from swift.common.utils import split_path
 from test.unit import FakeMemcache
 
 NO_CONTENT_RESP = (('204 No Content', {}, ''),)   # mock server response
@@ -99,7 +100,7 @@ class TestAuth(unittest.TestCase):
 
     def test_statsd_prefix(self):
         app = FakeApp()
-        ath = auth.filter_factory({'log_statsd_host': 'example.com'})(app)
+        ath = auth.filter_factory({})(app)
         self.assertIsNotNone(ath.logger.logger.statsd_client)
         self.assertIsInstance(ath.logger.logger.statsd_client,
                               StatsdClient)
@@ -107,8 +108,7 @@ class TestAuth(unittest.TestCase):
                          ath.logger.logger.statsd_client._prefix)
 
         ath = auth.filter_factory({'log_statsd_metric_prefix': 'foo',
-                                   'log_name': 'bar',
-                                   'log_statsd_host': 'example.com'})(app)
+                                   'log_name': 'bar'})(app)
         self.assertIsNotNone(ath.logger.logger.statsd_client)
         self.assertIsInstance(ath.logger.logger.statsd_client,
                               StatsdClient)
@@ -117,7 +117,6 @@ class TestAuth(unittest.TestCase):
 
         ath = auth.filter_factory({'log_statsd_metric_prefix': 'foo',
                                    'log_name': 'bar',
-                                   'log_statsd_host': 'example.com',
                                    'reseller_prefix': 'TEST'})(app)
         self.assertIsNotNone(ath.logger.logger.statsd_client)
         self.assertIsInstance(ath.logger.logger.statsd_client,
@@ -305,6 +304,29 @@ class TestAuth(unittest.TestCase):
         self.assertEqual(resp.status_int, 404)
         self.assertEqual(local_app.calls, 1)
         self.assertEqual(req.environ['PATH_INFO'], '/v1/AUTH_s3')
+        self.assertEqual(req.environ['swift.authorize'],
+                         local_auth.authorize)
+
+    def test_auth_with_s3api_unicode_authorization_good(self):
+        local_app = FakeApp()
+        conf = {u'user_t\u00e9st_t\u00e9ster': u'p\u00e1ss .admin'}
+        access_key = u't\u00e9st:t\u00e9ster'
+        if six.PY2:
+            conf = {k.encode('utf8'): v.encode('utf8')
+                    for k, v in conf.items()}
+            access_key = access_key.encode('utf8')
+        local_auth = auth.filter_factory(conf)(local_app)
+        req = self._make_request('/v1/t\xc3\xa9st:t\xc3\xa9ster', environ={
+            's3api.auth_details': {
+                'access_key': access_key,
+                'signature': b64encode('sig'),
+                'string_to_sign': 't',
+                'check_signature': lambda secret: True}})
+        resp = req.get_response(local_auth)
+
+        self.assertEqual(resp.status_int, 404)
+        self.assertEqual(local_app.calls, 1)
+        self.assertEqual(req.environ['PATH_INFO'], '/v1/AUTH_t\xc3\xa9st')
         self.assertEqual(req.environ['swift.authorize'],
                          local_auth.authorize)
 

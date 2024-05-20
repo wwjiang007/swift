@@ -140,15 +140,17 @@ use = egg:swift#recon
 
 [filter:backend_ratelimit]
 use = egg:swift#backend_ratelimit
-# Set the maximum rate of requests per second per device per worker. Beyond
-# this rate the server will return 529 responses and emit a 'backend.ratelimit'
-# statsd metric without logging. The default value of zero causes no
-# rate-limiting to be applied.
-# requests_per_device_per_second = 0.0
-#
-# Set the number of seconds of unused rate-limiting allowance that can
-# accumulate and be used to allow a subsequent burst of requests.
-# requests_per_device_rate_buffer = 1.0
+# Config options can optionally be loaded from a separate config file. Config
+# options in this section will be used unless the same option is found in the
+# config file, in which case the config file option will be used. See the
+# backend-ratelimit.conf-sample file for details of available config options.
+# backend_ratelimit_conf_path = /etc/swift/backend-ratelimit.conf
+
+# The minimum interval between attempts to reload any config file at
+# backend_ratelimit_conf_path while the server is running. A value of 0 means
+# that the file is loaded at start-up but not subsequently reloaded. Note that
+# config options in this section are never reloaded after start-up.
+# config_reload_interval = 60
 
 [container-replicator]
 # You can override the default log routing for this app here (don't use set!):
@@ -512,6 +514,12 @@ use = egg:swift#xprofile
 # sharder will warn that a container DB has not completed sharding.
 # The default is 48 hours (48 x 60 x 60)
 # container_sharding_timeout = 172800
+#
+# Some sharder states lead to repeated messages of 'Reclaimable db stuck
+# waiting for shrinking' on every sharder cycle. To reduce noise in logs,
+# this message will be suppressed for some time after its last emission.
+# Default is 24 hours.
+# periodic_warnings_interval = 86400
 #
 # Large databases tend to take a while to work with, but we want to make sure
 # we write down our progress. Use a larger-than-normal broker timeout to make

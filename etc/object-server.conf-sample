@@ -148,6 +148,12 @@ use = egg:swift#object
 # 'keep_cache_private' is false.
 # keep_cache_slo_manifest = false
 #
+# cooperative_period defines how frequent object server GET request will
+# perform the cooperative yielding during iterating the disk chunks. For
+# example, value of '5' will insert one sleep() after every 5 disk_chunk_size
+# chunk reads. A value of '0' (the default) will turn off cooperative yielding.
+# cooperative_period = 0
+#
 # on PUTs, sync data every n MB
 # mb_per_sync = 512
 #
@@ -244,15 +250,17 @@ use = egg:swift#recon
 
 [filter:backend_ratelimit]
 use = egg:swift#backend_ratelimit
-# Set the maximum rate of requests per second per device per worker. Beyond
-# this rate the server will return 529 responses and emit a 'backend.ratelimit'
-# statsd metric without logging. The default value of zero causes no
-# rate-limiting to be applied.
-# requests_per_device_per_second = 0.0
-#
-# Set the number of seconds of unused rate-limiting allowance that can
-# accumulate and be used to allow a subsequent burst of requests.
-# requests_per_device_rate_buffer = 1.0
+# Config options can optionally be loaded from a separate config file. Config
+# options in this section will be used unless the same option is found in the
+# config file, in which case the config file option will be used. See the
+# backend-ratelimit.conf-sample file for details of available config options.
+# backend_ratelimit_conf_path = /etc/swift/backend-ratelimit.conf
+
+# The minimum interval between attempts to reload any config file at
+# backend_ratelimit_conf_path while the server is running. A value of 0 means
+# that the file is loaded at start-up but not subsequently reloaded. Note that
+# config options in this section are never reloaded after start-up.
+# config_reload_interval = 60
 
 [object-replicator]
 # You can override the default log routing for this app here (don't use set!):
@@ -686,10 +694,32 @@ use = egg:swift#backend_ratelimit
 # ionice_class =
 # ionice_priority =
 #
-# Note: Put it at the beginning of the pipleline to profile all middleware. But
-# it is safer to put this after healthcheck.
+# The expirer can delay the reaping of expired objects on disk (and in
+# container listings) with an account level or container level delay_reaping
+# time.
+# After the delay_reaping time has passed objects will be reaped as normal.
+# You may configure this delay_reaping value in seconds with dynamic config
+# option names prefixed with delay_reaping_<ACCT> for account level delays
+# and delay_reaping_<ACCT>/<CNTR> for container level delays.
+# Special characters in <ACCT> or <CNTR> should be quoted.
+# The delay_reaping value should be a float value greater than or equal to
+# zero.
+# A container level delay_reaping does not require an account level
+# delay_reaping but overrides the account level delay_reaping for the same
+# account if it exists.
+# For example:
+# delay_reaping_AUTH_test = 300.0
+# delay_reaping_AUTH_test2 = 86400.0
+# delay_reaping_AUTH_test/test = 400.0
+# delay_reaping_AUTH_test/test2 = 600.0
+# delay_reaping_AUTH_test/special%0Achars%3Dshould%20be%20quoted
+# N.B. By default no delay_reaping value is configured for any accounts or
+# containers.
+
 [filter:xprofile]
 use = egg:swift#xprofile
+# Note: Put it at the beginning of the pipleline to profile all middleware. But
+# it is safer to put this after healthcheck.
 # This option enable you to switch profilers which should inherit from python
 # standard profiler. Currently the supported value can be 'cProfile',
 # 'eventlet.green.profile' etc.

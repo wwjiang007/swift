@@ -48,12 +48,13 @@ import six
 import six.moves.cPickle as pickle
 from six.moves import range
 from six.moves.http_client import HTTPException
+from six.moves import configparser
 
 from swift.common import storage_policy, swob, utils, exceptions
 from swift.common.memcached import MemcacheConnectionError
 from swift.common.storage_policy import (StoragePolicy, ECStoragePolicy,
                                          VALID_EC_TYPES)
-from swift.common.utils import Timestamp, md5
+from swift.common.utils import Timestamp, md5, close_if_possible
 from test import get_config
 from test.debug_logger import FakeLogger
 from swift.common.header_key_dict import HeaderKeyDict
@@ -410,6 +411,7 @@ class FakeMemcache(object):
 
     def __init__(self, error_on_set=None, error_on_get=None):
         self.store = {}
+        self.times = {}
         self.calls = []
         self.error_on_incr = False
         self.error_on_get = error_on_get or []
@@ -440,6 +442,7 @@ class FakeMemcache(object):
         else:
             assert isinstance(value, (str, bytes))
         self.store[key] = value
+        self.times[key] = time
         return True
 
     @track
@@ -463,12 +466,14 @@ class FakeMemcache(object):
     def delete(self, key):
         try:
             del self.store[key]
+            del self.times[key]
         except Exception:
             pass
         return True
 
     def delete_all(self):
         self.store.clear()
+        self.times.clear()
 
 
 # This decorator only makes sense in the context of FakeMemcache;
@@ -1444,7 +1449,7 @@ class ConfigAssertMixin(object):
 
     def assertDuplicateOptionError(self, app_config, option_name):
         with self.assertRaises(
-                utils.configparser.DuplicateOptionError) as ctx:
+                configparser.DuplicateOptionError) as ctx:
             app_config()
         msg = str(ctx.exception)
         self.assertIn(option_name, msg)
@@ -1493,3 +1498,99 @@ class FakeSource(object):
     def getheaders(self):
         return [('content-length', self.getheader('content-length'))] + \
                [(k, v) for k, v in self.headers.items()]
+
+
+class CaptureIterator(object):
+    """
+    Wraps an iterable, forwarding all calls to the wrapped iterable but
+    capturing the calls via a callback.
+
+    This class may be used to observe garbage collection, so tests should not
+    have to hold a reference to instances of this class because that would
+    prevent them being garbage collected. Calls are therefore captured via a
+    callback rather than being stashed locally.
+
+    :param wrapped: an iterable to wrap.
+    :param call_capture_callback: a function that will be called to capture
+        calls to this iterator.
+    """
+    def __init__(self, wrapped, call_capture_callback):
+        self.call_capture_callback = call_capture_callback
+        self.wrapped_iter = wrapped
+
+    def _capture_call(self):
+        # call home to capture the call
+        self.call_capture_callback(inspect.stack()[1][3])
+
+    def __iter__(self):
+        return self
+
+    def next(self):
+        self._capture_call()
+        return next(self.wrapped_iter)
+
+    __next__ = next
+
+    def __del__(self):
+        self._capture_call()
+
+    def close(self):
+        self._capture_call()
+        close_if_possible(self.wrapped_iter)
+
+
+class CaptureIteratorFactory(object):
+    """
+    Create instances of ``CaptureIterator`` to wrap a given iterable, and
+    provides a callback function for the ``CaptureIterator`` to capture its
+    calls.
+
+    :param wrapped: an iterable to wrap.
+    """
+    def __init__(self, wrapped):
+        self.wrapped = wrapped
+        self.instance_count = 0
+        self.captured_calls = defaultdict(list)
+
+    def log_call(self, instance_number, call):
+        self.captured_calls[instance_number].append(call)
+
+    def __call__(self, *args, **kwargs):
+        # note: do not keep a reference to the CaptureIterator because that
+        # would prevent it being garbage collected
+        self.instance_count += 1
+        return CaptureIterator(
+            self.wrapped(*args, **kwargs),
+            functools.partial(self.log_call, self.instance_count))
+
+
+def get_node_error_stats(proxy_app, ring_node):
+    node_key = proxy_app.error_limiter.node_key(ring_node)
+    return proxy_app.error_limiter.stats.get(node_key) or {}
+
+
+def node_error_count(proxy_app, ring_node):
+    # Reach into the proxy's internals to get the error count for a
+    # particular node
+    return get_node_error_stats(proxy_app, ring_node).get('errors', 0)
+
+
+def node_error_counts(proxy_app, ring_nodes):
+    # Reach into the proxy's internals to get the error counts for a
+    # list of nodes
+    return sorted([get_node_error_stats(proxy_app, node).get('errors', 0)
+                   for node in ring_nodes], reverse=True)
+
+
+def node_last_error(proxy_app, ring_node):
+    # Reach into the proxy's internals to get the last error for a
+    # particular node
+    return get_node_error_stats(proxy_app, ring_node).get('last_error')
+
+
+def set_node_errors(proxy_app, ring_node, value, last_error):
+    # Set the node's error count to value
+    node_key = proxy_app.error_limiter.node_key(ring_node)
+    stats = {'errors': value,
+             'last_error': last_error}
+    proxy_app.error_limiter.stats[node_key] = stats

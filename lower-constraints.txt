@@ -34,9 +34,9 @@ Jinja2==2.10
 keystoneauth1==3.4.0
 keystonemiddleware==4.17.0
 linecache2==1.0.0
-lxml==3.4.1
+lxml==4.2.3
 MarkupSafe==1.0
-mock==2.0
+mock==3.0
 monotonic==1.4
 msgpack==0.5.6
 netaddr==0.7.19
@@ -79,3 +79,4 @@ voluptuous==0.11.1
 wrapt==1.10.11
 xattr==0.4
 pycadf===2.10.0
+python-dateutil===2.4.2

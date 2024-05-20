@@ -33,14 +33,14 @@ from swift.common.middleware.s3api.utils import Config
 from swift.common.middleware.keystoneauth import KeystoneAuth
 from swift.common import swob, registry
 from swift.common.swob import Request
-from swift.common.utils import md5, get_logger
+from swift.common.utils import md5, get_logger, UTC
 
 from keystonemiddleware.auth_token import AuthProtocol
 from keystoneauth1.access import AccessInfoV2
 
 from test.debug_logger import debug_logger, FakeStatsdClient
 from test.unit.common.middleware.s3api import S3ApiTestCase
-from test.unit.common.middleware.s3api.helpers import FakeSwift
+from test.unit.common.middleware.helpers import FakeSwift
 from test.unit.common.middleware.s3api.test_s3token import \
     GOOD_RESPONSE_V2, GOOD_RESPONSE_V3
 from swift.common.middleware.s3api.s3request import SigV4Request, S3Request
@@ -223,9 +223,11 @@ class TestS3ApiMiddleware(S3ApiTestCase):
         self.assertEqual('s3api', s3api.logger.logger.name)
         self.assertIsNot(s3api.logger.logger, proxy_logger)
         self.assertEqual('swift', s3api.logger.server)
-        self.assertIsNone(s3api.logger.logger.statsd_client)
+        # there's a stats client, but with no host, it can't send anything
+        self.assertIsNone(s3api.logger.logger.statsd_client._host)
 
-        with mock.patch('swift.common.utils.StatsdClient', FakeStatsdClient):
+        with mock.patch('swift.common.statsd_client.StatsdClient',
+                        FakeStatsdClient):
             s3api = S3ApiMiddleware(None, {'log_name': 'proxy-server',
                                            'log_statsd_host': '1.2.3.4'})
             s3api.logger.increment('test-metric')
@@ -403,7 +405,7 @@ class TestS3ApiMiddleware(S3ApiTestCase):
                             'AWSAccessKeyId=test:tester' % expire,
                             environ={'REQUEST_METHOD': 'GET'},
                             headers={'Date': self.get_date_header()})
-        req.headers['Date'] = datetime.utcnow()
+        req.headers['Date'] = datetime.now(UTC)
         req.content_type = 'text/plain'
         status, headers, body = self.call_s3api(req)
         self.assertEqual(self._get_error_code(body), 'AccessDenied')
@@ -415,7 +417,7 @@ class TestS3ApiMiddleware(S3ApiTestCase):
         # Set expire to last 32b timestamp value
         # This number can't be higher, because it breaks tests on 32b systems
         expire = '2147483647'  # 19 Jan 2038 03:14:07
-        utc_date = datetime.utcnow()
+        utc_date = datetime.now(UTC)
         req = Request.blank('/bucket/object?Signature=X&Expires=%s&'
                             'AWSAccessKeyId=test:tester&Timestamp=%s' %
                             (expire, utc_date.isoformat().rsplit('.')[0]),
@@ -452,7 +454,7 @@ class TestS3ApiMiddleware(S3ApiTestCase):
                             'AWSAccessKeyId=test:tester' % expire,
                             environ={'REQUEST_METHOD': 'GET'},
                             headers={'Date': self.get_date_header()})
-        req.headers['Date'] = datetime.utcnow()
+        req.headers['Date'] = datetime.now(UTC)
         req.content_type = 'text/plain'
         status, headers, body = self.call_s3api(req)
         self.assertEqual(self._get_error_code(body), 'AccessDenied')
@@ -466,7 +468,7 @@ class TestS3ApiMiddleware(S3ApiTestCase):
                             'AWSAccessKeyId=test:tester' % expire,
                             environ={'REQUEST_METHOD': 'GET'},
                             headers={'Date': self.get_date_header()})
-        req.headers['Date'] = datetime.utcnow()
+        req.headers['Date'] = datetime.now(UTC)
         req.content_type = 'text/plain'
         status, headers, body = self.call_s3api(req)
         self.assertEqual(self._get_error_code(body), 'AccessDenied')
@@ -479,7 +481,7 @@ class TestS3ApiMiddleware(S3ApiTestCase):
         req = Request.blank('/bucket/object?Expires=%s&'
                             'AWSAccessKeyId=' % expire,
                             environ={'REQUEST_METHOD': 'GET'})
-        req.headers['Date'] = datetime.utcnow()
+        req.headers['Date'] = datetime.now(UTC)
         req.content_type = 'text/plain'
         status, headers, body = self.call_s3api(req)
         self.assertEqual(self._get_error_code(body), 'AccessDenied')
@@ -1575,8 +1577,6 @@ class TestS3ApiMiddleware(S3ApiTestCase):
         # after PUT container so we need to register the resposne here
         self.swift.register('POST', '/v1/AUTH_TENANT_ID/bucket',
                             swob.HTTPNoContent, {}, None)
-        self.swift.register('TEST', '/v1/AUTH_TENANT_ID',
-                            swob.HTTPMethodNotAllowed, {}, None)
         with patch.object(self.s3_token, '_json_request') as mock_req:
             mock_resp = requests.Response()
             mock_resp._content = json.dumps(GOOD_RESPONSE_V2).encode('ascii')

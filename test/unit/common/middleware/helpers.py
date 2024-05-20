@@ -22,7 +22,8 @@ from swift.common.header_key_dict import HeaderKeyDict
 from swift.common.request_helpers import is_user_meta, \
     is_object_transient_sysmeta, resolve_etag_is_at_header, \
     resolve_ignore_range_header
-from swift.common.swob import HTTPNotImplemented
+from swift.common.storage_policy import POLICIES
+from swift.common.swob import HTTPMethodNotAllowed
 from swift.common.utils import split_path, md5
 
 from test.debug_logger import debug_logger
@@ -63,6 +64,7 @@ def normalize_query_string(qs):
     if not qs:
         return ''
     else:
+        # N.B. sort params so app.call asserts can hard code qs
         return '?%s' % parse.urlencode(sorted(parse.parse_qsl(qs)))
 
 
@@ -134,6 +136,7 @@ class FakeSwift(object):
         self.uploaded = {}
         # mapping of (method, path) --> (response class, headers, body)
         self._responses = {}
+        self._sticky_headers = {}
         self.logger = debug_logger('fake-swift')
         self.account_ring = FakeRing()
         self.container_ring = FakeRing()
@@ -149,19 +152,18 @@ class FakeSwift(object):
 
     def _find_response(self, method, path):
         path = normalize_path(path)
-        resp = self._responses[(method, path)]
-        if isinstance(resp, list):
-            try:
-                resp = resp.pop(0)
-            except IndexError:
-                raise IndexError("Didn't find any more %r "
-                                 "in allowed responses" % (
-                                     (method, path),))
-        return resp
+        resps = self._responses[(method, path)]
+        if len(resps) == 1:
+            # we'll return the last registered response forever
+            return resps[0]
+        else:
+            return resps.pop(0)
 
-    def _select_response(self, env, method, path):
+    def _select_response(self, env):
         # in some cases we can borrow different registered response
         # ... the order is brittle and significant
+        method = env['REQUEST_METHOD']
+        path = self._parse_path(env)[0]
         preferences = [(method, path)]
         if env.get('QUERY_STRING'):
             # we can always reuse response w/o query string
@@ -191,19 +193,51 @@ class FakeSwift(object):
             # HEAD resp never has body
             body = None
 
-        return resp_class, HeaderKeyDict(headers), body
+        try:
+            is_success = resp_class().is_success
+        except Exception:
+            # test_reconciler passes in an exploding response
+            is_success = False
+        if is_success and method in ('GET', 'HEAD'):
+            # update sticky resp headers with headers from registered resp
+            sticky_headers = self._sticky_headers.get(env['PATH_INFO'], {})
+            resp_headers = HeaderKeyDict(sticky_headers)
+            resp_headers.update(headers)
+        else:
+            # error responses don't get sticky resp headers
+            resp_headers = HeaderKeyDict(headers)
 
-    def __call__(self, env, start_response):
-        method = env['REQUEST_METHOD']
-        if method not in self.ALLOWED_METHODS:
-            raise HTTPNotImplemented()
+        return resp_class, resp_headers, body
 
+    def _get_policy_index(self, acc, cont):
+        path = '/v1/%s/%s' % (acc, cont)
+        env = {'PATH_INFO': path,
+               'REQUEST_METHOD': 'HEAD'}
+        try:
+            resp_class, headers, _ = self._select_response(env)
+            policy_index = headers.get('X-Backend-Storage-Policy-Index')
+        except KeyError:
+            policy_index = None
+        if policy_index is None:
+            policy_index = str(int(POLICIES.default))
+        return policy_index
+
+    def _parse_path(self, env):
         path = env['PATH_INFO']
+
         _, acc, cont, obj = split_path(env['PATH_INFO'], 0, 4,
                                        rest_with_last=True)
         if env.get('QUERY_STRING'):
             path += '?' + env['QUERY_STRING']
         path = normalize_path(path)
+        return path, acc, cont, obj
+
+    def __call__(self, env, start_response):
+        method = env['REQUEST_METHOD']
+        if method not in self.ALLOWED_METHODS:
+            return HTTPMethodNotAllowed()(env, start_response)
+
+        path, acc, cont, obj = self._parse_path(env)
 
         if 'swift.authorize' in env:
             resp = env['swift.authorize'](swob.Request(env))
@@ -214,12 +248,7 @@ class FakeSwift(object):
         self.swift_sources.append(env.get('swift.source'))
         self.txn_ids.append(env.get('swift.trans_id'))
 
-        resp_class, headers, body = self._select_response(env, method, path)
-
-        # Update req.headers before capturing the request
-        if method in ('GET', 'HEAD') and obj:
-            req.headers['X-Backend-Storage-Policy-Index'] = headers.get(
-                'x-backend-storage-policy-index', '2')
+        resp_class, headers, body = self._select_response(env)
 
         # Capture the request before reading the body, in case the iter raises
         # an exception.
@@ -269,6 +298,14 @@ class FakeSwift(object):
 
         self.req_bodies.append(req_body)
 
+        # Some middlewares (e.g. proxy_logging) inspect the request headers
+        # after it has been handled, so simulate some request headers updates
+        # that the real proxy makes. Do this *after* the request has been
+        # captured in the state it was received.
+        if obj:
+            req.headers.setdefault('X-Backend-Storage-Policy-Index',
+                                   self._get_policy_index(acc, cont))
+
         # Apply conditional etag overrides
         conditional_etag = resolve_etag_is_at_header(req, headers)
 
@@ -292,6 +329,9 @@ class FakeSwift(object):
         self.mark_opened((method, path))
         return LeakTrackingIter(wsgi_iter, self.mark_closed,
                                 self.mark_read, (method, path))
+
+    def clear_calls(self):
+        del self._calls[:]
 
     def mark_opened(self, key):
         self._unclosed_req_keys[key] += 1
@@ -331,13 +371,23 @@ class FakeSwift(object):
     def call_count(self):
         return len(self._calls)
 
+    def update_sticky_response_headers(self, path, headers):
+        """
+        Tests setUp can use this to ensure any successful GET/HEAD response for
+        a given path will include these headers.
+        """
+        sticky_headers = self._sticky_headers.setdefault(path, {})
+        sticky_headers.update(headers)
+
     def register(self, method, path, response_class, headers, body=b''):
         path = normalize_path(path)
-        self._responses[(method, path)] = (response_class, headers, body)
+        self._responses[(method, path)] = [(response_class, headers, body)]
 
-    def register_responses(self, method, path, responses):
-        path = normalize_path(path)
-        self._responses[(method, path)] = list(responses)
+    def register_next_response(self, method, path,
+                               response_class, headers, body=b''):
+        resp_key = (method, normalize_path(path))
+        next_resp = (response_class, headers, body)
+        self._responses.setdefault(resp_key, []).append(next_resp)
 
 
 class FakeAppThatExcepts(object):

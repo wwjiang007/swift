@@ -239,7 +239,6 @@ class TestInternalClient(unittest.TestCase):
 
         [app:proxy-server]
         use = egg:swift#proxy
-        auto_create_account_prefix = -
 
         [filter:cache]
         use = egg:swift#memcache
@@ -261,11 +260,6 @@ class TestInternalClient(unittest.TestCase):
             with mock.patch('swift.proxy.server.get_logger',
                             lambda *a, **kw: logger):
                 client = internal_client.InternalClient(conf_path, 'test', 1)
-            self.assertEqual(logger.get_lines_for_level('warning'), [
-                'Option auto_create_account_prefix is deprecated. '
-                'Configure auto_create_account_prefix under the '
-                'swift-constraints section of swift.conf. This option will '
-                'be ignored in a future release.'])
             self.assertEqual(client.account_ring,
                              client.app.app.app.account_ring)
             self.assertEqual(client.account_ring.serialized_path,
@@ -279,7 +273,6 @@ class TestInternalClient(unittest.TestCase):
                              object_ring)
             self.assertEqual(object_ring.serialized_path,
                              object_ring_path)
-            self.assertEqual(client.auto_create_account_prefix, '-')
 
     @mock.patch('swift.common.utils.HASH_PATH_SUFFIX', new=b'endcap')
     @with_tempdir
@@ -303,7 +296,6 @@ class TestInternalClient(unittest.TestCase):
 
         [app:proxy-server]
         use = egg:swift#proxy
-        auto_create_account_prefix = -
 
         [filter:cache]
         use = egg:swift#memcache
@@ -332,7 +324,6 @@ class TestInternalClient(unittest.TestCase):
 
         [app:proxy-server]
         use = egg:swift#proxy
-        auto_create_account_prefix = -
 
         [filter:cache]
         use = egg:swift#memcache
@@ -361,7 +352,6 @@ class TestInternalClient(unittest.TestCase):
 
         [app:proxy-server]
         use = egg:swift#proxy
-        auto_create_account_prefix = -
 
         [filter:cache]
         use = egg:swift#memcache
@@ -385,8 +375,8 @@ class TestInternalClient(unittest.TestCase):
         user_agent = 'some_user_agent'
         request_tries = 123
 
-        with mock.patch.object(
-                internal_client, 'loadapp', return_value=app) as mock_loadapp,\
+        with mock.patch.object(internal_client, 'loadapp',
+                               return_value=app) as mock_loadapp, \
                 self.assertRaises(ValueError):
             # First try with a bad arg
             internal_client.InternalClient(
@@ -442,8 +432,8 @@ class TestInternalClient(unittest.TestCase):
         app = FakeSwift()
         user_agent = 'some_user_agent'
 
-        with mock.patch.object(
-                internal_client, 'loadapp', return_value=app) as mock_loadapp,\
+        with mock.patch.object(internal_client, 'loadapp',
+                               return_value=app) as mock_loadapp, \
                 self.assertRaises(ValueError) as cm:
             internal_client.InternalClient(
                 conf_path, user_agent, 1, allow_modify_pipeline=True)
@@ -785,7 +775,8 @@ class TestInternalClient(unittest.TestCase):
             client = internal_client.InternalClient(
                 None, "some_agent", 3, use_replication_network=False,
                 app=fake_app)
-            with self.assertRaises(internal_client.UnexpectedResponse) as ctx,\
+            expected_error = internal_client.UnexpectedResponse
+            with self.assertRaises(expected_error) as ctx, \
                     mock.patch('swift.common.internal_client.sleep'):
                 # This is obvious strange tests to expect only 400 Bad Request
                 # but this test intended to avoid extra body drain if it's
@@ -1602,9 +1593,8 @@ class TestInternalClient(unittest.TestCase):
         self.assertEqual(app.call_count, 1)
         req_headers.update({
             'host': 'localhost:80',  # from swob.Request.blank
+            'user-agent': 'test',  # from IC
             'x-backend-allow-reserved-names': 'true',  # also from IC
-            'x-backend-storage-policy-index': '2',  # from proxy-server app
-            'user-agent': 'test',
         })
         self.assertEqual(app.calls_with_headers, [(
             'GET', path_info + '?symlink=get', HeaderKeyDict(req_headers))])
@@ -2046,7 +2036,7 @@ class TestSimpleClient(unittest.TestCase):
                 self.assertEqual(1, len(args))
                 self.assertEqual(1, len(kwargs))
                 self.assertEqual(0.1, kwargs['timeout'])
-                self.assertTrue(isinstance(args[0], urllib2.Request))
+                self.assertIsInstance(args[0], urllib2.Request)
                 self.assertEqual(proxy_host, args[0].host)
                 if six.PY2:
                     self.assertEqual(scheme, args[0].type)
@@ -2071,7 +2061,7 @@ class TestSimpleClient(unittest.TestCase):
                 self.assertEqual(1, len(args))
                 self.assertEqual(1, len(kwargs))
                 self.assertEqual(0.1, kwargs['timeout'])
-                self.assertTrue(isinstance(args[0], urllib2.Request))
+                self.assertIsInstance(args[0], urllib2.Request)
                 self.assertEqual(proxy_host, args[0].host)
                 if six.PY2:
                     self.assertEqual(scheme, args[0].type)

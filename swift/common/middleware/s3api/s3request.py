@@ -26,7 +26,7 @@ from six.moves.urllib.parse import quote, unquote, parse_qsl
 import string
 
 from swift.common.utils import split_path, json, close_if_possible, md5, \
-    streq_const_time
+    streq_const_time, get_policy_index
 from swift.common.registry import get_swift_info
 from swift.common import swob
 from swift.common.http import HTTP_OK, HTTP_CREATED, HTTP_ACCEPTED, \
@@ -47,7 +47,7 @@ from swift.common.middleware.s3api.controllers import ServiceController, \
     LocationController, LoggingStatusController, PartController, \
     UploadController, UploadsController, VersioningController, \
     UnsupportedController, S3AclController, BucketController, \
-    TaggingController
+    TaggingController, ObjectLockController
 from swift.common.middleware.s3api.s3response import AccessDenied, \
     InvalidArgument, InvalidDigest, BucketAlreadyOwnedByYou, \
     RequestTimeTooSkewed, S3Response, SignatureDoesNotMatch, \
@@ -56,7 +56,8 @@ from swift.common.middleware.s3api.s3response import AccessDenied, \
     MissingContentLength, InvalidStorageClass, S3NotImplemented, InvalidURI, \
     MalformedXML, InvalidRequest, RequestTimeout, InvalidBucketName, \
     BadDigest, AuthorizationHeaderMalformed, SlowDown, \
-    AuthorizationQueryParametersError, ServiceUnavailable, BrokenMPU
+    AuthorizationQueryParametersError, ServiceUnavailable, BrokenMPU, \
+    InvalidPartNumber, InvalidPartArgument
 from swift.common.middleware.s3api.exception import NotS3Request
 from swift.common.middleware.s3api.utils import utf8encode, \
     S3Timestamp, mktime, MULTIUPLOAD_SUFFIX
@@ -74,7 +75,8 @@ ALLOWED_SUB_RESOURCES = sorted([
     'versionId', 'versioning', 'versions', 'website',
     'response-cache-control', 'response-content-disposition',
     'response-content-encoding', 'response-content-language',
-    'response-content-type', 'response-expires', 'cors', 'tagging', 'restore'
+    'response-content-type', 'response-expires', 'cors', 'tagging', 'restore',
+    'object-lock'
 ])
 
 
@@ -103,6 +105,7 @@ def _header_acl_property(resource):
     """
     Set and retrieve the acl in self.headers
     """
+
     def getter(self):
         return getattr(self, '_%s' % resource)
 
@@ -117,10 +120,22 @@ def _header_acl_property(resource):
                     doc='Get and set the %s acl property' % resource)
 
 
+class S3InputSHA256Mismatch(BaseException):
+    """
+    Client provided a X-Amz-Content-SHA256, but it doesn't match the data.
+
+    Inherit from BaseException (rather than Exception) so it cuts from the
+    proxy-server app (which will presumably be the one reading the input)
+    through all the layers of the pipeline back to us. It should never escape
+    the s3api middleware.
+    """
+
+
 class HashingInput(object):
     """
     wsgi.input wrapper to verify the hash of the input as it's read.
     """
+
     def __init__(self, reader, content_length, hasher, expected_hex_hash):
         self._input = reader
         self._to_read = content_length
@@ -137,7 +152,7 @@ class HashingInput(object):
                 self._hasher.hexdigest() != self._expected):
             self.close()
             # Since we don't return the last chunk, the PUT never completes
-            raise swob.HTTPUnprocessableEntity(
+            raise S3InputSHA256Mismatch(
                 'The X-Amz-Content-SHA56 you specified did not match '
                 'what we received.')
         return chunk
@@ -549,10 +564,62 @@ class S3Request(swob.Request):
         }
         self.account = None
         self.user_id = None
+        self.policy_index = None
 
         # Avoids that swift.swob.Response replaces Location header value
         # by full URL when absolute path given. See swift.swob for more detail.
         self.environ['swift.leave_relative_location'] = True
+
+    def validate_part_number(self, parts_count=None, check_max=True):
+        """
+        Get the partNumber param, if it exists, and check it is valid.
+
+        To be valid, a partNumber must satisfy two criteria. First, it must be
+        an integer between 1 and the maximum allowed parts, inclusive. The
+        maximum allowed parts is the maximum of the configured
+        ``max_upload_part_num`` and, if given, ``parts_count``. Second, the
+        partNumber must be less than or equal to the ``parts_count``, if it is
+        given.
+
+        :param parts_count: if given, this is the number of parts in an
+            existing object.
+        :raises InvalidPartArgument: if the partNumber param is invalid i.e.
+            less than 1 or greater than the maximum allowed parts.
+        :raises InvalidPartNumber: if the partNumber param is valid but greater
+            than ``num_parts``.
+        :return: an integer part number if the partNumber param exists,
+            otherwise ``None``.
+        """
+        part_number = self.params.get('partNumber')
+        if part_number is None:
+            return None
+
+        if self.range:
+            raise InvalidRequest('Cannot specify both Range header and '
+                                 'partNumber query parameter')
+
+        try:
+            parts_count = int(parts_count)
+        except (TypeError, ValueError):
+            # an invalid/empty param is treated like parts_count=max_parts
+            parts_count = self.conf.max_upload_part_num
+        # max_parts may be raised to the number of existing parts
+        max_parts = max(self.conf.max_upload_part_num, parts_count)
+
+        try:
+            part_number = int(part_number)
+            if part_number < 1:
+                raise ValueError
+        except ValueError:
+            raise InvalidPartArgument(max_parts, part_number)  # 400
+
+        if check_max:
+            if part_number > max_parts:
+                raise InvalidPartArgument(max_parts, part_number)  # 400
+            if part_number > parts_count:
+                raise InvalidPartNumber()  # 416
+
+        return part_number
 
     def check_signature(self, secret):
         secret = utf8encode(secret)
@@ -854,13 +921,8 @@ class S3Request(swob.Request):
             # Limit the read similar to how SLO handles manifests
             try:
                 body = self.body_file.read(max_length)
-            except swob.HTTPException as err:
-                if err.status_int == HTTP_UNPROCESSABLE_ENTITY:
-                    # Special case for HashingInput check
-                    raise BadDigest(
-                        'The X-Amz-Content-SHA56 you specified did not '
-                        'match what we received.')
-                raise
+            except S3InputSHA256Mismatch as err:
+                raise BadDigest(err.args[0])
         else:
             # No (or zero) Content-Length provided, and not chunked transfer;
             # no body. Assume zero-length, and enforce a required body below.
@@ -919,8 +981,6 @@ class S3Request(swob.Request):
         src_resp = self.get_response(app, 'HEAD', src_bucket,
                                      swob.str_to_wsgi(src_obj),
                                      headers=headers, query=query)
-        # we can't let this HEAD req spoil our COPY
-        self.headers.pop('x-backend-storage-policy-index')
         if src_resp.status_int == 304:  # pylint: disable-msg=E1101
             raise PreconditionFailed()
 
@@ -1042,7 +1102,10 @@ class S3Request(swob.Request):
         if 'logging' in self.params:
             return LoggingStatusController
         if 'partNumber' in self.params:
-            return PartController
+            if self.method == 'PUT':
+                return PartController
+            else:
+                return ObjectController
         if 'uploadId' in self.params:
             return UploadController
         if 'uploads' in self.params:
@@ -1051,6 +1114,8 @@ class S3Request(swob.Request):
             return VersioningController
         if 'tagging' in self.params:
             return TaggingController
+        if 'object-lock' in self.params:
+            return ObjectLockController
 
         unsupported = ('notification', 'policy', 'requestPayment', 'torrent',
                        'website', 'cors', 'restore')
@@ -1083,7 +1148,7 @@ class S3Request(swob.Request):
         Create a Swift request based on this request's environment.
         """
         if self.account is None:
-            account = self.access_key
+            account = swob.str_to_wsgi(self.access_key)
         else:
             account = self.account
 
@@ -1311,7 +1376,6 @@ class S3Request(swob.Request):
                 'GET': {
                     HTTP_NOT_FOUND: not_found_handler,
                     HTTP_PRECONDITION_FAILED: PreconditionFailed,
-                    HTTP_REQUESTED_RANGE_NOT_SATISFIABLE: InvalidRange,
                 },
                 'PUT': {
                     HTTP_NOT_FOUND: (NoSuchBucket, container),
@@ -1352,24 +1416,22 @@ class S3Request(swob.Request):
 
         try:
             sw_resp = sw_req.get_response(app)
-        except swob.HTTPException as err:
-            # Maybe a 422 from HashingInput? Put something in
-            # s3api.backend_path - hopefully by now any modifications to the
-            # path (e.g. tenant to account translation) will have been made by
-            # auth middleware
+        except S3InputSHA256Mismatch as err:
+            # hopefully by now any modifications to the path (e.g. tenant to
+            # account translation) will have been made by auth middleware
             self.environ['s3api.backend_path'] = sw_req.environ['PATH_INFO']
-            sw_resp = err
+            raise BadDigest(err.args[0])
         else:
             # reuse account
             _, self.account, _ = split_path(sw_resp.environ['PATH_INFO'],
                                             2, 3, True)
             # Update s3.backend_path from the response environ
             self.environ['s3api.backend_path'] = sw_resp.environ['PATH_INFO']
-            # Propogate backend headers back into our req headers for logging
-            for k, v in sw_req.headers.items():
-                if k.lower().startswith('x-backend-'):
-                    self.headers.setdefault(k, v)
 
+        # keep a record of the backend policy index so that the s3api can add
+        # it to the headers of whatever response it returns, which may not
+        # necessarily be this resp.
+        self.policy_index = get_policy_index(sw_req.headers, sw_resp.headers)
         resp = S3Response.from_swift_resp(sw_resp)
         status = resp.status_int  # pylint: disable-msg=E1101
 
@@ -1410,7 +1472,7 @@ class S3Request(swob.Request):
                 raise InvalidArgument('X-Delete-At',
                                       self.headers['X-Delete-At'],
                                       err_str)
-            if 'X-Delete-After' in err_msg.decode('utf8'):
+            if 'X-Delete-After' in err_str:
                 raise InvalidArgument('X-Delete-After',
                                       self.headers['X-Delete-After'],
                                       err_str)
@@ -1421,6 +1483,10 @@ class S3Request(swob.Request):
                 **self.signature_does_not_match_kwargs())
         if status == HTTP_FORBIDDEN:
             raise AccessDenied(reason='forbidden')
+        if status == HTTP_REQUESTED_RANGE_NOT_SATISFIABLE:
+            self.validate_part_number(
+                parts_count=resp.headers.get('x-amz-mp-parts-count'))
+            raise InvalidRange()
         if status == HTTP_SERVICE_UNAVAILABLE:
             raise ServiceUnavailable()
         if status in (HTTP_RATE_LIMITED, HTTP_TOO_MANY_REQUESTS):
@@ -1428,8 +1494,10 @@ class S3Request(swob.Request):
                 raise SlowDown(status='429 Slow Down')
             raise SlowDown()
         if resp.status_int == HTTP_CONFLICT:
-            # TODO: validate that this actually came up out of SLO
-            raise BrokenMPU()
+            if self.method == 'GET':
+                raise BrokenMPU()
+            else:
+                raise ServiceUnavailable()
 
         raise InternalError('unexpected status code %d' % status)
 
@@ -1536,6 +1604,7 @@ class S3AclRequest(S3Request):
     """
     S3Acl request object.
     """
+
     def __init__(self, env, app=None, conf=None):
         super(S3AclRequest, self).__init__(env, app, conf)
         self.authenticate(app)

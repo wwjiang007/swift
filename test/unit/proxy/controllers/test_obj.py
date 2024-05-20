@@ -20,6 +20,7 @@ import math
 import random
 import time
 import unittest
+import argparse
 from collections import defaultdict
 from contextlib import contextmanager
 import json
@@ -40,8 +41,9 @@ else:
 import swift
 from swift.common import utils, swob, exceptions
 from swift.common.exceptions import ChunkWriteTimeout, ShortReadError, \
-    ChunkReadTimeout
-from swift.common.utils import Timestamp, list_from_csv, md5, FileLikeIter
+    ChunkReadTimeout, RangeAlreadyComplete
+from swift.common.utils import Timestamp, list_from_csv, md5, FileLikeIter, \
+    ShardRange, Namespace, NamespaceBoundList
 from swift.proxy import server as proxy_server
 from swift.proxy.controllers import obj
 from swift.proxy.controllers.base import \
@@ -49,14 +51,14 @@ from swift.proxy.controllers.base import \
     NodeIter
 from swift.common.storage_policy import POLICIES, ECDriverError, \
     StoragePolicy, ECStoragePolicy
-from swift.common.swob import Request
+from swift.common.swob import Request, wsgi_to_str
 from test.debug_logger import debug_logger
 from test.unit import (
     FakeRing, fake_http_connect, patch_policies, SlowBody, FakeStatus,
     DEFAULT_TEST_EC_TYPE, encode_frag_archive_bodies, make_ec_object_stub,
     fake_ec_node_response, StubResponse, mocked_http_conn,
-    quiet_eventlet_exceptions, FakeSource)
-from test.unit.proxy.test_server import node_error_count
+    quiet_eventlet_exceptions, FakeSource, make_timestamp_iter, FakeMemcache,
+    node_error_count, node_error_counts)
 
 
 def unchunk_body(chunked_body):
@@ -211,6 +213,21 @@ class BaseObjectControllerMixin(object):
 
 class CommonObjectControllerMixin(BaseObjectControllerMixin):
     # defines tests that are common to all storage policy types
+
+    def test_GET_all_primaries_error_limited(self):
+        req = swift.common.swob.Request.blank('/v1/a/c/o')
+        obj_ring = self.app.get_object_ring(int(self.policy))
+        _part, primary_nodes = obj_ring.get_nodes('a', 'c', 'o')
+        for dev in primary_nodes:
+            self.app.error_limiter.limit(dev)
+
+        num_handoff = (
+            2 * self.policy.object_ring.replica_count) - len(primary_nodes)
+        codes = [404] * num_handoff
+        with mocked_http_conn(*codes):
+            resp = req.get_response(self.app)
+        self.assertEqual(resp.status_int, 503)
+
     def test_iter_nodes_local_first_noops_when_no_affinity(self):
         # this test needs a stable node order - most don't
         self.app.sort_nodes = lambda l, *args, **kwargs: l
@@ -432,6 +449,67 @@ class CommonObjectControllerMixin(BaseObjectControllerMixin):
         with set_http_connect(*codes):
             resp = req.get_response(self.app)
         self.assertEqual(resp.status_int, 204)
+
+    def test_object_DELETE_backend_update_container_ip_default(self):
+        self.policy.object_ring = FakeRing(separate_replication=True)
+        self.app.container_ring = FakeRing(separate_replication=True)
+        # sanity, devs have different ip & replication_ip
+        for ring in (self.policy.object_ring, self.app.container_ring):
+            for dev in ring.devs:
+                self.assertNotEqual(dev['ip'], dev['replication_ip'])
+        req = swift.common.swob.Request.blank('/v1/a/c/o', method='DELETE')
+        codes = [204] * self.replicas()
+        with mocked_http_conn(*codes) as log:
+            resp = req.get_response(self.app)
+        self.assertEqual(resp.status_int, 204)
+
+        # sanity, object hosts use node ip/port
+        object_hosts = {'%(ip)s:%(port)s' % req for req in log.requests}
+        object_ring = self.app.get_object_ring(int(self.policy))
+        part, object_nodes = object_ring.get_nodes('a', 'c', 'o')
+        expected_object_hosts = {'%(ip)s:%(port)s' % n for n in object_nodes}
+        self.assertEqual(object_hosts, expected_object_hosts)
+
+        # container hosts use node ip/port
+        container_hosts = {req['headers']['x-container-host']
+                           for req in log.requests}
+        part, container_nodes = self.app.container_ring.get_nodes('a', 'c')
+        expected_container_hosts = {'%(ip)s:%(port)s' % n
+                                    for n in container_nodes}
+        self.assertEqual(container_hosts, expected_container_hosts)
+
+    def test_repl_object_DELETE_backend_update_container_repl_ip(self):
+        self.policy.object_ring = FakeRing(separate_replication=True)
+        self.app.container_ring = FakeRing(separate_replication=True)
+        # sanity, devs have different ip & replication_ip
+        for ring in (self.policy.object_ring, self.app.container_ring):
+            for dev in ring.devs:
+                self.assertNotEqual(dev['ip'], dev['replication_ip'])
+        req = swift.common.swob.Request.blank(
+            '/v1/a/c/o', method='DELETE', headers={
+                'x-backend-use-replication-network': 'true'})
+        codes = [204] * self.replicas()
+        with mocked_http_conn(*codes) as log:
+            resp = req.get_response(self.app)
+        self.assertEqual(resp.status_int, 204)
+
+        # sanity, object hosts use node replication ip/port
+        object_hosts = {'%(ip)s:%(port)s' % req for req in log.requests}
+        object_ring = self.app.get_object_ring(int(self.policy))
+        part, object_nodes = object_ring.get_nodes('a', 'c', 'o')
+        expected_object_hosts = {
+            '%(replication_ip)s:%(replication_port)s' % n
+            for n in object_nodes}
+        self.assertEqual(object_hosts, expected_object_hosts)
+
+        # container hosts use node replication ip/port
+        container_hosts = {req['headers']['x-container-host']
+                           for req in log.requests}
+        part, container_nodes = self.app.container_ring.get_nodes('a', 'c')
+        expected_container_hosts = {
+            '%(replication_ip)s:%(replication_port)s' % n
+            for n in container_nodes}
+        self.assertEqual(container_hosts, expected_container_hosts)
 
     def test_DELETE_missing_one(self):
         # Obviously this test doesn't work if we're testing 1 replica.
@@ -738,6 +816,129 @@ class CommonObjectControllerMixin(BaseObjectControllerMixin):
             resp = req.get_response(self.app)
         self.assertEqual(resp.status_int, 400)
         self.assertEqual(b'X-Delete-At in past', resp.body)
+
+    def _test_x_open_expired(self, method, num_reqs, headers=None):
+        req = swift.common.swob.Request.blank(
+            '/v1/a/c/o', method=method, headers=headers)
+        codes = [404] * num_reqs
+        with mocked_http_conn(*codes) as fake_conn:
+            resp = req.get_response(self.app)
+        self.assertEqual(resp.status_int, 404)
+        return fake_conn.requests
+
+    def test_x_open_expired_default_config(self):
+        for method, num_reqs in (
+                ('GET',
+                 self.obj_ring.replicas + self.obj_ring.max_more_nodes),
+                ('HEAD',
+                 self.obj_ring.replicas + self.obj_ring.max_more_nodes),
+                ('POST', self.obj_ring.replicas)):
+            requests = self._test_x_open_expired(method, num_reqs)
+            for r in requests:
+                self.assertNotIn('X-Open-Expired', r['headers'])
+                self.assertNotIn('X-Backend-Open-Expired', r['headers'])
+
+            requests = self._test_x_open_expired(
+                method, num_reqs, headers={'X-Open-Expired': 'true'})
+            for r in requests:
+                self.assertEqual(r['headers']['X-Open-Expired'], 'true')
+                self.assertNotIn('X-Backend-Open-Expired', r['headers'])
+
+            requests = self._test_x_open_expired(
+                method, num_reqs, headers={'X-Open-Expired': 'false'})
+            for r in requests:
+                self.assertEqual(r['headers']['X-Open-Expired'], 'false')
+                self.assertNotIn('X-Backend-Open-Expired', r['headers'])
+
+    def test_x_open_expired_custom_config(self):
+        # helper to check that PUT is not supported in all cases
+        def test_put_unsupported():
+            req = swift.common.swob.Request.blank(
+                '/v1/a/c/o', method='PUT', headers={
+                    'Content-Length': '0',
+                    'X-Open-Expired': 'true'})
+            codes = [201] * self.obj_ring.replicas
+            expect_headers = {
+                'X-Obj-Metadata-Footer': 'yes',
+                'X-Obj-Multiphase-Commit': 'yes'
+            }
+            with mocked_http_conn(
+                    *codes, expect_headers=expect_headers) as fake_conn:
+                resp = req.get_response(self.app)
+            self.assertEqual(resp.status_int, 201)
+            for r in fake_conn.requests:
+                self.assertEqual(r['headers']['X-Open-Expired'], 'true')
+                self.assertNotIn('X-Backend-Open-Expired', r['headers'])
+
+        # Allow open expired
+        # Override app configuration
+        conf = {'allow_open_expired': 'true'}
+        # Create a new proxy instance for test with config
+        self.app = PatchedObjControllerApp(
+            conf, account_ring=FakeRing(),
+            container_ring=FakeRing(), logger=None)
+        # Use the same container info as the app used in other tests
+        self.app.container_info = dict(self.container_info)
+        self.obj_ring = self.app.get_object_ring(int(self.policy))
+
+        for method, num_reqs in (
+                ('GET',
+                 self.obj_ring.replicas + self.obj_ring.max_more_nodes),
+                ('HEAD',
+                 self.obj_ring.replicas + self.obj_ring.max_more_nodes),
+                ('POST', self.obj_ring.replicas)):
+            requests = self._test_x_open_expired(
+                method, num_reqs, headers={'X-Open-Expired': 'true'})
+            for r in requests:
+                # If the proxy server config is has allow_open_expired set
+                # to true, then we set x-backend-open-expired to true
+                self.assertEqual(r['headers']['X-Open-Expired'], 'true')
+                self.assertEqual(r['headers']['X-Backend-Open-Expired'],
+                                 'true')
+
+        for method, num_reqs in (
+                ('GET',
+                 self.obj_ring.replicas + self.obj_ring.max_more_nodes),
+                ('HEAD',
+                 self.obj_ring.replicas + self.obj_ring.max_more_nodes),
+                ('POST', self.obj_ring.replicas)):
+            requests = self._test_x_open_expired(
+                method, num_reqs, headers={'X-Open-Expired': 'false'})
+            for r in requests:
+                # If the proxy server config has allow_open_expired set
+                # to false, then we set x-backend-open-expired to false
+                self.assertEqual(r['headers']['X-Open-Expired'], 'false')
+                self.assertNotIn('X-Backend-Open-Expired', r['headers'])
+
+        # we don't support x-open-expired on PUT when allow_open_expired
+        test_put_unsupported()
+
+        # Disallow open expired
+        conf = {'allow_open_expired': 'false'}
+        # Create a new proxy instance for test with config
+        self.app = PatchedObjControllerApp(
+            conf, account_ring=FakeRing(),
+            container_ring=FakeRing(), logger=None)
+        # Use the same container info as the app used in other tests
+        self.app.container_info = dict(self.container_info)
+        self.obj_ring = self.app.get_object_ring(int(self.policy))
+
+        for method, num_reqs in (
+                ('GET',
+                 self.obj_ring.replicas + self.obj_ring.max_more_nodes),
+                ('HEAD',
+                 self.obj_ring.replicas + self.obj_ring.max_more_nodes),
+                ('POST', self.obj_ring.replicas)):
+            # This case is different: we never add the 'X-Backend-Open-Expired'
+            # header if the proxy server config disables this feature
+            requests = self._test_x_open_expired(
+                method, num_reqs, headers={'X-Open-Expired': 'true'})
+            for r in requests:
+                self.assertEqual(r['headers']['X-Open-Expired'], 'true')
+                self.assertNotIn('X-Backend-Open-Expired', r['headers'])
+
+        # we don't support x-open-expired on PUT when not allow_open_expired
+        test_put_unsupported()
 
     def test_HEAD_simple(self):
         req = swift.common.swob.Request.blank('/v1/a/c/o', method='HEAD')
@@ -1711,24 +1912,27 @@ class TestReplicatedObjController(CommonObjectControllerMixin,
 
         req = swob.Request.blank('/v1/a/c/o', headers={
             'Range': 'bytes=0-49,100-104'})
-        with capture_http_requests(get_response) as log:
+        with capture_http_requests(get_response) as captured_requests:
             resp = req.get_response(self.app)
             self.assertEqual(resp.status_int, 206)
             actual_body = resp.body
 
         self.assertEqual(resp.status_int, 206)
-        self.assertEqual(2, len(log))
+        self.assertEqual(2, len(captured_requests))
+        self.assertEqual([1] + [0] * (self.replicas() - 1),
+                         node_error_counts(self.app, self.obj_ring.devs))
         # note: client response uses boundary from first backend response
         self.assertEqual(resp_body1, actual_body)
-        error_lines = self.app.logger.get_lines_for_level('error')
-        self.assertEqual(1, len(error_lines))
-        self.assertIn('Trying to read object during GET ', error_lines[0])
         return req_range_hdrs
 
     def test_GET_with_multirange_slow_body_resumes(self):
         req_range_hdrs = self._do_test_GET_with_multirange_slow_body_resumes(
             slowdown_after=0)
         self.assertEqual(['bytes=0-49,100-104'] * 2, req_range_hdrs)
+        error_lines = self.app.logger.get_lines_for_level('error')
+        self.assertEqual(1, len(error_lines))
+        self.assertIn('Trying to read next part of object multi-part GET '
+                      '(retrying)', error_lines[0])
 
     def test_GET_with_multirange_slow_body_resumes_before_body_started(self):
         # First response times out while first part boundary/headers are being
@@ -1737,6 +1941,10 @@ class TestReplicatedObjController(CommonObjectControllerMixin,
         req_range_hdrs = self._do_test_GET_with_multirange_slow_body_resumes(
             slowdown_after=40, resume_bytes=0)
         self.assertEqual(['bytes=0-49,100-104'] * 2, req_range_hdrs)
+        error_lines = self.app.logger.get_lines_for_level('error')
+        self.assertEqual(1, len(error_lines))
+        self.assertIn('Trying to read next part of object multi-part GET '
+                      '(retrying)', error_lines[0])
 
     def test_GET_with_multirange_slow_body_resumes_after_body_started(self):
         # First response times out after first part boundary/headers have been
@@ -1750,10 +1958,13 @@ class TestReplicatedObjController(CommonObjectControllerMixin,
             slowdown_after=140, resume_bytes=20)
         self.assertEqual(['bytes=0-49,100-104', 'bytes=20-49,100-104'],
                          req_range_hdrs)
+        error_lines = self.app.logger.get_lines_for_level('error')
+        self.assertEqual(1, len(error_lines))
+        self.assertIn('Trying to read object during GET (retrying) ',
+                      error_lines[0])
 
     def test_GET_with_multirange_slow_body_unable_to_resume(self):
         self.app.recoverable_node_timeout = 0.01
-        self.app.object_chunk_size = 10
         obj_data = b'testing' * 100
         etag = md5(obj_data, usedforsecurity=False).hexdigest()
         boundary = b'81eb9c110b32ced5fe'
@@ -1789,19 +2000,96 @@ class TestReplicatedObjController(CommonObjectControllerMixin,
 
         req = swob.Request.blank('/v1/a/c/o', headers={
             'Range': 'bytes=0-49,100-104'})
+        response_chunks = []
         with capture_http_requests(get_response) as log:
             resp = req.get_response(self.app)
-            self.assertEqual(resp.status_int, 206)
-            actual_body = resp.body
-
+            with self.assertRaises(ChunkReadTimeout):
+                # note: the error is raised while the resp_iter is read...
+                for chunk in resp.app_iter:
+                    response_chunks.append(chunk)
+        self.assertEqual(response_chunks, [])
         self.assertEqual(resp.status_int, 206)
+        self.assertEqual([1, 1, 1],
+                         node_error_counts(self.app, self.obj_ring.devs))
         self.assertEqual(6, len(log))
-        resp_boundary = resp.headers['content-type'].rsplit('=', 1)[1].encode()
-        self.assertEqual(b'--%s--' % resp_boundary, actual_body)
         error_lines = self.app.logger.get_lines_for_level('error')
         self.assertEqual(3, len(error_lines))
         for line in error_lines:
-            self.assertIn('Trying to read object during GET ', line)
+            self.assertIn('Trying to read next part of object multi-part GET '
+                          '(retrying)', line)
+
+    def test_GET_unable_to_resume(self):
+        self.app.recoverable_node_timeout = 0.01
+        self.app.client_timeout = 0.1
+        self.app.object_chunk_size = 10
+        resp_body = b'length 8'
+        etag = md5(resp_body, usedforsecurity=False).hexdigest()
+        headers = {
+            'Etag': etag,
+            'Content-Type': b'plain/text',
+            'Content-Length': len(resp_body),
+            'X-Timestamp': Timestamp(self.ts()).normal,
+        }
+
+        # make all responses slow...
+        responses = [
+            StubResponse(200, resp_body, headers, slowdown=0.1),
+            StubResponse(200, resp_body, headers, slowdown=0.1),
+            StubResponse(200, resp_body, headers, slowdown=0.1),
+        ]
+
+        def get_response(req):
+            return responses.pop(0) if responses else StubResponse(404)
+
+        req = swob.Request.blank('/v1/a/c/o')
+        with capture_http_requests(get_response):
+            resp = req.get_response(self.app)
+            with self.assertRaises(ChunkReadTimeout):
+                _ = resp.body
+        self.assertEqual(resp.status_int, 200)
+        self.assertEqual(etag, resp.headers.get('ETag'))
+        self.assertEqual([1] * self.replicas(),
+                         node_error_counts(self.app, self.obj_ring.devs))
+
+        error_lines = self.app.logger.get_lines_for_level('error')
+        self.assertEqual(3, len(error_lines))
+        for line in error_lines[:3]:
+            self.assertIn('Trying to read object during GET', line)
+
+    def test_GET_newest_will_not_resume(self):
+        # verify that request with x-newest use node_timeout and don't resume
+        self.app.node_timeout = 0.01
+        # set recoverable_node_timeout crazy high to verify that this is not
+        # the timeout value that is used
+        self.app.recoverable_node_timeout = 1000
+        self.app.client_timeout = 0.1
+        self.app.object_chunk_size = 10
+        resp_body = b'length 8'
+        etag = md5(resp_body, usedforsecurity=False).hexdigest()
+        headers = {
+            'Etag': etag,
+            'Content-Type': b'plain/text',
+            'Content-Length': len(resp_body),
+            'X-Timestamp': Timestamp(self.ts()).normal,
+        }
+
+        # make all responses slow...
+        responses = [
+            StubResponse(200, resp_body, headers, slowdown=0.1),
+        ]
+
+        def get_response(req):
+            return responses.pop(0) if responses else StubResponse(404)
+
+        req = swob.Request.blank('/v1/a/c/o', headers={'X-Newest': 'true'})
+        with capture_http_requests(get_response):
+            resp = req.get_response(self.app)
+            with self.assertRaises(ChunkReadTimeout):
+                _ = resp.body
+        self.assertEqual(resp.status_int, 200)
+        self.assertEqual(etag, resp.headers.get('ETag'))
+        error_lines = self.app.logger.get_lines_for_level('error')
+        self.assertEqual(0, len(error_lines))
 
     def test_GET_resuming_ignores_416(self):
         # verify that a resuming getter will not try to use the content of a
@@ -1895,6 +2183,8 @@ class TestReplicatedObjController(CommonObjectControllerMixin,
                          log.requests[2]['headers']['Range'])
         self.assertNotIn('X-Backend-Ignore-Range-If-Metadata-Present',
                          log.requests[2]['headers'])
+        self.assertEqual([1, 1] + [0] * (self.replicas() - 2),
+                         node_error_counts(self.app, self.obj_ring.devs))
 
     def test_GET_transfer_encoding_chunked(self):
         req = swift.common.swob.Request.blank('/v1/a/c/o')
@@ -1959,6 +2249,8 @@ class TestReplicatedObjController(CommonObjectControllerMixin,
         with set_http_connect(*codes):
             resp = req.get_response(self.app)
         self.assertEqual(resp.status_int, 503)
+        self.assertEqual([1] * self.replicas(),
+                         node_error_counts(self.app, self.obj_ring.devs))
 
     def test_HEAD_error_limit_supression_count(self):
         def do_test(primary_codes, expected, clear_stats=True):
@@ -2110,6 +2402,80 @@ class TestReplicatedObjController(CommonObjectControllerMixin,
             self.assertIn('X-Delete-At-Device', given_headers)
             self.assertIn('X-Delete-At-Partition', given_headers)
             self.assertIn('X-Delete-At-Container', given_headers)
+
+    def test_POST_delete_at_with_x_open_expired(self):
+        t_delete = str(int(time.time() + 30))
+
+        def capture_headers(ip, port, device, part, method, path, headers,
+                            **kwargs):
+            if method == 'POST':
+                post_headers.append(headers)
+
+        def do_post(extra_headers):
+            headers = {'Content-Type': 'foo/bar',
+                       'X-Delete-At': t_delete}
+            headers.update(extra_headers)
+            req_post = swob.Request.blank('/v1/a/c/o', method='POST', body=b'',
+                                          headers=headers)
+
+            post_codes = [202] * self.obj_ring.replicas
+            with set_http_connect(*post_codes, give_connect=capture_headers):
+                resp = req_post.get_response(self.app)
+            self.assertEqual(resp.status_int, 202)
+            self.assertEqual(len(post_headers), self.obj_ring.replicas)
+            for given_headers in post_headers:
+                self.assertEqual(given_headers.get('X-Delete-At'), t_delete)
+                self.assertIn('X-Delete-At-Host', given_headers)
+                self.assertIn('X-Delete-At-Device', given_headers)
+                self.assertIn('X-Delete-At-Partition', given_headers)
+                self.assertIn('X-Delete-At-Container', given_headers)
+
+        # Check when allow_open_expired config is set to true
+        conf = {'allow_open_expired': 'true'}
+        self.app = PatchedObjControllerApp(
+            conf, account_ring=FakeRing(),
+            container_ring=FakeRing(), logger=None)
+        self.app.container_info = dict(self.container_info)
+        self.obj_ring = self.app.get_object_ring(int(self.policy))
+
+        post_headers = []
+        do_post({})
+        for given_headers in post_headers:
+            self.assertNotIn('X-Backend-Open-Expired', given_headers)
+
+        post_headers = []
+        do_post({'X-Open-Expired': 'false'})
+        for given_headers in post_headers:
+            self.assertNotIn('X-Backend-Open-Expired', given_headers)
+
+        post_headers = []
+        do_post({'X-Open-Expired': 'true'})
+        for given_headers in post_headers:
+            self.assertEqual(given_headers.get('X-Backend-Open-Expired'),
+                             'true')
+
+        # Check when allow_open_expired config is set to false
+        conf = {'allow_open_expired': 'false'}
+        self.app = PatchedObjControllerApp(
+            conf, account_ring=FakeRing(),
+            container_ring=FakeRing(), logger=None)
+        self.app.container_info = dict(self.container_info)
+        self.obj_ring = self.app.get_object_ring(int(self.policy))
+
+        post_headers = []
+        do_post({})
+        for given_headers in post_headers:
+            self.assertNotIn('X-Backend-Open-Expired', given_headers)
+
+        post_headers = []
+        do_post({'X-Open-Expired': 'false'})
+        for given_headers in post_headers:
+            self.assertNotIn('X-Backend-Open-Expired', given_headers)
+
+        post_headers = []
+        do_post({'X-Open-Expired': 'true'})
+        for given_headers in post_headers:
+            self.assertNotIn('X-Backend-Open-Expired', given_headers)
 
     def test_PUT_converts_delete_after_to_delete_at(self):
         req = swob.Request.blank('/v1/a/c/o', method='PUT', body=b'',
@@ -4744,18 +5110,97 @@ class TestECObjController(ECObjectControllerMixin, unittest.TestCase):
             'Range': 'bytes=1000-2000,14000-15000'})
         with capture_http_requests(get_response) as log:
             resp = req.get_response(self.app)
-            _ = resp.body
+            # note: the error is raised before the resp_iter is read
+            self.assertIn(b'Internal Error', resp.body)
         self.assertEqual(resp.status_int, 500)
         self.assertEqual(len(log), self.policy.ec_n_unique_fragments * 2)
         log_lines = self.app.logger.get_lines_for_level('error')
         self.assertEqual(3, len(log_lines), log_lines)
-        self.assertIn('Trying to read next part of EC multi-part GET',
+        self.assertIn('Trying to read next part of EC fragment multi-part GET',
                       log_lines[0])
         self.assertIn('Trying to read during GET: ChunkReadTimeout',
                       log_lines[1])
         # not the most graceful ending
         self.assertIn('Unhandled exception in request: ChunkReadTimeout',
                       log_lines[2])
+
+    def test_GET_with_multirange_unable_to_resume_body_started(self):
+        self.app.object_chunk_size = 256
+        self.app.recoverable_node_timeout = 0.01
+        test_body = b'test' * self.policy.ec_segment_size
+        ec_stub = make_ec_object_stub(test_body, self.policy, None)
+        frag_archives = ec_stub['frags']
+        self.assertEqual(len(frag_archives[0]), 1960)
+        boundary = b'81eb9c110b32ced5fe'
+
+        def make_mime_body(frag_archive):
+            return b'\r\n'.join([
+                b'--' + boundary,
+                b'Content-Type: application/octet-stream',
+                b'Content-Range: bytes 0-489/1960',
+                b'',
+                frag_archive[0:490],
+                b'--' + boundary,
+                b'Content-Type: application/octet-stream',
+                b'Content-Range: bytes 1470-1959/1960',
+                b'',
+                frag_archive[1470:],
+                b'--' + boundary + b'--',
+            ])
+
+        obj_resp_bodies = [make_mime_body(fa) for fa
+                           # no extra good responses
+                           in ec_stub['frags'][:self.policy.ec_ndata]]
+
+        headers = {
+            'Content-Type': b'multipart/byteranges;boundary=' + boundary,
+            'Content-Length': len(obj_resp_bodies[0]),
+            'X-Object-Sysmeta-Ec-Content-Length': len(ec_stub['body']),
+            'X-Object-Sysmeta-Ec-Etag': ec_stub['etag'],
+            'X-Timestamp': Timestamp(self.ts()).normal,
+        }
+
+        responses = [
+            StubResponse(206, body, headers, i,
+                         # make the first one slow
+                         slowdown=0.1 if i == 0 else None)
+            for i, body in enumerate(obj_resp_bodies)
+        ]
+        # the first response serves some bytes before slowing down
+        responses[0].slowdown_after = 1000
+
+        def get_response(req):
+            return responses.pop(0) if responses else StubResponse(404)
+
+        req = swob.Request.blank('/v1/a/c/o', headers={
+            'Range': 'bytes=1000-2000,14000-15000'})
+        response_chunks = []
+        with capture_http_requests(get_response) as log:
+            resp = req.get_response(self.app)
+            with self.assertRaises(ChunkReadTimeout):
+                # note: the error is raised while the resp_iter is read
+                for chunk in resp.app_iter:
+                    response_chunks.append(chunk)
+        boundary = resp.headers['Content-Type'].split('=', 1)[1]
+        self.assertEqual(response_chunks, [
+            b'\r\n'.join([
+                b'--' + boundary.encode('ascii'),
+                b'Content-Type: application/octet-stream',
+                b'Content-Range: bytes 1000-2000/16384',
+                b'',
+                b'',
+            ]),
+            test_body[0:1001],
+            b'\r\n',
+        ])
+        self.assertEqual(resp.status_int, 206)
+        self.assertEqual(len(log), self.policy.ec_n_unique_fragments * 2)
+        log_lines = self.app.logger.get_lines_for_level('error')
+        self.assertEqual(2, len(log_lines), log_lines)
+        self.assertIn('Trying to read next part of EC fragment multi-part GET',
+                      log_lines[0])
+        self.assertIn('Trying to read during GET: ChunkReadTimeout',
+                      log_lines[1])
 
     def test_GET_with_multirange_short_resume_body(self):
         self.app.object_chunk_size = 256
@@ -4828,7 +5273,7 @@ class TestECObjController(ECObjectControllerMixin, unittest.TestCase):
         self.assertEqual(resp.status_int, 206)
         self.assertEqual(len(log), self.policy.ec_n_unique_fragments * 2)
         log_lines = self.app.logger.get_lines_for_level('error')
-        self.assertIn("Trying to read next part of EC multi-part "
+        self.assertIn("Trying to read next part of EC fragment multi-part "
                       "GET (retrying)", log_lines[0])
         # not the most graceful ending
         self.assertIn("Exception fetching fragments for '/a/c/o'",
@@ -5449,7 +5894,7 @@ class TestECObjController(ECObjectControllerMixin, unittest.TestCase):
         for line in self.logger.logger.records['ERROR']:
             self.assertIn(req.headers['x-trans-id'], line)
 
-    def test_GET_read_timeout_fails(self):
+    def _do_test_GET_read_timeout_fast_forward_fails(self, error):
         segment_size = self.policy.ec_segment_size
         test_data = (b'test' * segment_size)[:-333]
         etag = md5(test_data).hexdigest()
@@ -5476,10 +5921,18 @@ class TestECObjController(ECObjectControllerMixin, unittest.TestCase):
                               headers=headers), \
                 mock.patch(
                     'swift.proxy.controllers.obj.ECFragGetter.fast_forward',
-                    side_effect=ValueError()):
+                    side_effect=error):
             resp = req.get_response(self.app)
             self.assertEqual(resp.status_int, 200)
             self.assertNotEqual(md5(resp.body).hexdigest(), etag)
+
+        for line in self.logger.logger.records['ERROR'] + \
+                self.logger.logger.records['WARNING']:
+            self.assertIn(req.headers['x-trans-id'], line)
+
+    def test_GET_read_timeout_fast_forward_fails(self):
+        self._do_test_GET_read_timeout_fast_forward_fails(ValueError())
+
         error_lines = self.logger.get_lines_for_level('error')
         self.assertEqual(2, len(error_lines))
         self.assertIn('Unable to fast forward', error_lines[0])
@@ -5489,9 +5942,21 @@ class TestECObjController(ECObjectControllerMixin, unittest.TestCase):
         self.assertIn(
             'Un-recoverable fragment rebuild. Only received 9/10 fragments',
             warning_lines[0])
-        for line in self.logger.logger.records['ERROR'] + \
-                self.logger.logger.records['WARNING']:
-            self.assertIn(req.headers['x-trans-id'], line)
+
+    def test_GET_read_timeout_fast_forward_range_complete(self):
+        self._do_test_GET_read_timeout_fast_forward_fails(
+            RangeAlreadyComplete())
+
+        error_lines = self.logger.get_lines_for_level('error')
+        self.assertEqual(0, len(error_lines))
+        # the test is a little bogus - presumably if the range was complete
+        # then the fragment would be ok to rebuild. But the test pretends range
+        # was complete without actually feeding the bytes to the getter...
+        warning_lines = self.logger.get_lines_for_level('warning')
+        self.assertEqual(1, len(warning_lines))
+        self.assertIn(
+            'Un-recoverable fragment rebuild. Only received 9/10 fragments',
+            warning_lines[0])
 
     def test_GET_one_short_fragment_archive(self):
         # verify that a warning is logged when one fragment archive returns
@@ -7064,11 +7529,18 @@ class TestNumContainerUpdates(unittest.TestCase):
 class TestECFragGetter(BaseObjectControllerMixin, unittest.TestCase):
     def setUp(self):
         super(TestECFragGetter, self).setUp()
-        req = Request.blank(path='/a/c/o')
+        req = Request.blank(path='/v1/a/c/o')
         self.getter = obj.ECFragGetter(
             self.app, req, None, None, self.policy, 'a/c/o',
             {}, None, self.logger.thread_locals,
             self.logger)
+
+    def test_init_node_timeout(self):
+        app = argparse.Namespace(node_timeout=2, recoverable_node_timeout=3)
+        getter = obj.ECFragGetter(
+            app, None, None, None, self.policy, 'a/c/o',
+            {}, None, None, self.logger)
+        self.assertEqual(3, getter.node_timeout)
 
     def test_iter_bytes_from_response_part(self):
         part = FileLikeIter([b'some', b'thing'])
@@ -7087,13 +7559,13 @@ class TestECFragGetter(BaseObjectControllerMixin, unittest.TestCase):
 
     def test_iter_bytes_from_response_part_read_timeout(self):
         part = FileLikeIter([b'some', b'thing'])
-        self.app.recoverable_node_timeout = 0.05
-        self.app.client_timeout = 0.8
         it = self.getter._iter_bytes_from_response_part(part, nbytes=9)
+        exc = ChunkReadTimeout()
+        # set this after __init__ to keep it off the eventlet scheduler
+        exc.seconds = 9
         with mock.patch.object(self.getter, '_find_source',
                                return_value=False):
-            with mock.patch.object(part, 'read',
-                                   side_effect=[b'some', ChunkReadTimeout(9)]):
+            with mock.patch.object(part, 'read', side_effect=[b'some', exc]):
                 with self.assertRaises(ChunkReadTimeout) as cm:
                     b''.join(it)
         self.assertEqual('9 seconds', str(cm.exception))
@@ -7111,15 +7583,13 @@ class TestECFragGetter(BaseObjectControllerMixin, unittest.TestCase):
     def test_fragment_size(self):
         source = FakeSource((
             b'abcd', b'1234', b'abc', b'd1', b'234abcd1234abcd1', b'2'))
-        req = Request.blank('/v1/a/c/o')
 
         def mock_source_gen():
             yield GetterSource(self.app, source, {})
 
         self.getter.fragment_size = 8
-        with mock.patch.object(self.getter, '_source_gen',
-                               mock_source_gen):
-            it = self.getter.response_parts_iter(req)
+        with mock.patch.object(self.getter, '_source_gen', mock_source_gen):
+            it = self.getter.response_parts_iter()
             fragments = list(next(it)['part_iter'])
 
         self.assertEqual(fragments, [
@@ -7133,7 +7603,6 @@ class TestECFragGetter(BaseObjectControllerMixin, unittest.TestCase):
         # incomplete reads of fragment_size will be re-fetched
         source2 = FakeSource([b'efgh', b'5678', b'lots', None])
         source3 = FakeSource([b'lots', b'more', b'data'])
-        req = Request.blank('/v1/a/c/o')
         range_headers = []
         sources = [GetterSource(self.app, src, node)
                    for src in (source1, source2, source3)]
@@ -7146,7 +7615,7 @@ class TestECFragGetter(BaseObjectControllerMixin, unittest.TestCase):
         self.getter.fragment_size = 8
         with mock.patch.object(self.getter, '_source_gen',
                                mock_source_gen):
-            it = self.getter.response_parts_iter(req)
+            it = self.getter.response_parts_iter()
             fragments = list(next(it)['part_iter'])
 
         self.assertEqual(fragments, [
@@ -7162,7 +7631,6 @@ class TestECFragGetter(BaseObjectControllerMixin, unittest.TestCase):
         range_headers = []
         sources = [GetterSource(self.app, src, node)
                    for src in (source1, source2)]
-        req = Request.blank('/v1/a/c/o')
 
         def mock_source_gen():
             for source in sources:
@@ -7172,10 +7640,306 @@ class TestECFragGetter(BaseObjectControllerMixin, unittest.TestCase):
         self.getter.fragment_size = 8
         with mock.patch.object(self.getter, '_source_gen',
                                mock_source_gen):
-            it = self.getter.response_parts_iter(req)
+            it = self.getter.response_parts_iter()
             fragments = list(next(it)['part_iter'])
         self.assertEqual(fragments, [b'abcd1234', b'efgh5678'])
         self.assertEqual(range_headers, [None, 'bytes=8-'])
+
+
+@patch_policies()
+class TestGetUpdateShard(BaseObjectControllerMixin, unittest.TestCase):
+    bound_prefix = 'x'
+    item = 'x1_test'
+
+    def setUp(self):
+        super(TestGetUpdateShard, self).setUp()
+        self.ctrl = obj.BaseObjectController(self.app, 'a', 'c', 'o')
+        self.memcache = FakeMemcache()
+        ts_iter = make_timestamp_iter()
+        # NB: these shard ranges have gaps
+        self.shard_ranges = [ShardRange(
+            '.sharded_a/sr%d' % i, next(ts_iter),
+            self.bound_prefix + u'%d_lower' % i,
+            self.bound_prefix + u'%d_upper' % i,
+            object_count=i, bytes_used=1024 * i,
+            meta_timestamp=next(ts_iter))
+            for i in range(3)]
+
+    def _create_response_data(self, shards, includes=None):
+        resp_headers = {'X-Backend-Record-Type': 'shard',
+                        'X-Backend-Record-Shard-Format': 'namespace'}
+        namespaces = [Namespace(sr.name, sr.lower, sr.upper)
+                      for sr in shards]
+        if includes is not None:
+            namespaces = [ns for ns in namespaces if includes in ns]
+        body = json.dumps([dict(ns) for ns in namespaces]).encode('ascii')
+        return body, resp_headers
+
+    def test_get_update_shard_cache_writing(self):
+        # verify case when complete set of shards is returned
+        req = Request.blank('/v1/a/c/o', method='PUT',
+                            environ={'swift.cache': self.memcache})
+        body, resp_headers = self._create_response_data(self.shard_ranges)
+        with mocked_http_conn(
+                200, 200, body_iter=iter([b'', body]),
+                headers=resp_headers) as fake_conn:
+            actual = self.ctrl._get_update_shard(req, 'a', 'c', self.item)
+
+        # account info
+        captured = fake_conn.requests
+        self.assertEqual('HEAD', captured[0]['method'])
+        self.assertEqual('a', captured[0]['path'][7:])
+        # container GET
+        self.assertEqual('GET', captured[1]['method'])
+        self.assertEqual('a/c', captured[1]['path'][7:])
+        params = sorted(captured[1]['qs'].split('&'))
+        self.assertEqual(
+            ['format=json', 'states=updating'], params)
+        captured_hdrs = captured[1]['headers']
+        self.assertEqual('shard', captured_hdrs.get('X-Backend-Record-Type'))
+        self.assertEqual('namespace',
+                         captured_hdrs.get('X-Backend-Record-Shard-Format'))
+        exp_bounds = NamespaceBoundList.parse(self.shard_ranges).bounds
+        self.assertEqual(json.loads(json.dumps(exp_bounds)),
+                         self.memcache.get('shard-updating-v2/a/c'))
+        exp_ns = Namespace(self.shard_ranges[1].name,
+                           self.shard_ranges[1].lower,
+                           self.shard_ranges[2].lower)
+        self.assertEqual(exp_ns, actual)
+        self.assertFalse(self.app.logger.get_lines_for_level('error'))
+
+    def test_get_update_shard_cache_reading(self):
+        # verify case when complete set of shards is in cache
+        cached_bounds = NamespaceBoundList.parse(self.shard_ranges).bounds
+        self.memcache.set('shard-updating-v2/a/c', cached_bounds)
+        req = Request.blank('/v1/a/c/o', method='PUT',
+                            environ={'swift.cache': self.memcache})
+
+        actual = self.ctrl._get_update_shard(req, 'a', 'c', self.item)
+
+        self.assertEqual(json.loads(json.dumps(cached_bounds)),
+                         self.memcache.get('shard-updating-v2/a/c'))
+        exp_ns = Namespace(self.shard_ranges[1].name,
+                           self.shard_ranges[1].lower,
+                           self.shard_ranges[2].lower)
+        self.assertEqual(exp_ns, actual)
+        self.assertFalse(self.app.logger.get_lines_for_level('error'))
+
+    def test_get_update_shard_cache_recheck_time_zero(self):
+        # verify case when shard caching is disabled
+        req = Request.blank('/v1/a/c/o', method='PUT',
+                            environ={'swift.cache': self.memcache})
+        body, resp_headers = self._create_response_data(
+            self.shard_ranges, self.item)
+        with mock.patch.object(self.app, 'recheck_updating_shard_ranges', 0):
+            with mocked_http_conn(
+                    200, 200, body_iter=iter([b'', body]),
+                    headers=resp_headers) as fake_conn:
+                actual = self.ctrl._get_update_shard(req, 'a', 'c', self.item)
+
+        # account info
+        captured = fake_conn.requests
+        self.assertEqual('HEAD', captured[0]['method'])
+        self.assertEqual('a', captured[0]['path'][7:])
+        # container GET
+        self.assertEqual('GET', captured[1]['method'])
+        self.assertEqual('a/c', captured[1]['path'][7:])
+        params = sorted(captured[1]['qs'].split('&'))
+        self.assertEqual(
+            ['format=json', 'includes=' + quote(self.item), 'states=updating'],
+            params)
+        captured_hdrs = captured[1]['headers']
+        self.assertEqual('shard', captured_hdrs.get('X-Backend-Record-Type'))
+        self.assertEqual('namespace',
+                         captured_hdrs.get('X-Backend-Record-Shard-Format'))
+        self.assertIsNone(self.memcache.get('shard-updating-v2/a/c'))
+        exp_ns = Namespace(self.shard_ranges[1].name,
+                           self.shard_ranges[1].lower,
+                           self.shard_ranges[1].upper)
+        self.assertEqual(exp_ns, actual)
+        self.assertFalse(self.app.logger.get_lines_for_level('error'))
+
+    def test_get_update_shard_cache_not_available(self):
+        # verify case when memcache is not available
+        req = Request.blank('/v1/a/c/o', method='PUT')
+        body, resp_headers = self._create_response_data(self.shard_ranges)
+        with mocked_http_conn(
+                200, 200, body_iter=iter([b'', body]),
+                headers=resp_headers) as fake_conn:
+            actual = self.ctrl._get_update_shard(req, 'a', 'c', self.item)
+
+        # account info
+        captured = fake_conn.requests
+        self.assertEqual('HEAD', captured[0]['method'])
+        self.assertEqual('a', captured[0]['path'][7:])
+        # container GET
+        self.assertEqual('GET', captured[1]['method'])
+        self.assertEqual('a/c', captured[1]['path'][7:])
+        params = sorted(captured[1]['qs'].split('&'))
+        self.assertEqual(
+            ['format=json', 'states=updating'], params)
+        captured_hdrs = captured[1]['headers']
+        self.assertEqual('shard', captured_hdrs.get('X-Backend-Record-Type'))
+        self.assertEqual('namespace',
+                         captured_hdrs.get('X-Backend-Record-Shard-Format'))
+        self.assertIsNone(self.memcache.get('shard-updating-v2/a/c'))
+        exp_ns = Namespace(self.shard_ranges[1].name,
+                           self.shard_ranges[1].lower,
+                           self.shard_ranges[2].lower)
+        self.assertEqual(exp_ns, actual)
+        self.assertFalse(self.app.logger.get_lines_for_level('error'))
+
+    def test_get_update_shard_empty_body(self):
+        # verify case when no shards are returned
+        req = Request.blank('/v1/a/c/o', method='PUT',
+                            environ={'swift.cache': self.memcache})
+
+        body, resp_headers = self._create_response_data(self.shard_ranges)
+        with mocked_http_conn(
+                200, 200, body_iter=[b'', b''],
+                headers=resp_headers) as fake_conn:
+            actual = self.ctrl._get_update_shard(req, 'a', 'c', self.item)
+
+        # account info
+        captured = fake_conn.requests
+        self.assertEqual('HEAD', captured[0]['method'])
+        self.assertEqual('a', captured[0]['path'][7:])
+        # container GET
+        self.assertEqual('GET', captured[1]['method'])
+        self.assertEqual('a/c', captured[1]['path'][7:])
+        params = sorted(captured[1]['qs'].split('&'))
+        self.assertEqual(
+            ['format=json', 'states=updating'], params)
+        captured_hdrs = captured[1]['headers']
+        self.assertEqual('shard', captured_hdrs.get('X-Backend-Record-Type'))
+        self.assertEqual('namespace',
+                         captured_hdrs.get('X-Backend-Record-Shard-Format'))
+        self.assertIsNone(self.memcache.get('shard-updating-v2/a/c'))
+        self.assertIsNone(actual)
+        lines = self.app.logger.get_lines_for_level('error')
+        self.assertEqual(1, len(lines))
+        self.assertIn('Problem with listing response from /v1/a/c/o', lines[0])
+
+
+class TestGetUpdateShardUTF8(TestGetUpdateShard):
+    bound_prefix = u'\u1234'
+    item = wsgi_to_str('\xe1\x88\xb41_test')
+
+
+class TestGetUpdateShardLegacy(TestGetUpdateShard):
+    def _create_response_data(self, shards, includes=None):
+        # older container servers never return the shorter 'namespace' format
+        # nor the 'X-Backend-Record-Shard-Format' header
+        resp_headers = {'X-Backend-Record-Type': 'shard'}
+        if includes is not None:
+            shards = [sr for sr in shards if includes in sr]
+        body = json.dumps([dict(sr) for sr in shards]).encode('ascii')
+        return body, resp_headers
+
+
+class TestGetUpdateShardLegacyUTF8(TestGetUpdateShard):
+    bound_prefix = u'\u1234'
+    item = wsgi_to_str('\xe1\x88\xb41_test')
+
+
+@patch_policies()
+class TestGetUpdatingNamespacesErrors(BaseObjectControllerMixin,
+                                      unittest.TestCase):
+    def setUp(self):
+        super(TestGetUpdatingNamespacesErrors, self).setUp()
+        self.ctrl = obj.BaseObjectController(self.app, 'a', 'c', 'o')
+
+    def _check_get_namespaces_bad_data(self, body):
+        req = Request.blank('/v1/a/c/o', method='PUT')
+        # empty response
+        resp_headers = {'X-Backend-Record-Type': 'shard'}
+        with mocked_http_conn(200, 200, body_iter=iter([b'', body]),
+                              headers=resp_headers):
+            actual, resp = self.ctrl._get_updating_namespaces(
+                req, 'a', 'c', '1_test')
+        self.assertEqual(200, resp.status_int)
+        self.assertIsNone(actual)
+        lines = self.app.logger.get_lines_for_level('error')
+        return lines
+
+    def test_get_namespaces_empty_body(self):
+        error_lines = self._check_get_namespaces_bad_data(b'')
+        self.assertIn('Problem with listing response', error_lines[0])
+        if six.PY2:
+            self.assertIn('No JSON', error_lines[0])
+        else:
+            self.assertIn('JSONDecodeError', error_lines[0])
+        self.assertFalse(error_lines[1:])
+
+    def test_get_namespaces_not_a_list(self):
+        body = json.dumps({}).encode('ascii')
+        error_lines = self._check_get_namespaces_bad_data(body)
+        self.assertIn('Problem with listing response', error_lines[0])
+        self.assertIn('not a list', error_lines[0])
+        self.assertFalse(error_lines[1:])
+
+    def test_get_namespaces_key_missing(self):
+        body = json.dumps([{}]).encode('ascii')
+        error_lines = self._check_get_namespaces_bad_data(body)
+        self.assertIn('Failed to get namespaces', error_lines[0])
+        self.assertIn('KeyError', error_lines[0])
+        self.assertFalse(error_lines[1:])
+
+    def test_get_namespaces_invalid_shard_range(self):
+        # lower > upper !
+        bad_ns_data = {'name': 'name', 'lower': 'z', 'upper': 'a'}
+        body = json.dumps([bad_ns_data]).encode('ascii')
+        error_lines = self._check_get_namespaces_bad_data(body)
+        self.assertIn('Failed to get namespaces', error_lines[0])
+        self.assertIn('ValueError', error_lines[0])
+        self.assertFalse(error_lines[1:])
+
+    def test_get_namespaces_missing_record_type(self):
+        req = Request.blank('/v1/a/c/o', method='PUT')
+        sr = utils.Namespace('a/c', 'l', 'u')
+        body = json.dumps([dict(sr)]).encode('ascii')
+        with mocked_http_conn(
+                200, 200, body_iter=iter([b'', body])):
+            actual, resp = self.ctrl._get_updating_namespaces(
+                req, 'a', 'c', '1_test')
+        self.assertEqual(200, resp.status_int)
+        self.assertIsNone(actual)
+        error_lines = self.app.logger.get_lines_for_level('error')
+        self.assertIn('Failed to get shard ranges', error_lines[0])
+        self.assertIn('unexpected record type', error_lines[0])
+        self.assertIn('/a/c', error_lines[0])
+        self.assertFalse(error_lines[1:])
+
+    def test_get_namespaces_wrong_record_type(self):
+        req = Request.blank('/v1/a/c/o', method='PUT')
+        sr = utils.Namespace('a/c', 'l', 'u')
+        body = json.dumps([dict(sr)]).encode('ascii')
+        headers = {'X-Backend-Record-Type': 'object'}
+        with mocked_http_conn(
+                200, 200, body_iter=iter([b'', body]),
+                headers=headers):
+            actual, resp = self.ctrl._get_updating_namespaces(
+                req, 'a', 'c', '1_test')
+        self.assertEqual(200, resp.status_int)
+        self.assertIsNone(actual)
+        error_lines = self.app.logger.get_lines_for_level('error')
+        self.assertIn('Failed to get shard ranges', error_lines[0])
+        self.assertIn('unexpected record type', error_lines[0])
+        self.assertIn('/a/c', error_lines[0])
+        self.assertFalse(error_lines[1:])
+
+    def test_get_namespaces_request_failed(self):
+        req = Request.blank('/v1/a/c/o', method='PUT')
+        with mocked_http_conn(200, 404, 404, 404):
+            actual, resp = self.ctrl._get_updating_namespaces(
+                req, 'a', 'c', '1_test')
+        self.assertEqual(404, resp.status_int)
+        self.assertIsNone(actual)
+        self.assertFalse(self.app.logger.get_lines_for_level('error'))
+        warning_lines = self.app.logger.get_lines_for_level('warning')
+        self.assertIn('Failed to get container listing', warning_lines[0])
+        self.assertIn('/a/c', warning_lines[0])
+        self.assertFalse(warning_lines[1:])
 
 
 if __name__ == '__main__':

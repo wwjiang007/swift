@@ -50,7 +50,8 @@ from swift.common.base_storage_server import BaseStorageServer
 from swift.common.header_key_dict import HeaderKeyDict
 from swift.common.request_helpers import get_name_and_placement, \
     is_user_meta, is_sys_or_user_meta, is_object_transient_sysmeta, \
-    resolve_etag_is_at_header, is_sys_meta, validate_internal_obj
+    resolve_etag_is_at_header, is_sys_meta, validate_internal_obj, \
+    is_backend_open_expired
 from swift.common.swob import HTTPAccepted, HTTPBadRequest, HTTPCreated, \
     HTTPInternalServerError, HTTPNoContent, HTTPNotFound, \
     HTTPPreconditionFailed, HTTPRequestTimeout, HTTPUnprocessableEntity, \
@@ -152,6 +153,7 @@ class ObjectController(BaseStorageServer):
             config_true_value(conf.get('keep_cache_private', 'false'))
         self.keep_cache_slo_manifest = \
             config_true_value(conf.get('keep_cache_slo_manifest', 'false'))
+        self.cooperative_period = int(conf.get("cooperative_period", 0))
 
         default_allowed_headers = '''
             content-disposition,
@@ -173,18 +175,8 @@ class ObjectController(BaseStorageServer):
         for header in extra_allowed_headers:
             if header not in RESERVED_DATAFILE_META:
                 self.allowed_headers.add(header)
-        if conf.get('auto_create_account_prefix'):
-            self.logger.warning('Option auto_create_account_prefix is '
-                                'deprecated. Configure '
-                                'auto_create_account_prefix under the '
-                                'swift-constraints section of '
-                                'swift.conf. This option will '
-                                'be ignored in a future release.')
-            self.auto_create_account_prefix = \
-                conf['auto_create_account_prefix']
-        else:
-            self.auto_create_account_prefix = AUTO_CREATE_ACCOUNT_PREFIX
 
+        self.auto_create_account_prefix = AUTO_CREATE_ACCOUNT_PREFIX
         self.expiring_objects_account = self.auto_create_account_prefix + \
             (conf.get('expiring_objects_account_name') or 'expiring_objects')
         self.expiring_objects_container_divisor = \
@@ -644,8 +636,7 @@ class ObjectController(BaseStorageServer):
         try:
             disk_file = self.get_diskfile(
                 device, partition, account, container, obj,
-                policy=policy, open_expired=config_true_value(
-                    request.headers.get('x-backend-replication', 'false')),
+                policy=policy, open_expired=is_backend_open_expired(request),
                 next_part_power=next_part_power)
         except DiskFileDeviceUnavailable:
             return HTTPInsufficientStorage(drive=device, request=request)
@@ -1083,8 +1074,7 @@ class ObjectController(BaseStorageServer):
             disk_file = self.get_diskfile(
                 device, partition, account, container, obj,
                 policy=policy, frag_prefs=frag_prefs,
-                open_expired=config_true_value(
-                    request.headers.get('x-backend-replication', 'false')))
+                open_expired=is_backend_open_expired(request))
         except DiskFileDeviceUnavailable:
             return HTTPInsufficientStorage(drive=device, request=request)
         try:
@@ -1107,10 +1097,15 @@ class ObjectController(BaseStorageServer):
                     )
                 )
                 conditional_etag = resolve_etag_is_at_header(request, metadata)
+                app_iter = disk_file.reader(
+                    keep_cache=keep_cache,
+                    cooperative_period=self.cooperative_period,
+                )
                 response = Response(
-                    app_iter=disk_file.reader(keep_cache=keep_cache),
-                    request=request, conditional_response=True,
-                    conditional_etag=conditional_etag)
+                    app_iter=app_iter, request=request,
+                    conditional_response=True,
+                    conditional_etag=conditional_etag,
+                )
                 response.headers['Content-Type'] = metadata.get(
                     'Content-Type', 'application/octet-stream')
                 for key, value in metadata.items():
@@ -1161,8 +1156,7 @@ class ObjectController(BaseStorageServer):
             disk_file = self.get_diskfile(
                 device, partition, account, container, obj,
                 policy=policy, frag_prefs=frag_prefs,
-                open_expired=config_true_value(
-                    request.headers.get('x-backend-replication', 'false')))
+                open_expired=is_backend_open_expired(request))
         except DiskFileDeviceUnavailable:
             return HTTPInsufficientStorage(drive=device, request=request)
         try:

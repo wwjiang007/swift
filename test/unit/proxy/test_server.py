@@ -58,8 +58,9 @@ from test.unit import (
     connect_tcp, readuntil2crlfs, fake_http_connect, FakeRing,
     FakeMemcache, patch_policies, write_fake_ring, mocked_http_conn,
     DEFAULT_TEST_EC_TYPE, make_timestamp_iter, skip_if_no_xattrs,
-    FakeHTTPResponse)
+    FakeHTTPResponse, node_error_count, node_last_error, set_node_errors)
 from test.unit.helpers import setup_servers, teardown_servers
+from swift.common.statsd_client import StatsdClient
 from swift.proxy import server as proxy_server
 from swift.proxy.controllers.obj import ReplicatedObjectController
 from swift.obj import server as object_server
@@ -71,9 +72,8 @@ from swift.common.exceptions import ChunkReadTimeout, DiskFileNotExist, \
     APIVersionError, ChunkReadError
 from swift.common import utils, constraints, registry
 from swift.common.utils import hash_path, storage_directory, \
-    parse_content_type, parse_mime_headers, StatsdClient, \
-    iter_multipart_mime_documents, public, mkdirs, NullLogger, md5, \
-    node_to_string, NamespaceBoundList
+    parse_content_type, parse_mime_headers, iter_multipart_mime_documents, \
+    public, mkdirs, NullLogger, md5, node_to_string, NamespaceBoundList
 from swift.common.wsgi import loadapp, ConfigString
 from swift.common.http_protocol import SwiftHttpProtocol
 from swift.proxy.controllers import base as proxy_base
@@ -152,31 +152,6 @@ def parse_headers_string(headers_str):
             else:
                 headers_dict[header.decode('utf8')] = value.decode('utf8')
     return headers_dict
-
-
-def get_node_error_stats(proxy_app, ring_node):
-    node_key = proxy_app.error_limiter.node_key(ring_node)
-    return proxy_app.error_limiter.stats.get(node_key) or {}
-
-
-def node_error_count(proxy_app, ring_node):
-    # Reach into the proxy's internals to get the error count for a
-    # particular node
-    return get_node_error_stats(proxy_app, ring_node).get('errors', 0)
-
-
-def node_last_error(proxy_app, ring_node):
-    # Reach into the proxy's internals to get the last error for a
-    # particular node
-    return get_node_error_stats(proxy_app, ring_node).get('last_error')
-
-
-def set_node_errors(proxy_app, ring_node, value, last_error):
-    # Set the node's error count to value
-    node_key = proxy_app.error_limiter.node_key(ring_node)
-    stats = {'errors': value,
-             'last_error': last_error}
-    proxy_app.error_limiter.stats[node_key] = stats
 
 
 @contextmanager
@@ -592,15 +567,6 @@ class TestProxyServerConfiguration(unittest.TestCase):
         app = self._make_app({})
         self.assertEqual(app.auto_create_account_prefix, '.')
         self.assertEqual(self.logger.get_lines_for_level('warning'), [])
-
-        app = self._make_app({'auto_create_account_prefix': '-'})
-        self.assertEqual(app.auto_create_account_prefix, '-')
-        self.assertEqual(self.logger.get_lines_for_level('warning'), [
-            'Option auto_create_account_prefix is deprecated. '
-            'Configure auto_create_account_prefix under the '
-            'swift-constraints section of swift.conf. This option '
-            'will be ignored in a future release.'
-        ])
 
     def test_node_timeout(self):
         # later config should be extended to assert more config options
@@ -2327,7 +2293,8 @@ class TestProxyServerConfigLoading(unittest.TestCase):
         """ % self.tempdir
         conf_path = self._write_conf(dedent(conf_sections))
 
-        with mock.patch('swift.common.utils.StatsdClient') as mock_statsd:
+        with mock.patch('swift.common.statsd_client.StatsdClient')\
+                as mock_statsd:
             app = loadapp(conf_path, allow_modify_pipeline=False)
         # logger name is hard-wired 'proxy-server'
         self.assertEqual('proxy-server', app.logger.name)
@@ -2350,7 +2317,8 @@ class TestProxyServerConfigLoading(unittest.TestCase):
         """ % self.tempdir
         conf_path = self._write_conf(dedent(conf_sections))
 
-        with mock.patch('swift.common.utils.StatsdClient') as mock_statsd:
+        with mock.patch('swift.common.statsd_client.StatsdClient') \
+                as mock_statsd:
             app = loadapp(conf_path, allow_modify_pipeline=False)
         # logger name is hard-wired 'proxy-server'
         self.assertEqual('proxy-server', app.logger.name)
@@ -4176,20 +4144,32 @@ class TestReplicatedObjectController(
         StoragePolicy(1, 'one', object_ring=FakeRing()),
     ])
     def test_POST_backend_headers(self):
+        self.app = proxy_server.Application(
+            {},
+            account_ring=FakeRing(separate_replication=True),
+            container_ring=FakeRing(separate_replication=True))
+
+        part = self.app.container_ring.get_part('a', 'c')
+        nodes = self.app.container_ring.get_part_nodes(part)
+        self.assertNotEqual(nodes[0]['ip'], nodes[0]['replication_ip'])
+
         # reset the router post patch_policies
         self.app.obj_controller_router = proxy_server.ObjectControllerRouter()
         self.app.sort_nodes = lambda nodes, *args, **kwargs: nodes
 
-        def do_test(resp_headers):
+        def do_test(resp_headers, use_replication=False):
             backend_requests = []
 
             def capture_requests(ip, port, method, path, headers, *args,
                                  **kwargs):
                 backend_requests.append((method, path, headers))
 
+            replication_aware = 'true' if use_replication else 'false'
             req = Request.blank('/v1/a/c/o', {}, method='POST',
                                 headers={'X-Object-Meta-Color': 'Blue',
-                                         'Content-Type': 'text/plain'})
+                                         'Content-Type': 'text/plain',
+                                         'x-backend-use-replication-network':
+                                             replication_aware})
 
             # we want the container_info response to says a policy index of 1
             with mocked_http_conn(
@@ -4244,7 +4224,10 @@ class TestReplicatedObjectController(
 
             expected = {}
             for i, device in enumerate(['sda', 'sdb', 'sdc']):
-                expected[device] = '10.0.0.%d:100%d' % (i, i)
+                if use_replication:
+                    expected[device] = '10.0.1.%d:110%d' % (i, i)
+                else:
+                    expected[device] = '10.0.0.%d:100%d' % (i, i)
             self.assertEqual(container_headers, expected)
 
             # and again with policy override
@@ -4277,6 +4260,7 @@ class TestReplicatedObjectController(
         do_test(resp_headers)
         resp_headers['X-Backend-Sharding-State'] = 'unsharded'
         do_test(resp_headers)
+        do_test(resp_headers, use_replication=True)
 
     def _check_request(self, req, method, path, headers=None, params=None):
         self.assertEqual(method, req['method'])
@@ -4431,7 +4415,8 @@ class TestReplicatedObjectController(
                               'account.info.infocache.hit': 2,
                               'container.info.cache.miss.200': 1,
                               'container.info.infocache.hit': 1,
-                              'object.shard_updating.cache.miss.200': 1},
+                              'object.shard_updating.cache.miss.200': 1,
+                              'object.shard_updating.cache.set': 1},
                              stats)
             self.assertEqual([], self.app.logger.log_dict['set_statsd_prefix'])
             info_lines = self.logger.get_lines_for_level('info')
@@ -4795,7 +4780,8 @@ class TestReplicatedObjectController(
                               'object.shard_updating.cache.hit': 1,
                               'container.info.cache.hit': 1,
                               'account.info.cache.hit': 1,
-                              'object.shard_updating.cache.skip.200': 1},
+                              'object.shard_updating.cache.skip.200': 1,
+                              'object.shard_updating.cache.set': 1},
                              stats)
             # verify statsd prefix is not mutated
             self.assertEqual([], self.app.logger.log_dict['set_statsd_prefix'])
@@ -4865,7 +4851,99 @@ class TestReplicatedObjectController(
                 'container.info.infocache.hit': 3,
                 'object.shard_updating.cache.skip.200': 1,
                 'object.shard_updating.cache.hit': 1,
-                'object.shard_updating.cache.error.200': 1})
+                'object.shard_updating.cache.error.200': 1,
+                'object.shard_updating.cache.set': 2
+            })
+
+        do_test('POST', 'sharding')
+        do_test('POST', 'sharded')
+        do_test('DELETE', 'sharding')
+        do_test('DELETE', 'sharded')
+        do_test('PUT', 'sharding')
+        do_test('PUT', 'sharded')
+
+    @patch_policies([
+        StoragePolicy(0, 'zero', is_default=True, object_ring=FakeRing()),
+        StoragePolicy(1, 'one', object_ring=FakeRing()),
+    ])
+    def test_backend_headers_update_shard_container_cache_set_error(self):
+        # verify that backend container update is directed to the shard
+        # container despite memcache set error
+        # reset the router post patch_policies
+        self.app.obj_controller_router = proxy_server.ObjectControllerRouter()
+        self.app.sort_nodes = lambda nodes, *args, **kwargs: nodes
+        self.app.recheck_updating_shard_ranges = 3600
+        self.app.container_updating_shard_ranges_skip_cache = 0.001
+
+        def do_test(method, sharding_state):
+            self.app.logger.clear()  # clean capture state
+            # simulate memcache error when setting updating namespaces;
+            # expect 4 memcache sets: account info, container info, container
+            # info again from namespaces GET subrequest, namespaces
+            cache = FakeMemcache(error_on_set=[False, False, False, True])
+            req = Request.blank(
+                '/v1/a/c/o', {'swift.cache': cache},
+                method=method, body='', headers={'Content-Type': 'text/plain'})
+            # acct HEAD, cont HEAD, cont shard GET, obj POSTs
+            status_codes = (200, 200, 200, 202, 202, 202)
+            resp_headers = {'X-Backend-Storage-Policy-Index': 1,
+                            'x-backend-sharding-state': sharding_state,
+                            'X-Backend-Record-Type': 'shard'}
+            shard_ranges = [
+                utils.ShardRange(
+                    '.shards_a/c_not_used', utils.Timestamp.now(), '', 'l'),
+                utils.ShardRange(
+                    '.shards_a/c_shard', utils.Timestamp.now(), 'l', 'u'),
+                utils.ShardRange(
+                    '.shards_a/c_nope', utils.Timestamp.now(), 'u', ''),
+            ]
+            body = json.dumps([
+                dict(shard_range)
+                for shard_range in shard_ranges]).encode('ascii')
+            with mock.patch('random.random', return_value=0), \
+                mocked_http_conn(*status_codes, headers=resp_headers,
+                                 body=body) as fake_conn:
+                resp = req.get_response(self.app)
+
+            self.assertEqual(resp.status_int, 202)
+
+            stats = self.app.logger.statsd_client.get_increment_counts()
+            self.assertEqual({'account.info.cache.miss.200': 1,
+                              'account.info.infocache.hit': 2,
+                              'container.info.cache.miss.200': 1,
+                              'container.info.infocache.hit': 1,
+                              'object.shard_updating.cache.skip.200': 1,
+                              'object.shard_updating.cache.set_error': 1},
+                             stats)
+            # verify statsd prefix is not mutated
+            self.assertEqual([], self.app.logger.log_dict['set_statsd_prefix'])
+            # sanity check: namespaces not in cache
+            cache_key = 'shard-updating-v2/a/c'
+            self.assertNotIn(cache_key, req.environ['swift.cache'].store)
+
+            # make sure backend requests included expected container headers
+            container_headers = {}
+            for backend_request in fake_conn.requests[3:]:
+                req_headers = backend_request['headers']
+                device = req_headers['x-container-device']
+                container_headers[device] = req_headers['x-container-host']
+                expectations = {
+                    'method': method,
+                    'path': '/0/a/c/o',
+                    'headers': {
+                        'X-Container-Partition': '0',
+                        'Host': 'localhost:80',
+                        'Referer': '%s http://localhost/v1/a/c/o' % method,
+                        'X-Backend-Storage-Policy-Index': '1',
+                        'X-Backend-Quoted-Container-Path': shard_ranges[1].name
+                    },
+                }
+                self._check_request(backend_request, **expectations)
+
+            expected = {}
+            for i, device in enumerate(['sda', 'sdb', 'sdc']):
+                expected[device] = '10.0.0.%d:100%d' % (i, i)
+            self.assertEqual(container_headers, expected)
 
         do_test('POST', 'sharding')
         do_test('POST', 'sharded')
@@ -5324,99 +5402,148 @@ class TestReplicatedObjectController(
             resp = req.get_response(self.app)
             self.assertEqual(resp.status_int, 201)
 
-    def test_node_read_timeout(self):
+    def _do_test_node_read_timeout(self, slow=None, etags=None):
+        # this helper gets as far as making the first backend request,
+        # returning 200, but the response body isn't read - callers read the
+        # body and trigger any resuming GETs.
+        object_ring = self.app.get_object_ring(None)
+        # there are only 3 devices so no handoff requests expected
+        self.assertEqual(3, len(object_ring.devs))
+        self.app.recoverable_node_timeout = 0.2
+
+        self.logger.clear()
+        req = Request.blank('/v1/a/c/o', environ={'REQUEST_METHOD': 'GET'})
+        self.app.update_request(req)
+
+        request_log = []
+
+        # we don't use mocked_http_conn because we return before the code_iter
+        # is empty and would get a "left over status" AssertionError
+        def capture_req(ipaddr, port, device, partition, method, path,
+                        headers=None, query_string=None):
+            request_log.append((method, path))
+
+        # account HEAD, container HEAD, obj GET x 3
+        set_http_connect(200, 200, 200, 200, 200, body=b'lalala',
+                         slow=slow, etags=etags, give_connect=capture_req)
+        resp = req.get_response(self.app)
+        self.assertEqual(200, resp.status_int)
+        # at this point we've only made the request to the first object
+        self.assertEqual([
+            ('HEAD', '/a'),
+            ('HEAD', '/a/c'),
+            ('GET', '/a/c/o'),
+        ], request_log)
+        return resp, request_log
+
+    def test_node_read_timeout_retry_three_time_out(self):
         with save_globals():
-            self.app.account_ring.get_nodes('account')
-            for dev in self.app.account_ring.devs:
-                dev['ip'] = '127.0.0.1'
-                dev['port'] = 1
-            self.app.container_ring.get_nodes('account')
-            for dev in self.app.container_ring.devs:
-                dev['ip'] = '127.0.0.1'
-                dev['port'] = 1
-            object_ring = self.app.get_object_ring(None)
-            object_ring.get_nodes('account')
-            for dev in object_ring.devs:
-                dev['ip'] = '127.0.0.1'
-                dev['port'] = 1
-            req = Request.blank('/v1/a/c/o', environ={'REQUEST_METHOD': 'GET'})
-            self.app.update_request(req)
-            set_http_connect(200, 200, 200, slow=0.1)
-            req.sent_size = 0
-            resp = req.get_response(self.app)
-            got_exc = False
-            try:
-                resp.body
-            except ChunkReadTimeout:
-                got_exc = True
-            self.assertFalse(got_exc)
-            self.app.recoverable_node_timeout = 0.1
-            set_http_connect(200, 200, 200, slow=1.0)
-            resp = req.get_response(self.app)
+            # all obj nodes time out
+            resp, req_log = self._do_test_node_read_timeout(
+                slow=[0.0, 0.0, 1.0, 1.0, 1.0])
             with self.assertRaises(ChunkReadTimeout):
                 resp.body
+            # two nodes left to attempt resume, both timeout reading body
+            self.assertEqual([
+                ('GET', '/a/c/o'),
+                ('GET', '/a/c/o'),
+            ], req_log[3:])
+            error_lines = self.logger.get_lines_for_level('error')
+            self.assertEqual(3, len(error_lines))
+            for line in error_lines[:3]:
+                self.assertIn('Trying to read object during GET', line)
 
-    def test_node_read_timeout_retry(self):
+    def test_node_read_timeout_retry_only_first_time_out(self):
         with save_globals():
-            self.app.account_ring.get_nodes('account')
-            for dev in self.app.account_ring.devs:
-                dev['ip'] = '127.0.0.1'
-                dev['port'] = 1
-            self.app.container_ring.get_nodes('account')
-            for dev in self.app.container_ring.devs:
-                dev['ip'] = '127.0.0.1'
-                dev['port'] = 1
-            object_ring = self.app.get_object_ring(None)
-            object_ring.get_nodes('account')
-            for dev in object_ring.devs:
-                dev['ip'] = '127.0.0.1'
-                dev['port'] = 1
-            req = Request.blank('/v1/a/c/o', environ={
-                'REQUEST_METHOD': 'GET', 'swift.cache': FakeMemcache()})
-            self.app.update_request(req)
+            resp, req_log = self._do_test_node_read_timeout(
+                slow=[0, 0, 1.0])
+            self.assertEqual([], req_log[3:])  # sanity
+            # we get the body
+            self.assertEqual(resp.body, b'lalala')
+            # only one retry
+            self.assertEqual([
+                ('GET', '/a/c/o'),
+            ], req_log[3:])
+            error_lines = self.logger.get_lines_for_level('error')
+            self.assertEqual(1, len(error_lines))
+            self.assertIn('Trying to read object during GET', error_lines[0])
 
-            self.app.recoverable_node_timeout = 0.1
-            set_http_connect(200, 200, 200, slow=[1.0, 1.0, 1.0])
-            resp = req.get_response(self.app)
+    def test_node_read_timeout_retry_two_time_out(self):
+        with save_globals():
+            resp, req_log = self._do_test_node_read_timeout(
+                slow=[0, 0, 1.0, 1.0])
+            self.assertEqual([], req_log[3:])  # sanity
+            # first 2 obj nodes time out
+            self.assertEqual(resp.body, b'lalala')
+            # ... so two retries
+            self.assertEqual([
+                ('GET', '/a/c/o'),
+                ('GET', '/a/c/o'),
+            ], req_log[3:])
+            error_lines = self.logger.get_lines_for_level('error')
+            self.assertEqual(2, len(error_lines))
+            for line in error_lines[:2]:
+                self.assertIn('Trying to read object during GET', line)
+
+    def test_node_read_timeout_retry_first_two_time_out_etags_match(self):
+        with save_globals():
+            resp, req_log = self._do_test_node_read_timeout(
+                slow=[0, 0, 1.0, 1.0],
+                etags=['account', 'container', 'a', 'a', 'a'])
+            self.assertEqual([], req_log[3:])  # sanity
+            # we get the body
+            self.assertEqual(resp.body, b'lalala')
+            # this is the same as above test, but explicit etag match
+            self.assertEqual([
+                ('GET', '/a/c/o'),
+                ('GET', '/a/c/o'),
+            ], req_log[3:])
+            error_lines = self.logger.get_lines_for_level('error')
+            self.assertEqual(2, len(error_lines))
+            for line in error_lines[:2]:
+                self.assertIn('Trying to read object during GET', line)
+
+    def test_node_read_timeout_retry_one_time_out_one_etag_mismatch(self):
+        with save_globals():
+            resp, req_log = self._do_test_node_read_timeout(
+                slow=[0, 0, 1.0],
+                etags=['account', 'container', 'a', 'b', 'a'])
+            self.assertEqual([], req_log[3:])  # sanity
+            self.assertEqual(resp.body, b'lalala')
+            # N.B. even if you break the proxy to return second response, this
+            # header was sent with the original 200 ok
+            self.assertEqual(resp.etag, 'a')
+            # but we can know we got the right response because we had to retry
+            # twice because of etag
+            self.assertEqual([
+                ('GET', '/a/c/o'),
+                ('GET', '/a/c/o'),
+            ], req_log[3:])
+            error_lines = self.logger.get_lines_for_level('error')
+            # only one timeout error for the first source because the second
+            # source with wrong etag is not read
+            self.assertEqual(1, len(error_lines))
+            self.assertIn('Trying to read object during GET', error_lines[0])
+
+    def test_node_read_timeout_retry_one_time_out_two_etag_mismatch(self):
+        with save_globals():
+            resp, req_log = self._do_test_node_read_timeout(
+                slow=[0, 0, 1.0],
+                etags=['account', 'container', 'a', 'b', 'b'])
             with self.assertRaises(ChunkReadTimeout):
                 resp.body
-
-            set_http_connect(200, 200, 200, body=b'lalala',
-                             slow=[1.0, 1.0])
-            resp = req.get_response(self.app)
-            self.assertEqual(resp.body, b'lalala')
-
-            set_http_connect(200, 200, 200, body=b'lalala',
-                             slow=[1.0, 1.0], etags=['a', 'a', 'a'])
-            resp = req.get_response(self.app)
-            self.assertEqual(resp.body, b'lalala')
-
-            set_http_connect(200, 200, 200, body=b'lalala',
-                             slow=[1.0, 1.0], etags=['a', 'b', 'a'])
-            resp = req.get_response(self.app)
-            self.assertEqual(resp.body, b'lalala')
-
-            set_http_connect(200, 200, 200, body=b'lalala',
-                             slow=[1.0, 1.0], etags=['a', 'b', 'b'])
-            resp = req.get_response(self.app)
-            with self.assertRaises(ChunkReadTimeout):
-                resp.body
+            self.assertEqual([
+                ('GET', '/a/c/o'),
+                ('GET', '/a/c/o'),
+            ], req_log[3:])
+            error_lines = self.logger.get_lines_for_level('error')
+            # only one timeout error for the first source because the second
+            # and third sources with wrong etag are not read
+            self.assertEqual(1, len(error_lines))
+            self.assertIn('Trying to read object during GET', error_lines[0])
 
     def test_node_write_timeout(self):
         with save_globals():
-            self.app.account_ring.get_nodes('account')
-            for dev in self.app.account_ring.devs:
-                dev['ip'] = '127.0.0.1'
-                dev['port'] = 1
-            self.app.container_ring.get_nodes('account')
-            for dev in self.app.container_ring.devs:
-                dev['ip'] = '127.0.0.1'
-                dev['port'] = 1
-            object_ring = self.app.get_object_ring(None)
-            object_ring.get_nodes('account')
-            for dev in object_ring.devs:
-                dev['ip'] = '127.0.0.1'
-                dev['port'] = 1
             req = Request.blank('/v1/a/c/o',
                                 environ={'REQUEST_METHOD': 'PUT'},
                                 headers={'Content-Length': '4',
@@ -11030,18 +11157,18 @@ class TestContainerController(unittest.TestCase):
             self.assertEqual(timestamp, timestamps[0])
             self.assertTrue(re.match(r'[0-9]{10}\.[0-9]{5}', timestamp))
 
-    def test_node_read_timeout_retry_to_container(self):
+    def test_node_read_timeout_no_retry_to_container(self):
         with save_globals():
             req = Request.blank('/v1/a/c', environ={'REQUEST_METHOD': 'GET'})
             self.app.node_timeout = 0.1
-            set_http_connect(200, 200, 200, body='abcdef', slow=[1.0, 1.0])
+            # account HEAD, container GET
+            set_http_connect(200, 200, body='abcdef', slow=[0.0, 1.0])
             resp = req.get_response(self.app)
-            got_exc = False
-            try:
+            self.assertEqual(200, resp.status_int)
+            with self.assertRaises(ChunkReadTimeout):
                 resp.body
-            except ChunkReadTimeout:
-                got_exc = True
-            self.assertTrue(got_exc)
+            error_lines = self.app.logger.get_lines_for_level('error')
+            self.assertEqual(0, len(error_lines))
 
 
 @patch_policies([StoragePolicy(0, 'zero', True, object_ring=FakeRing())])
@@ -11906,10 +12033,11 @@ class TestSwiftInfo(unittest.TestCase):
                          constraints.MAX_OBJECT_NAME_LENGTH)
         self.assertIn('strict_cors_mode', si)
         self.assertFalse(si['allow_account_management'])
+        self.assertFalse(si['allow_open_expired'])
         self.assertFalse(si['account_autocreate'])
         # this next test is deliberately brittle in order to alert if
         # other items are added to swift info
-        self.assertEqual(len(si), 17)
+        self.assertEqual(len(si), 18)
 
         si = registry.get_swift_info()['swift']
         # Tehse settings is by default excluded by disallowed_sections

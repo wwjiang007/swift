@@ -36,7 +36,8 @@ from swift.common.swob import HTTPBadRequest, \
     HTTPServiceUnavailable, Range, is_chunked, multi_range_iterator, \
     HTTPPreconditionFailed, wsgi_to_bytes, wsgi_unquote, wsgi_to_str
 from swift.common.utils import split_path, validate_device_partition, \
-    close_if_possible, maybe_multipart_byteranges_to_document_iters, \
+    close_if_possible, friendly_close, \
+    maybe_multipart_byteranges_to_document_iters, \
     multipart_byteranges_to_document_iters, parse_content_type, \
     parse_content_range, csv_append, list_from_csv, Spliterator, quote, \
     RESERVED, config_true_value, md5, CloseableChain, select_ip_port
@@ -92,6 +93,39 @@ def get_param(req, name, default=None):
                     request=req, content_type='text/plain',
                     body='"%s" parameter not valid UTF-8' % name)
     return value
+
+
+def get_valid_part_num(req):
+    """
+    Any non-range GET or HEAD request for a SLO object may include a
+    part-number parameter in query string.  If the passed in request
+    includes a part-number parameter it will be parsed into a valid integer
+    and returned.  If the passed in request does not include a part-number
+    param we will return None.  If the part-number parameter is invalid for
+    the given request we will raise the appropriate HTTP exception
+
+    :param req: the request object
+
+    :returns: validated part-number value or None
+    :raises HTTPBadRequest: if request or part-number param is not valid
+    """
+    part_number_param = get_param(req, 'part-number')
+    if part_number_param is None:
+        return None
+    try:
+        part_number = int(part_number_param)
+        if part_number <= 0:
+            raise ValueError
+    except ValueError:
+        raise HTTPBadRequest('Part number must be an integer greater '
+                             'than 0')
+
+    if req.range:
+        raise HTTPBadRequest(req=req,
+                             body='Range requests are not supported '
+                                  'with part number queries')
+
+    return part_number
 
 
 def validate_params(req, names):
@@ -460,15 +494,17 @@ class SegmentedIterable(object):
     :param app: WSGI application from which segments will come
 
     :param listing_iter: iterable yielding the object segments to fetch,
-        along with the byte subranges to fetch, in the form of a 5-tuple
-        (object-path, object-etag, object-size, first-byte, last-byte).
+        along with the byte sub-ranges to fetch. Each yielded item should be a
+        dict with the following keys: ``path`` or ``raw_data``,
+        ``first-byte``, ``last-byte``, ``hash`` (optional), ``bytes``
+        (optional).
 
-        If object-etag is None, no MD5 verification will be done.
+        If ``hash`` is None, no MD5 verification will be done.
 
-        If object-size is None, no length verification will be done.
+        If ``bytes`` is None, no length verification will be done.
 
-        If first-byte and last-byte are None, then the entire object will be
-        fetched.
+        If ``first-byte`` and ``last-byte`` are None, then the entire object
+        will be fetched.
 
     :param max_get_time: maximum permitted duration of a GET request (seconds)
     :param logger: logger object
@@ -740,7 +776,10 @@ class SegmentedIterable(object):
             for x in mri:
                 yield x
         finally:
-            self.close()
+            # Spliterator and multi_range_iterator can't possibly know we've
+            # consumed the whole of the app_iter, but we want to read/close the
+            # final segment response
+            friendly_close(self.app_iter)
 
     def validate_first_segment(self):
         """
@@ -954,3 +993,31 @@ def get_ip_port(node, headers):
     """
     return select_ip_port(
         node, use_replication=is_use_replication_network(headers))
+
+
+def is_open_expired(app, req):
+    """
+    Helper function to check if a request with the header 'x-open-expired'
+    can access an object that has not yet been reaped by the object-expirer
+    based on the allow_open_expired global config.
+
+    :param app: the application instance
+    :param req: request object
+    """
+    return (config_true_value(app.allow_open_expired) and
+            config_true_value(req.headers.get('x-open-expired')))
+
+
+def is_backend_open_expired(request):
+    """
+    Helper function to check if a request has either the headers
+    'x-backend-open-expired' or 'x-backend-replication' for the backend
+    to access expired objects.
+
+    :param request: request object
+    """
+    x_backend_open_expired = config_true_value(request.headers.get(
+        'x-backend-open-expired', 'false'))
+    x_backend_replication = config_true_value(request.headers.get(
+        'x-backend-replication', 'false'))
+    return x_backend_open_expired or x_backend_replication

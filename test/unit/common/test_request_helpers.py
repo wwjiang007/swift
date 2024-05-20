@@ -14,15 +14,17 @@
 # limitations under the License.
 
 """Tests for swift.common.request_helpers"""
-
+import argparse
 import unittest
-from swift.common.swob import Request, HTTPException, HeaderKeyDict
+from swift.common.swob import Request, HTTPException, HeaderKeyDict, HTTPOk
 from swift.common.storage_policy import POLICIES, EC_POLICY, REPL_POLICY
 from swift.common import request_helpers as rh
 from swift.common.constraints import AUTO_CREATE_ACCOUNT_PREFIX
 
+from test.debug_logger import debug_logger
 from test.unit import patch_policies
 from test.unit.common.test_utils import FakeResponse
+from test.unit.common.middleware.helpers import FakeSwift
 
 
 server_types = ['account', 'container', 'object']
@@ -471,6 +473,46 @@ class TestRequestHelpers(unittest.TestCase):
         self.assertEqual(str(ctx.exception),
                          'Invalid reserved name')
 
+    def test_is_open_expired(self):
+        app = argparse.Namespace(allow_open_expired=False)
+        req = Request.blank('/v1/a/c/o', headers={'X-Open-Expired': 'yes'})
+        self.assertFalse(rh.is_open_expired(app, req))
+        req = Request.blank('/v1/a/c/o', headers={'X-Open-Expired': 'no'})
+        self.assertFalse(rh.is_open_expired(app, req))
+        req = Request.blank('/v1/a/c/o', headers={})
+        self.assertFalse(rh.is_open_expired(app, req))
+
+        app = argparse.Namespace(allow_open_expired=True)
+        req = Request.blank('/v1/a/c/o', headers={'X-Open-Expired': 'no'})
+        self.assertFalse(rh.is_open_expired(app, req))
+        req = Request.blank('/v1/a/c/o', headers={})
+        self.assertFalse(rh.is_open_expired(app, req))
+
+        req = Request.blank('/v1/a/c/o', headers={'X-Open-Expired': 'yes'})
+        self.assertTrue(rh.is_open_expired(app, req))
+
+    def test_is_backend_open_expired(self):
+        req = Request.blank('/v1/a/c/o', headers={
+            'X-Backend-Open-Expired': 'yes'
+        })
+        self.assertTrue(rh.is_backend_open_expired(req))
+        req = Request.blank('/v1/a/c/o', headers={
+            'X-Backend-Open-Expired': 'no'
+        })
+        self.assertFalse(rh.is_backend_open_expired(req))
+
+        req = Request.blank('/v1/a/c/o', headers={
+            'X-Backend-Replication': 'yes'
+        })
+        self.assertTrue(rh.is_backend_open_expired(req))
+        req = Request.blank('/v1/a/c/o', headers={
+            'X-Backend-Replication': 'no'
+        })
+        self.assertFalse(rh.is_backend_open_expired(req))
+
+        req = Request.blank('/v1/a/c/o', headers={})
+        self.assertFalse(rh.is_backend_open_expired(req))
+
 
 class TestHTTPResponseToDocumentIters(unittest.TestCase):
     def test_200(self):
@@ -704,3 +746,56 @@ class TestHTTPResponseToDocumentIters(unittest.TestCase):
             'X-Object-Meta-Color': 'blue',
         })
         self.assertIsNone(req.range)
+
+
+class TestSegmentedIterable(unittest.TestCase):
+
+    def setUp(self):
+        self.logger = debug_logger()
+        self.app = FakeSwift()
+        self.expected_unread_requests = {}
+
+    def tearDown(self):
+        self.assertFalse(self.app.unclosed_requests)
+        self.assertEqual(self.app.unread_requests,
+                         self.expected_unread_requests)
+
+    def test_simple_segments_app_iter(self):
+        self.app.register('GET', '/a/c/seg1', HTTPOk, {}, 'segment1')
+        self.app.register('GET', '/a/c/seg2', HTTPOk, {}, 'segment2')
+        req = Request.blank('/v1/a/c/mpu')
+        listing_iter = [
+            {'path': '/a/c/seg1', 'first_byte': None, 'last_byte': None},
+            {'path': '/a/c/seg2', 'first_byte': None, 'last_byte': None},
+        ]
+        si = rh.SegmentedIterable(req, self.app, listing_iter, 60, self.logger,
+                                  'test-agent', 'test-source')
+        body = b''.join(si.app_iter)
+        self.assertEqual(b'segment1segment2', body)
+
+    def test_simple_segments_app_iter_ranges(self):
+        self.app.register('GET', '/a/c/seg1', HTTPOk, {}, 'segment1')
+        self.app.register('GET', '/a/c/seg2', HTTPOk, {}, 'segment2')
+        req = Request.blank('/v1/a/c/mpu')
+        listing_iter = [
+            {'path': '/a/c/seg1', 'first_byte': None, 'last_byte': None},
+            {'path': '/a/c/seg2', 'first_byte': None, 'last_byte': None},
+        ]
+        si = rh.SegmentedIterable(req, self.app, listing_iter, 60, self.logger,
+                                  'test-agent', 'test-source')
+        body = b''.join(si.app_iter_ranges(
+            [(0, 8), (8, 16)], b'app/foo', b'bound', 16))
+        expected = b'\r\n'.join([
+            b'--bound',
+            b'Content-Type: app/foo',
+            b'Content-Range: bytes 0-7/16',
+            b'',
+            b'segment1',
+            b'--bound',
+            b'Content-Type: app/foo',
+            b'Content-Range: bytes 8-15/16',
+            b'',
+            b'segment2',
+            b'--bound--',
+        ])
+        self.assertEqual(expected, body)

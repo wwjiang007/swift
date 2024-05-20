@@ -29,20 +29,20 @@ from swift.proxy.controllers.base import headers_to_container_info, \
     get_cache_key, get_account_info, get_info, get_object_info, \
     Controller, GetOrHeadHandler, bytes_to_skip, clear_info_cache, \
     set_info_cache, NodeIter, headers_from_container_info, \
-    record_cache_op_metrics, GetterSource
+    record_cache_op_metrics, GetterSource, get_namespaces_from_cache, \
+    set_namespaces_in_cache
 from swift.common.swob import Request, HTTPException, RESPONSE_REASONS, \
-    bytes_to_wsgi, wsgi_to_str
+    bytes_to_wsgi
 from swift.common import exceptions
-from swift.common.utils import split_path, ShardRange, Timestamp, \
-    GreenthreadSafeIterator, GreenAsyncPile
+from swift.common.utils import split_path, Timestamp, \
+    GreenthreadSafeIterator, GreenAsyncPile, NamespaceBoundList
 from swift.common.header_key_dict import HeaderKeyDict
 from swift.common.http import is_success
 from swift.common.storage_policy import StoragePolicy, StoragePolicyCollection
 from test.debug_logger import debug_logger
 from test.unit import (
-    fake_http_connect, FakeRing, FakeMemcache, PatchPolicies,
-    make_timestamp_iter, mocked_http_conn, patch_policies, FakeSource,
-    StubResponse)
+    fake_http_connect, FakeRing, FakeMemcache, PatchPolicies, patch_policies,
+    FakeSource, StubResponse, CaptureIteratorFactory)
 from swift.common.request_helpers import (
     get_sys_meta_prefix, get_object_transient_sysmeta
 )
@@ -181,8 +181,8 @@ class FakeCache(FakeMemcache):
         # Fake a json roundtrip
         self.stub = json.loads(json.dumps(stub))
 
-    def get(self, key):
-        return self.stub or self.store.get(key)
+    def get(self, key, raise_on_error=False):
+        return self.stub or super(FakeCache, self).get(key, raise_on_error)
 
 
 class BaseTest(unittest.TestCase):
@@ -201,6 +201,120 @@ class BaseTest(unittest.TestCase):
 
 @patch_policies([StoragePolicy(0, 'zero', True, object_ring=FakeRing())])
 class TestFuncs(BaseTest):
+
+    def test_get_namespaces_from_cache_disabled(self):
+        cache_key = 'shard-updating-v2/a/c/'
+        req = Request.blank('a/c')
+        actual = get_namespaces_from_cache(req, cache_key, 0)
+        self.assertEqual((None, 'disabled'), actual)
+
+    def test_get_namespaces_from_cache_miss(self):
+        cache_key = 'shard-updating-v2/a/c/'
+        req = Request.blank('a/c')
+        req.environ['swift.cache'] = self.cache
+        actual = get_namespaces_from_cache(req, cache_key, 0)
+        self.assertEqual((None, 'miss'), actual)
+
+    def test_get_namespaces_from_cache_infocache_hit(self):
+        cache_key = 'shard-updating-v2/a/c/'
+        ns_bound_list1 = NamespaceBoundList([['', 'sr1'], ['k', 'sr2']])
+        ns_bound_list2 = NamespaceBoundList([['', 'sr3'], ['t', 'sr4']])
+        req = Request.blank('a/c')
+        req.environ['swift.cache'] = self.cache
+        req.environ['swift.infocache'] = {cache_key: ns_bound_list1}
+        # memcache ignored if infocache hits
+        self.cache.set(cache_key, ns_bound_list2.bounds)
+        actual = get_namespaces_from_cache(req, cache_key, 0)
+        self.assertEqual((ns_bound_list1, 'infocache_hit'), actual)
+
+    def test_get_namespaces_from_cache_hit(self):
+        cache_key = 'shard-updating-v2/a/c/'
+        ns_bound_list = NamespaceBoundList([['', 'sr3'], ['t', 'sr4']])
+        req = Request.blank('a/c')
+        req.environ['swift.cache'] = self.cache
+        req.environ['swift.infocache'] = {}
+        self.cache.set(cache_key, ns_bound_list.bounds)
+        actual = get_namespaces_from_cache(req, 'shard-updating-v2/a/c/', 0)
+        self.assertEqual((ns_bound_list, 'hit'), actual)
+        self.assertEqual({cache_key: ns_bound_list},
+                         req.environ['swift.infocache'])
+
+    def test_get_namespaces_from_cache_skips(self):
+        cache_key = 'shard-updating-v2/a/c/'
+        ns_bound_list = NamespaceBoundList([['', 'sr1'], ['k', 'sr2']])
+
+        self.cache.set(cache_key, ns_bound_list.bounds)
+        req = Request.blank('a/c')
+        req.environ['swift.cache'] = self.cache
+        with mock.patch('swift.proxy.controllers.base.random.random',
+                        return_value=0.099):
+            actual = get_namespaces_from_cache(req, cache_key, 0.1)
+        self.assertEqual((None, 'skip'), actual)
+
+        req = Request.blank('a/c')
+        req.environ['swift.cache'] = self.cache
+        with mock.patch('swift.proxy.controllers.base.random.random',
+                        return_value=0.1):
+            actual = get_namespaces_from_cache(req, cache_key, 0.1)
+        self.assertEqual((ns_bound_list, 'hit'), actual)
+
+    def test_get_namespaces_from_cache_error(self):
+        cache_key = 'shard-updating-v2/a/c/'
+        ns_bound_list = NamespaceBoundList([['', 'sr1'], ['k', 'sr2']])
+        self.cache.set(cache_key, ns_bound_list.bounds)
+        # sanity check
+        req = Request.blank('a/c')
+        req.environ['swift.cache'] = self.cache
+        actual = get_namespaces_from_cache(req, cache_key, 0.0)
+        self.assertEqual((ns_bound_list, 'hit'), actual)
+
+        req = Request.blank('a/c')
+        req.environ['swift.cache'] = self.cache
+        self.cache.error_on_get = [True]
+        actual = get_namespaces_from_cache(req, cache_key, 0.0)
+        self.assertEqual((None, 'error'), actual)
+
+    def test_set_namespaces_in_cache_disabled(self):
+        cache_key = 'shard-updating-v2/a/c/'
+        ns_bound_list = NamespaceBoundList([['', 'sr1'], ['k', 'sr2']])
+        req = Request.blank('a/c')
+        actual = set_namespaces_in_cache(req, cache_key, ns_bound_list, 123)
+        self.assertEqual('disabled', actual)
+        self.assertEqual({cache_key: ns_bound_list},
+                         req.environ['swift.infocache'])
+
+    def test_set_namespaces_in_cache_ok(self):
+        cache_key = 'shard-updating-v2/a/c/'
+        ns_bound_list = NamespaceBoundList([['', 'sr1'], ['k', 'sr2']])
+        req = Request.blank('a/c')
+        req.environ['swift.cache'] = self.cache
+        actual = set_namespaces_in_cache(req, cache_key, ns_bound_list, 123)
+        self.assertEqual('set', actual)
+        self.assertEqual({cache_key: ns_bound_list},
+                         req.environ['swift.infocache'])
+        self.assertEqual(ns_bound_list.bounds, self.cache.store.get(cache_key))
+        self.assertEqual(123, self.cache.times.get(cache_key))
+
+    def test_set_namespaces_in_cache_infocache_exists(self):
+        cache_key = 'shard-updating-v2/a/c/'
+        ns_bound_list = NamespaceBoundList([['', 'sr1'], ['k', 'sr2']])
+        req = Request.blank('a/c')
+        req.environ['swift.infocache'] = {'already': 'exists'}
+        actual = set_namespaces_in_cache(req, cache_key, ns_bound_list, 123)
+        self.assertEqual('disabled', actual)
+        self.assertEqual({'already': 'exists', cache_key: ns_bound_list},
+                         req.environ['swift.infocache'])
+
+    def test_set_namespaces_in_cache_error(self):
+        cache_key = 'shard-updating-v2/a/c/'
+        ns_bound_list = NamespaceBoundList([['', 'sr1'], ['k', 'sr2']])
+        req = Request.blank('a/c')
+        req.environ['swift.cache'] = self.cache
+        self.cache.error_on_set = [True]
+        actual = set_namespaces_in_cache(req, cache_key, ns_bound_list, 123)
+        self.assertEqual('set_error', actual)
+        self.assertEqual(ns_bound_list,
+                         req.environ['swift.infocache'].get(cache_key))
 
     def test_get_info_zero_recheck(self):
         mock_cache = mock.Mock()
@@ -1192,87 +1306,6 @@ class TestFuncs(BaseTest):
         self.assertEqual(resp.status, '404 Not Found')
         self.assertEqual(resp.body, b'Custom body')
 
-    def test_range_fast_forward(self):
-        req = Request.blank('/')
-        handler = GetOrHeadHandler(
-            self.app, req, None, Namespace(num_primary_nodes=3), None, None,
-            {})
-        handler.fast_forward(50)
-        self.assertEqual(handler.backend_headers['Range'], 'bytes=50-')
-
-        handler = GetOrHeadHandler(
-            self.app, req, None, Namespace(num_primary_nodes=3), None, None,
-            {'Range': 'bytes=23-50'})
-        handler.fast_forward(20)
-        self.assertEqual(handler.backend_headers['Range'], 'bytes=43-50')
-        self.assertRaises(HTTPException,
-                          handler.fast_forward, 80)
-        self.assertRaises(exceptions.RangeAlreadyComplete,
-                          handler.fast_forward, 8)
-
-        handler = GetOrHeadHandler(
-            self.app, req, None, Namespace(num_primary_nodes=3), None, None,
-            {'Range': 'bytes=23-'})
-        handler.fast_forward(20)
-        self.assertEqual(handler.backend_headers['Range'], 'bytes=43-')
-
-        handler = GetOrHeadHandler(
-            self.app, req, None, Namespace(num_primary_nodes=3), None, None,
-            {'Range': 'bytes=-100'})
-        handler.fast_forward(20)
-        self.assertEqual(handler.backend_headers['Range'], 'bytes=-80')
-        self.assertRaises(HTTPException,
-                          handler.fast_forward, 100)
-        self.assertRaises(exceptions.RangeAlreadyComplete,
-                          handler.fast_forward, 80)
-
-        handler = GetOrHeadHandler(
-            self.app, req, None, Namespace(num_primary_nodes=3), None, None,
-            {'Range': 'bytes=0-0'})
-        self.assertRaises(exceptions.RangeAlreadyComplete,
-                          handler.fast_forward, 1)
-
-        handler = GetOrHeadHandler(
-            self.app, req, None, Namespace(num_primary_nodes=3), None, None,
-            {'Range': 'bytes=23-',
-             'X-Backend-Ignore-Range-If-Metadata-Present':
-             'X-Static-Large-Object'})
-        handler.fast_forward(20)
-        self.assertEqual(handler.backend_headers['Range'], 'bytes=43-')
-        self.assertNotIn('X-Backend-Ignore-Range-If-Metadata-Present',
-                         handler.backend_headers)
-
-    def test_range_fast_forward_after_data_timeout(self):
-        req = Request.blank('/')
-
-        # We get a 200 and learn that it's a 1000-byte object, but receive 0
-        # bytes of data, so then we get a new node, fast_forward(0), and
-        # send out a new request. That new request must be for all 1000
-        # bytes.
-        handler = GetOrHeadHandler(
-            self.app, req, None, Namespace(num_primary_nodes=3), None, None,
-            {})
-        handler.learn_size_from_content_range(0, 999, 1000)
-        handler.fast_forward(0)
-        self.assertEqual(handler.backend_headers['Range'], 'bytes=0-999')
-
-        # Same story as above, but a 1-byte object so we can have our byte
-        # indices be 0.
-        handler = GetOrHeadHandler(
-            self.app, req, None, Namespace(num_primary_nodes=3), None, None,
-            {})
-        handler.learn_size_from_content_range(0, 0, 1)
-        handler.fast_forward(0)
-        self.assertEqual(handler.backend_headers['Range'], 'bytes=0-0')
-
-        # last 100 bytes
-        handler = GetOrHeadHandler(
-            self.app, req, None, Namespace(num_primary_nodes=3), None, None,
-            {'Range': 'bytes=-100'})
-        handler.learn_size_from_content_range(900, 999, 1000)
-        handler.fast_forward(0)
-        self.assertEqual(handler.backend_headers['Range'], 'bytes=900-999')
-
     def test_transfer_headers_with_sysmeta(self):
         base = Controller(self.app)
         good_hdrs = {'x-base-sysmeta-foo': 'ok',
@@ -1404,41 +1437,6 @@ class TestFuncs(BaseTest):
             self.assertEqual(v, dst_headers[k])
         self.assertEqual('', dst_headers['Referer'])
 
-    def test_disconnected_logging(self):
-        self.app.logger = mock.Mock()
-        req = Request.blank('/v1/a/c/o')
-        headers = {'content-type': 'text/plain'}
-        source = FakeSource([], headers=headers, body=b'the cake is a lie')
-
-        node = {'ip': '1.2.3.4', 'port': 6200, 'device': 'sda'}
-        handler = GetOrHeadHandler(
-            self.app, req, 'Object', Namespace(num_primary_nodes=1), None,
-            'some-path', {})
-
-        def mock_find_source():
-            handler.source = GetterSource(self.app, source, node)
-            return True
-
-        with mock.patch.object(handler, '_find_source',
-                               mock_find_source):
-            resp = handler.get_working_response(req)
-            resp.app_iter.close()
-        self.app.logger.info.assert_called_once_with(
-            'Client disconnected on read of %r', 'some-path')
-
-        self.app.logger = mock.Mock()
-        node = {'ip': '1.2.3.4', 'port': 6200, 'device': 'sda'}
-        handler = GetOrHeadHandler(
-            self.app, req, 'Object', Namespace(num_primary_nodes=1), None,
-            None, {})
-
-        with mock.patch.object(handler, '_find_source',
-                               mock_find_source):
-            resp = handler.get_working_response(req)
-            next(resp.app_iter)
-            resp.app_iter.close()
-        self.app.logger.warning.assert_not_called()
-
     def test_bytes_to_skip(self):
         # if you start at the beginning, skip nothing
         self.assertEqual(bytes_to_skip(1024, 0), 0)
@@ -1467,198 +1465,6 @@ class TestFuncs(BaseTest):
         # prime numbers
         self.assertEqual(bytes_to_skip(11, 7), 4)
         self.assertEqual(bytes_to_skip(97, 7873823), 55)
-
-    def test_get_shard_ranges_for_container_get(self):
-        ts_iter = make_timestamp_iter()
-        shard_ranges = [dict(ShardRange(
-            '.sharded_a/sr%d' % i, next(ts_iter), '%d_lower' % i,
-            '%d_upper' % i, object_count=i, bytes_used=1024 * i,
-            meta_timestamp=next(ts_iter)))
-            for i in range(3)]
-        base = Controller(self.app)
-        req = Request.blank('/v1/a/c', method='GET')
-        resp_headers = {'X-Backend-Record-Type': 'shard'}
-        with mocked_http_conn(
-            200, 200,
-            body_iter=iter([b'', json.dumps(shard_ranges).encode('ascii')]),
-            headers=resp_headers
-        ) as fake_conn:
-            actual, resp = base._get_shard_ranges(req, 'a', 'c')
-        self.assertEqual(200, resp.status_int)
-
-        # account info
-        captured = fake_conn.requests
-        self.assertEqual('HEAD', captured[0]['method'])
-        self.assertEqual('a', captured[0]['path'][7:])
-        # container GET
-        self.assertEqual('GET', captured[1]['method'])
-        self.assertEqual('a/c', captured[1]['path'][7:])
-        self.assertEqual('format=json', captured[1]['qs'])
-        self.assertEqual(
-            'shard', captured[1]['headers'].get('X-Backend-Record-Type'))
-        self.assertEqual(shard_ranges, [dict(pr) for pr in actual])
-        self.assertFalse(self.app.logger.get_lines_for_level('error'))
-
-    def test_get_shard_ranges_for_object_put(self):
-        ts_iter = make_timestamp_iter()
-        shard_ranges = [dict(ShardRange(
-            '.sharded_a/sr%d' % i, next(ts_iter), '%d_lower' % i,
-            '%d_upper' % i, object_count=i, bytes_used=1024 * i,
-            meta_timestamp=next(ts_iter)))
-            for i in range(3)]
-        base = Controller(self.app)
-        req = Request.blank('/v1/a/c/o', method='PUT')
-        resp_headers = {'X-Backend-Record-Type': 'shard'}
-        with mocked_http_conn(
-            200, 200,
-            body_iter=iter([b'',
-                            json.dumps(shard_ranges[1:2]).encode('ascii')]),
-            headers=resp_headers
-        ) as fake_conn:
-            actual, resp = base._get_shard_ranges(req, 'a', 'c', '1_test')
-        self.assertEqual(200, resp.status_int)
-
-        # account info
-        captured = fake_conn.requests
-        self.assertEqual('HEAD', captured[0]['method'])
-        self.assertEqual('a', captured[0]['path'][7:])
-        # container GET
-        self.assertEqual('GET', captured[1]['method'])
-        self.assertEqual('a/c', captured[1]['path'][7:])
-        params = sorted(captured[1]['qs'].split('&'))
-        self.assertEqual(
-            ['format=json', 'includes=1_test'], params)
-        self.assertEqual(
-            'shard', captured[1]['headers'].get('X-Backend-Record-Type'))
-        self.assertEqual(shard_ranges[1:2], [dict(pr) for pr in actual])
-        self.assertFalse(self.app.logger.get_lines_for_level('error'))
-
-    def test_get_shard_ranges_for_utf8_object_put(self):
-        ts_iter = make_timestamp_iter()
-        shard_ranges = [dict(ShardRange(
-            '.sharded_a/sr%d' % i, next(ts_iter), u'\u1234%d_lower' % i,
-            u'\u1234%d_upper' % i, object_count=i, bytes_used=1024 * i,
-            meta_timestamp=next(ts_iter)))
-            for i in range(3)]
-        base = Controller(self.app)
-        req = Request.blank('/v1/a/c/o', method='PUT')
-        resp_headers = {'X-Backend-Record-Type': 'shard'}
-        with mocked_http_conn(
-            200, 200,
-            body_iter=iter([b'',
-                            json.dumps(shard_ranges[1:2]).encode('ascii')]),
-            headers=resp_headers
-        ) as fake_conn:
-            actual, resp = base._get_shard_ranges(
-                req, 'a', 'c', wsgi_to_str('\xe1\x88\xb41_test'))
-        self.assertEqual(200, resp.status_int)
-
-        # account info
-        captured = fake_conn.requests
-        self.assertEqual('HEAD', captured[0]['method'])
-        self.assertEqual('a', captured[0]['path'][7:])
-        # container GET
-        self.assertEqual('GET', captured[1]['method'])
-        self.assertEqual('a/c', captured[1]['path'][7:])
-        params = sorted(captured[1]['qs'].split('&'))
-        self.assertEqual(
-            ['format=json', 'includes=%E1%88%B41_test'], params)
-        self.assertEqual(
-            'shard', captured[1]['headers'].get('X-Backend-Record-Type'))
-        self.assertEqual(shard_ranges[1:2], [dict(pr) for pr in actual])
-        self.assertFalse(self.app.logger.get_lines_for_level('error'))
-
-    def _check_get_shard_ranges_bad_data(self, body):
-        base = Controller(self.app)
-        req = Request.blank('/v1/a/c/o', method='PUT')
-        # empty response
-        headers = {'X-Backend-Record-Type': 'shard'}
-        with mocked_http_conn(200, 200, body_iter=iter([b'', body]),
-                              headers=headers):
-            actual, resp = base._get_shard_ranges(req, 'a', 'c', '1_test')
-        self.assertEqual(200, resp.status_int)
-        self.assertIsNone(actual)
-        lines = self.app.logger.get_lines_for_level('error')
-        return lines
-
-    def test_get_shard_ranges_empty_body(self):
-        error_lines = self._check_get_shard_ranges_bad_data(b'')
-        self.assertIn('Problem with listing response', error_lines[0])
-        if six.PY2:
-            self.assertIn('No JSON', error_lines[0])
-        else:
-            self.assertIn('JSONDecodeError', error_lines[0])
-        self.assertFalse(error_lines[1:])
-
-    def test_get_shard_ranges_not_a_list(self):
-        body = json.dumps({}).encode('ascii')
-        error_lines = self._check_get_shard_ranges_bad_data(body)
-        self.assertIn('Problem with listing response', error_lines[0])
-        self.assertIn('not a list', error_lines[0])
-        self.assertFalse(error_lines[1:])
-
-    def test_get_shard_ranges_key_missing(self):
-        body = json.dumps([{}]).encode('ascii')
-        error_lines = self._check_get_shard_ranges_bad_data(body)
-        self.assertIn('Failed to get shard ranges', error_lines[0])
-        self.assertIn('KeyError', error_lines[0])
-        self.assertFalse(error_lines[1:])
-
-    def test_get_shard_ranges_invalid_shard_range(self):
-        sr = ShardRange('a/c', Timestamp.now())
-        bad_sr_data = dict(sr, name='bad_name')
-        body = json.dumps([bad_sr_data]).encode('ascii')
-        error_lines = self._check_get_shard_ranges_bad_data(body)
-        self.assertIn('Failed to get shard ranges', error_lines[0])
-        self.assertIn('ValueError', error_lines[0])
-        self.assertFalse(error_lines[1:])
-
-    def test_get_shard_ranges_missing_record_type(self):
-        base = Controller(self.app)
-        req = Request.blank('/v1/a/c/o', method='PUT')
-        sr = ShardRange('a/c', Timestamp.now())
-        body = json.dumps([dict(sr)]).encode('ascii')
-        with mocked_http_conn(
-                200, 200, body_iter=iter([b'', body])):
-            actual, resp = base._get_shard_ranges(req, 'a', 'c', '1_test')
-        self.assertEqual(200, resp.status_int)
-        self.assertIsNone(actual)
-        error_lines = self.app.logger.get_lines_for_level('error')
-        self.assertIn('Failed to get shard ranges', error_lines[0])
-        self.assertIn('unexpected record type', error_lines[0])
-        self.assertIn('/a/c', error_lines[0])
-        self.assertFalse(error_lines[1:])
-
-    def test_get_shard_ranges_wrong_record_type(self):
-        base = Controller(self.app)
-        req = Request.blank('/v1/a/c/o', method='PUT')
-        sr = ShardRange('a/c', Timestamp.now())
-        body = json.dumps([dict(sr)]).encode('ascii')
-        headers = {'X-Backend-Record-Type': 'object'}
-        with mocked_http_conn(
-                200, 200, body_iter=iter([b'', body]),
-                headers=headers):
-            actual, resp = base._get_shard_ranges(req, 'a', 'c', '1_test')
-        self.assertEqual(200, resp.status_int)
-        self.assertIsNone(actual)
-        error_lines = self.app.logger.get_lines_for_level('error')
-        self.assertIn('Failed to get shard ranges', error_lines[0])
-        self.assertIn('unexpected record type', error_lines[0])
-        self.assertIn('/a/c', error_lines[0])
-        self.assertFalse(error_lines[1:])
-
-    def test_get_shard_ranges_request_failed(self):
-        base = Controller(self.app)
-        req = Request.blank('/v1/a/c/o', method='PUT')
-        with mocked_http_conn(200, 404, 404, 404):
-            actual, resp = base._get_shard_ranges(req, 'a', 'c', '1_test')
-        self.assertEqual(404, resp.status_int)
-        self.assertIsNone(actual)
-        self.assertFalse(self.app.logger.get_lines_for_level('error'))
-        warning_lines = self.app.logger.get_lines_for_level('warning')
-        self.assertIn('Failed to get container listing', warning_lines[0])
-        self.assertIn('/a/c', warning_lines[0])
-        self.assertFalse(warning_lines[1:])
 
 
 @patch_policies([StoragePolicy(0, 'zero', True, object_ring=FakeRing())])
@@ -1862,3 +1668,162 @@ class TestGetterSource(unittest.TestCase):
         src.resp.nuke_from_orbit = mock.MagicMock()
         src.close()
         src.resp.nuke_from_orbit.assert_called_once_with()
+
+
+@patch_policies([StoragePolicy(0, 'zero', True, object_ring=FakeRing())])
+class TestGetOrHeadHandler(BaseTest):
+    def test_init_node_timeout(self):
+        conf = {'node_timeout': 5, 'recoverable_node_timeout': 3}
+        app = proxy_server.Application(conf,
+                                       logger=self.logger,
+                                       account_ring=self.account_ring,
+                                       container_ring=self.container_ring)
+        # x-newest set
+        req = Request.blank('/v1/a/c/o', headers={'X-Newest': 'true'})
+        node_iter = Namespace(num_primary_nodes=3)
+        # app.node_timeout
+        getter = GetOrHeadHandler(
+            app, req, 'Object', node_iter, None, None, {})
+        self.assertEqual(5, getter.node_timeout)
+
+        # x-newest not set
+        req = Request.blank('/v1/a/c/o')
+        node_iter = Namespace(num_primary_nodes=3)
+        # app.recoverable_node_timeout
+        getter = GetOrHeadHandler(
+            app, req, 'Object', node_iter, None, None, {})
+        self.assertEqual(3, getter.node_timeout)
+
+        # app.node_timeout
+        getter = GetOrHeadHandler(
+            app, req, 'Account', node_iter, None, None, {})
+        self.assertEqual(5, getter.node_timeout)
+
+        getter = GetOrHeadHandler(
+            app, req, 'Container', node_iter, None, None, {})
+        self.assertEqual(5, getter.node_timeout)
+
+    def test_disconnected_logging(self):
+        req = Request.blank('/v1/a/c/o')
+        headers = {'content-type': 'text/plain'}
+        source = FakeSource([], headers=headers, body=b'the cake is a lie')
+
+        node = {'ip': '1.2.3.4', 'port': 6200, 'device': 'sda'}
+        handler = GetOrHeadHandler(
+            self.app, req, 'Object', Namespace(num_primary_nodes=1), None,
+            'some-path', {})
+
+        def mock_find_source():
+            handler.source = GetterSource(self.app, source, node)
+            return True
+
+        factory = CaptureIteratorFactory(handler._iter_parts_from_response)
+        with mock.patch.object(handler, '_find_source', mock_find_source):
+            with mock.patch.object(
+                    handler, '_iter_parts_from_response', factory):
+                resp = handler.get_working_response()
+                resp.app_iter.close()
+        # verify that iter exited
+        self.assertEqual({1: ['next', 'close', '__del__']},
+                         factory.captured_calls)
+        self.assertEqual(["Client disconnected on read of 'some-path'"],
+                         self.logger.get_lines_for_level('info'))
+
+        self.logger.clear()
+        node = {'ip': '1.2.3.4', 'port': 6200, 'device': 'sda'}
+        handler = GetOrHeadHandler(
+            self.app, req, 'Object', Namespace(num_primary_nodes=1), None,
+            None, {})
+
+        factory = CaptureIteratorFactory(handler._iter_parts_from_response)
+        with mock.patch.object(handler, '_find_source', mock_find_source):
+            with mock.patch.object(
+                    handler, '_iter_parts_from_response', factory):
+                resp = handler.get_working_response()
+                next(resp.app_iter)
+            resp.app_iter.close()
+        self.assertEqual({1: ['next', 'close', '__del__']},
+                         factory.captured_calls)
+        self.assertEqual([], self.logger.get_lines_for_level('warning'))
+        self.assertEqual([], self.logger.get_lines_for_level('info'))
+
+    def test_range_fast_forward(self):
+        req = Request.blank('/')
+        handler = GetOrHeadHandler(
+            self.app, req, 'test', Namespace(num_primary_nodes=3), None, None,
+            {})
+        handler.fast_forward(50)
+        self.assertEqual(handler.backend_headers['Range'], 'bytes=50-')
+
+        handler = GetOrHeadHandler(
+            self.app, req, 'test', Namespace(num_primary_nodes=3), None, None,
+            {'Range': 'bytes=23-50'})
+        handler.fast_forward(20)
+        self.assertEqual(handler.backend_headers['Range'], 'bytes=43-50')
+        self.assertRaises(HTTPException,
+                          handler.fast_forward, 80)
+        self.assertRaises(exceptions.RangeAlreadyComplete,
+                          handler.fast_forward, 8)
+
+        handler = GetOrHeadHandler(
+            self.app, req, 'test', Namespace(num_primary_nodes=3), None, None,
+            {'Range': 'bytes=23-'})
+        handler.fast_forward(20)
+        self.assertEqual(handler.backend_headers['Range'], 'bytes=43-')
+
+        handler = GetOrHeadHandler(
+            self.app, req, 'test', Namespace(num_primary_nodes=3), None, None,
+            {'Range': 'bytes=-100'})
+        handler.fast_forward(20)
+        self.assertEqual(handler.backend_headers['Range'], 'bytes=-80')
+        self.assertRaises(HTTPException,
+                          handler.fast_forward, 100)
+        self.assertRaises(exceptions.RangeAlreadyComplete,
+                          handler.fast_forward, 80)
+
+        handler = GetOrHeadHandler(
+            self.app, req, 'test', Namespace(num_primary_nodes=3), None, None,
+            {'Range': 'bytes=0-0'})
+        self.assertRaises(exceptions.RangeAlreadyComplete,
+                          handler.fast_forward, 1)
+
+        handler = GetOrHeadHandler(
+            self.app, req, 'test', Namespace(num_primary_nodes=3), None, None,
+            {'Range': 'bytes=23-',
+             'X-Backend-Ignore-Range-If-Metadata-Present':
+             'X-Static-Large-Object'})
+        handler.fast_forward(20)
+        self.assertEqual(handler.backend_headers['Range'], 'bytes=43-')
+        self.assertNotIn('X-Backend-Ignore-Range-If-Metadata-Present',
+                         handler.backend_headers)
+
+    def test_range_fast_forward_after_data_timeout(self):
+        req = Request.blank('/')
+
+        # We get a 200 and learn that it's a 1000-byte object, but receive 0
+        # bytes of data, so then we get a new node, fast_forward(0), and
+        # send out a new request. That new request must be for all 1000
+        # bytes.
+        handler = GetOrHeadHandler(
+            self.app, req, 'test', Namespace(num_primary_nodes=3), None, None,
+            {})
+        handler.learn_size_from_content_range(0, 999, 1000)
+        handler.fast_forward(0)
+        self.assertEqual(handler.backend_headers['Range'], 'bytes=0-999')
+
+        # Same story as above, but a 1-byte object so we can have our byte
+        # indices be 0.
+        handler = GetOrHeadHandler(
+            self.app, req, 'test', Namespace(num_primary_nodes=3), None, None,
+            {})
+        handler.learn_size_from_content_range(0, 0, 1)
+        handler.fast_forward(0)
+        self.assertEqual(handler.backend_headers['Range'], 'bytes=0-0')
+
+        # last 100 bytes
+        handler = GetOrHeadHandler(
+            self.app, req, 'test', Namespace(num_primary_nodes=3), None, None,
+            {'Range': 'bytes=-100'})
+        handler.learn_size_from_content_range(900, 999, 1000)
+        handler.fast_forward(0)
+        self.assertEqual(handler.backend_headers['Range'], 'bytes=900-999')

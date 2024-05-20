@@ -24,16 +24,9 @@
       tools/test-setup.sh.
     vars:
       tox_envlist: py27
+      bindep_profile: test py27
       python_version: 2.7
     post-run: tools/playbooks/common/cover-post.yaml
-
-- job:
-    name: swift-tox-py27-centos-7
-    parent: openstack-tox-py27
-    nodeset: centos-7
-    vars:
-      tox_environment:
-        TMPDIR: '{{ ansible_env.HOME }}/xfstmp'
 
 - job:
     name: swift-tox-py36
@@ -152,6 +145,22 @@
       python_version: '3.11'
 
 - job:
+    name: swift-tox-py312
+    parent: swift-tox-base
+    nodeset: debian-bookworm
+    description: |
+      Run unit-tests for swift under cPython version 3.12.
+
+      Uses tox with the ``py312`` environment.
+      It sets TMPDIR to an XFS mount point created via
+      tools/test-setup.sh.
+    vars:
+      tox_envlist: py312
+      bindep_profile: test py312
+      python_use_pyenv: True
+      python_version: '3.12'
+
+- job:
     name: swift-tox-func-py27
     parent: swift-tox-base
     nodeset: ubuntu-bionic
@@ -250,12 +259,6 @@
       tox_envlist: func-ec-py3
 
 - job:
-    name: swift-tox-func-py27-centos-7
-    parent: swift-tox-py27-centos-7
-    vars:
-      tox_envlist: func
-
-- job:
     name: swift-tox-func-encryption-py27
     parent: swift-tox-func-py27
     description: |
@@ -268,12 +271,6 @@
       tox_envlist: func-encryption
 
 - job:
-    name: swift-tox-func-encryption-py27-centos-7
-    parent: swift-tox-func-py27-centos-7
-    vars:
-      tox_envlist: func-encryption
-
-- job:
     name: swift-tox-func-ec-py27
     parent: swift-tox-func-py27
     description: |
@@ -282,12 +279,6 @@
       Uses tox with the ``func-ec`` environment.
       It sets TMPDIR to an XFS mount point created via
       tools/test-setup.sh.
-    vars:
-      tox_envlist: func-ec
-
-- job:
-    name: swift-tox-func-ec-py27-centos-7
-    parent: swift-tox-func-py27-centos-7
     vars:
       tox_envlist: func-ec
 
@@ -373,45 +364,31 @@
       - tools/playbooks/probetests/post.yaml
 
 - job:
-    name: swift-probetests-centos-7
-    parent: swift-probetests-centos-8-stream
-    nodeset: centos-7
-    description: |
-      Setup a SAIO dev environment and run Swift's probe tests
-      under Python 2.
-    vars:
-      bindep_profile: test py27
-      ensure_pip_from_packages: False
-      ensure_pip_from_packages_with_python2: False
-      ensure_pip_from_upstream: True
-      ensure_pip_from_upstream_interpreters:
-        - python2
-      ensure_pip_from_upstream_url: "https://bootstrap.pypa.io/pip/2.7/get-pip.py"
-
-- job:
-    name: swift-probetests-centos-8-stream
+    name: swift-probetests-centos-9-stream
     parent: unittests
-    nodeset: centos-8-stream
+    nodeset: centos-9-stream
     description: |
       Setup a SAIO dev environment and run Swift's probe tests
       under Python 3.
     timeout: 7200
     vars:
-      bindep_profile: test py36
+      s3_acl: no
+      bindep_profile: test py39
     pre-run:
       - tools/playbooks/common/install_dependencies.yaml
       - tools/playbooks/saio_single_node_setup/setup_saio.yaml
       - tools/playbooks/saio_single_node_setup/make_rings.yaml
+      - tools/playbooks/saio_single_node_setup/add_s3api.yaml
     run: tools/playbooks/probetests/run.yaml
     post-run: tools/playbooks/probetests/post.yaml
 
 - job:
-    name: swift-probetests-centos-8-stream-arm64
-    parent: swift-probetests-centos-8-stream
+    name: swift-probetests-centos-9-stream-arm64
+    parent: swift-probetests-centos-9-stream
     nodeset:
       nodes:
-        - name: swift-centos-8-stream-arm64
-          label: centos-8-stream-arm64
+        - name: swift-centos-9-stream-arm64
+          label: centos-9-stream-arm64
     description: |
       Setup a SAIO dev environment and run Swift's probe tests
       under Python 3 on top of arm64 architecture.
@@ -419,14 +396,11 @@
 
 - job:
     name: swift-func-cors
-    parent: swift-probetests-centos-8-stream
+    parent: swift-probetests-centos-9-stream
     description: |
       Setup a SAIO dev environment and run Swift's CORS functional tests
     timeout: 1200
-    vars:
-      s3_acl: no
     pre-run:
-      - tools/playbooks/saio_single_node_setup/add_s3api.yaml
       - tools/playbooks/cors/install_selenium.yaml
     run: tools/playbooks/cors/run.yaml
     post-run: tools/playbooks/cors/post.yaml
@@ -491,46 +465,34 @@
     post-run: tools/playbooks/probetests/post.yaml
 
 - job:
-    name: swift-multinode-rolling-upgrade-train
-    parent: swift-multinode-rolling-upgrade
-    vars:
-      previous_swift_version: origin/stable/train
-
-- job:
-    name: swift-multinode-rolling-upgrade-ussuri
-    parent: swift-multinode-rolling-upgrade
-    vars:
-      previous_swift_version: origin/stable/ussuri
-
-- job:
     name: swift-multinode-rolling-upgrade-victoria
     parent: swift-multinode-rolling-upgrade
     vars:
-      previous_swift_version: origin/stable/victoria
+      previous_swift_version: victoria-eom
 
 - job:
     name: swift-multinode-rolling-upgrade-wallaby
     parent: swift-multinode-rolling-upgrade
     vars:
-      previous_swift_version: origin/stable/wallaby
+      previous_swift_version: wallaby-eom
 
 - job:
     name: swift-multinode-rolling-upgrade-xena
     parent: swift-multinode-rolling-upgrade
     vars:
-      previous_swift_version: origin/stable/xena
+      previous_swift_version: xena-eom
 
 - job:
     name: swift-multinode-rolling-upgrade-yoga
     parent: swift-multinode-rolling-upgrade
     vars:
-      previous_swift_version: origin/stable/yoga
+      previous_swift_version: yoga-eom
 
 - job:
     name: swift-multinode-rolling-upgrade-zed
     parent: swift-multinode-rolling-upgrade
     vars:
-      previous_swift_version: origin/stable/zed
+      previous_swift_version: zed-eom
 
 - job:
     name: swift-multinode-rolling-upgrade-antelope
@@ -543,6 +505,12 @@
     parent: swift-multinode-rolling-upgrade
     vars:
       previous_swift_version: origin/stable/2023.2
+
+- job:
+    name: swift-multinode-rolling-upgrade-caracal
+    parent: swift-multinode-rolling-upgrade
+    vars:
+      previous_swift_version: origin/stable/2024.1
 
 - job:
     name: swift-multinode-rolling-upgrade-master
@@ -723,11 +691,11 @@
               - ^test/(cors|functional|probe|s3api)/.*$
         - swift-tox-py36:
             irrelevant-files: *unittest-irrelevant-files
-        - swift-tox-py39:
-            irrelevant-files: *unittest-irrelevant-files
-        - swift-tox-py310:
+        - swift-tox-py38:
             irrelevant-files: *unittest-irrelevant-files
         - swift-tox-py311:
+            irrelevant-files: *unittest-irrelevant-files
+        - swift-tox-py312:
             irrelevant-files: *unittest-irrelevant-files
 
         # Functional tests
@@ -769,15 +737,13 @@
               - ^doc/(requirements.txt|(manpages|s3api|source)/.*)$
               - ^test/(cors|unit|functional|probe)/.*$
               - ^(.gitreview|.mailmap|AUTHORS|CHANGELOG|.*\.rst)$
-        - swift-probetests-centos-7:
+        - swift-probetests-centos-9-stream:
             irrelevant-files: &probetest-irrelevant-files
               - ^(api-ref|releasenotes)/.*$
               # Keep doc/saio -- we use those sample configs in the saio playbooks
               - ^doc/(requirements.txt|(manpages|s3api|source)/.*)$
               - ^test/(cors|unit|functional|s3api)/.*$
               - ^(.gitreview|.mailmap|AUTHORS|CHANGELOG|.*\.rst)$
-        - swift-probetests-centos-8-stream:
-            irrelevant-files: *probetest-irrelevant-files
         - swift-dsvm-functional:
             irrelevant-files: *functest-irrelevant-files
         - swift-dsvm-functional-ipv6:
@@ -791,7 +757,6 @@
               - ^doc/(requirements.txt|(saio|s3api|source)/.*)$
         - swift-multinode-rolling-upgrade:
             irrelevant-files: *functest-irrelevant-files
-            voting: false
         - tempest-integrated-object-storage:
             irrelevant-files: &tempest-irrelevant-files
               - ^(api-ref|doc|releasenotes)/.*$
@@ -802,6 +767,8 @@
         - openstacksdk-functional-devstack:
             irrelevant-files: *tempest-irrelevant-files
         - grenade:
+            irrelevant-files: *tempest-irrelevant-files
+        - grenade-skip-level:
             irrelevant-files: *tempest-irrelevant-files
     gate:
       jobs:
@@ -815,9 +782,9 @@
             irrelevant-files: *docker-irrelevant-files
         - swift-tox-py27
         - swift-tox-py36
-        - swift-tox-py39
-        - swift-tox-py310
+        - swift-tox-py38
         - swift-tox-py311
+        - swift-tox-py312
         - swift-tox-func-py27
         - swift-tox-func-encryption-py27
         - swift-tox-func-ec-py27
@@ -826,9 +793,7 @@
         - swift-tox-func-ec-py38
         - swift-func-cors
         - swift-tox-func-s3api-tests-tempauth
-        - swift-probetests-centos-7:
-            irrelevant-files: *probetest-irrelevant-files
-        - swift-probetests-centos-8-stream:
+        - swift-probetests-centos-9-stream:
             irrelevant-files: *probetest-irrelevant-files
         - swift-dsvm-functional:
             irrelevant-files: *functest-irrelevant-files
@@ -838,6 +803,8 @@
             irrelevant-files: *unittest-irrelevant-files
         - openstack-tox-pep8:
             irrelevant-files: *pep8-irrelevant-files
+        - swift-multinode-rolling-upgrade:
+            irrelevant-files: *functest-irrelevant-files
         - tempest-integrated-object-storage:
             irrelevant-files: *tempest-irrelevant-files
         - tempest-ipv6-only:
@@ -846,20 +813,17 @@
             irrelevant-files: *tempest-irrelevant-files
         - grenade:
             irrelevant-files: *tempest-irrelevant-files
+        - grenade-skip-level:
+            irrelevant-files: *tempest-irrelevant-files
     experimental:
       jobs:
         - swift-tox-py37
-        - swift-tox-py38
-        - swift-tox-py27-centos-7
-        - swift-tox-func-py27-centos-7
-        - swift-tox-func-encryption-py27-centos-7
-        - swift-tox-func-ec-py27-centos-7
+        - swift-tox-py39
+        - swift-tox-py310
         - swift-tox-py36-centos-8-stream
         - swift-tox-func-py39-centos-9-stream
         - swift-tox-func-encryption-py39-centos-9-stream
         - swift-tox-func-ec-py39-centos-9-stream
-        - swift-multinode-rolling-upgrade-train
-        - swift-multinode-rolling-upgrade-ussuri
         - swift-multinode-rolling-upgrade-victoria
         - swift-multinode-rolling-upgrade-wallaby
         - swift-multinode-rolling-upgrade-xena
@@ -867,6 +831,7 @@
         - swift-multinode-rolling-upgrade-zed
         - swift-multinode-rolling-upgrade-antelope
         - swift-multinode-rolling-upgrade-bobcat
+        - swift-multinode-rolling-upgrade-caracal
         - swift-multinode-rolling-upgrade-master:
             branches: master
 
